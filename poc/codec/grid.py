@@ -45,6 +45,14 @@ def set_ecc(n: int) -> None:
 
 MODE_MONO = 0
 MODE_COLOR8 = 1
+MODE_GRAY4 = 2   # 4 luminance levels, 2 bits/cell. Chosen from measurement:
+                 # real captures show black/white separated by ~12 sigma while
+                 # chroma axes collapse, so spend bits on the axis that works.
+
+GRAY4_LEVELS = np.array([0.0, 85.0, 170.0, 255.0])
+# Gray-coded so an adjacent-level error costs one bit, not two
+GRAY4_BITS = {0: (0, 0), 1: (0, 1), 2: (1, 1), 3: (1, 0)}
+GRAY4_SYM = {v: k for k, v in GRAY4_BITS.items()}
 
 # 8-color constellation for color8 mode: corners of the RGB cube.
 PALETTE = np.array([
@@ -86,7 +94,8 @@ class Layout:
         self.payload_cells = np.argwhere(~reserved)
 
     def payload_capacity_bytes(self, mode: int) -> int:
-        bits = len(self.payload_cells) * (3 if mode == MODE_COLOR8 else 1)
+        bpc = {MODE_MONO: 1, MODE_COLOR8: 3, MODE_GRAY4: 2}[mode]
+        bits = len(self.payload_cells) * bpc
         raw = bits // 8
         # largest b whose RS-encoded length fits in raw bytes
         b = raw * (255 - PAYLOAD_ECC) // 255
@@ -202,6 +211,14 @@ def render_frame(layout: Layout, header: bytes, payload: bytes,
         n = min(len(pb), len(layout.payload_cells))
         pc = layout.payload_cells[:n]
         cells[pc[:, 0], pc[:, 1]] = (255.0 * pb[:n])[:, None]
+    elif mode == MODE_GRAY4:  # 2 bits per cell, Gray-coded luminance levels
+        pb = _bits(coded)
+        pb = np.concatenate([pb, np.zeros((-len(pb)) % 2, dtype=np.uint8)])
+        pairs = pb.reshape(-1, 2)
+        syms = np.array([GRAY4_SYM[(int(a), int(b))] for a, b in pairs])
+        n = min(len(syms), len(layout.payload_cells))
+        pc = layout.payload_cells[:n]
+        cells[pc[:, 0], pc[:, 1]] = GRAY4_LEVELS[syms[:n]][:, None]
     else:  # color8: 3 bits per cell
         pb = _bits(coded)
         pb = np.concatenate([pb, np.zeros((-len(pb)) % 3, dtype=np.uint8)])
@@ -377,7 +394,28 @@ def decide_payload(header: dict, pay_samples: np.ndarray):
     """Hard-decide cells from (possibly evidence-averaged) samples, then RS."""
     pay_lum = pay_samples.mean(axis=1)
     margins = None
-    if header["mode"] == MODE_MONO:
+    if header["mode"] == MODE_GRAY4:
+        # learn the 4 level centers from this frame's own data (symbols are
+        # ~uniform, so quartile means are unbiased estimates), then classify
+        # by nearest learned center — the receiver adapts to whatever gamma,
+        # exposure, and contrast the channel actually delivered
+        q = np.quantile(pay_lum, [0.125, 0.375, 0.625, 0.875])
+        edges = np.quantile(pay_lum, [0.25, 0.5, 0.75])
+        centers = np.array([
+            pay_lum[pay_lum <= edges[0]].mean(),
+            pay_lum[(pay_lum > edges[0]) & (pay_lum <= edges[1])].mean(),
+            pay_lum[(pay_lum > edges[1]) & (pay_lum <= edges[2])].mean(),
+            pay_lum[pay_lum > edges[2]].mean(),
+        ])
+        syms = np.abs(pay_lum[:, None] - centers[None]).argmin(axis=1)
+        bits = np.array([GRAY4_BITS[int(s)] for s in syms], dtype=np.uint8).reshape(-1)
+        raw = _bytes(bits)
+        bounds = (centers[:-1] + centers[1:]) / 2
+        dist = np.min(np.abs(pay_lum[:, None] - bounds[None]), axis=1)
+        spread = max(1e-3, centers[-1] - centers[0])
+        cm = dist / spread
+        margins = np.repeat(cm, 2)   # each cell contributes 2 bits
+    elif header["mode"] == MODE_MONO:
         th, _ = cv2.threshold(np.clip(pay_lum, 0, 255).astype(np.uint8), 0, 255,
                               cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         bits = (pay_lum > th).astype(np.uint8)

@@ -28,7 +28,7 @@ def main():
     ap.add_argument("input")
     ap.add_argument("output", help=".mp4 path")
     ap.add_argument("--fps", type=int, default=30)
-    ap.add_argument("--mode", default="mono", choices=["mono", "color8"])
+    ap.add_argument("--mode", default="mono", choices=["mono", "color8", "gray4"])
     ap.add_argument("--cell-px", type=int, default=12)
     ap.add_argument("--grid", default="120x68")
     ap.add_argument("--overhead", type=float, default=1.6)
@@ -39,7 +39,8 @@ def main():
     args = ap.parse_args()
     grid.set_ecc(args.ecc)
 
-    mode = grid.MODE_MONO if args.mode == "mono" else grid.MODE_COLOR8
+    mode = {"mono": grid.MODE_MONO, "color8": grid.MODE_COLOR8,
+            "gray4": grid.MODE_GRAY4}[args.mode]
     gw, gh = (int(v) for v in args.grid.split("x"))
     layout = grid.Layout(gw, gh)
     # 4 bytes of the frame carry a CRC32 of the fountain block: RS(255,223)
