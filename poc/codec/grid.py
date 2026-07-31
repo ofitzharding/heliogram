@@ -23,7 +23,14 @@ from reedsolo import RSCodec, ReedSolomonError
 
 MAGIC = b"SCPC"
 HEADER_LEN = 24          # bytes, pre-RS
-HEADER_ECC = 12          # RS parity bytes on the header
+HEADER_ECC = 40          # RS parity bytes on the header.
+                         # Was 12 (corrects 6 byte errors) and measured as the
+                         # dominant loss on real captures: 1346 frames located,
+                         # only 346 headers readable. The header strip spans the
+                         # full width, so it eats the same edge defect as the
+                         # payload but with a fraction of the protection. It is
+                         # ~0.4% of the grid; over-armouring it is nearly free,
+                         # and every header recovered is a whole frame recovered.
 PAYLOAD_ECC = 32         # RS parity bytes per 255-byte chunk of payload
                          # (set_ecc() overrides; the value travels in the header)
 
@@ -153,26 +160,24 @@ def render_frame(layout: Layout, header: bytes, payload: bytes,
 
     # header: mono bits
     hb = _bits(header)
-    for bit, (r, c) in zip(hb, layout.header_cells):
-        cells[r, c] = 255.0 * bit
+    hc = layout.header_cells[: len(hb)]
+    cells[hc[:, 0], hc[:, 1]] = (255.0 * hb)[:, None]
     # unused header cells stay black
 
     # payload
-    enc = RSCodec(PAYLOAD_ECC)
-    coded = bytes(enc.encode(payload))
+    coded = bytes(RSCodec(PAYLOAD_ECC).encode(payload))
     if mode == MODE_MONO:
         pb = _bits(coded)
         n = min(len(pb), len(layout.payload_cells))
-        for bit, (r, c) in zip(pb[:n], layout.payload_cells[:n]):
-            cells[r, c] = 255.0 * bit
+        pc = layout.payload_cells[:n]
+        cells[pc[:, 0], pc[:, 1]] = (255.0 * pb[:n])[:, None]
     else:  # color8: 3 bits per cell
         pb = _bits(coded)
-        pad = (-len(pb)) % 3
-        pb = np.concatenate([pb, np.zeros(pad, dtype=np.uint8)])
+        pb = np.concatenate([pb, np.zeros((-len(pb)) % 3, dtype=np.uint8)])
         syms = pb.reshape(-1, 3) @ np.array([4, 2, 1])
         n = min(len(syms), len(layout.payload_cells))
-        for s, (r, c) in zip(syms[:n], layout.payload_cells[:n]):
-            cells[r, c] = PALETTE[s][::-1]  # BGR
+        pc = layout.payload_cells[:n]
+        cells[pc[:, 0], pc[:, 1]] = PALETTE[syms[:n]][:, ::-1]  # BGR
 
     img = cv2.resize(cells.astype(np.uint8), (gw * cell_px, gh * cell_px),
                      interpolation=cv2.INTER_NEAREST)

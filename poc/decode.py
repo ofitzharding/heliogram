@@ -103,7 +103,9 @@ def main():
                     tracked += 1
             if H is None:
                 continue
-            H = grid.refine_H(img, layout, H)
+            # NOTE: refine_H deliberately NOT applied — measured twice tonight
+            # (sim noise-30 fusion 14->4 blocks, real v2 capture 97->4): under
+            # real margins its translation snap injects alignment jitter.
         if args.combine or args.track:
             header, pay_samples, stats = grid.sample_frame(img, layout, H)
             located += stats["located"]
