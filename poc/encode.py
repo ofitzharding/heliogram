@@ -33,7 +33,11 @@ def main():
     ap.add_argument("--grid", default="120x68")
     ap.add_argument("--overhead", type=float, default=1.6)
     ap.add_argument("--frames-dir", help="also dump PNG frames here")
+    ap.add_argument("--ecc", type=int, default=32,
+                    help="RS parity bytes per 255-byte codeword; "
+                         "corrects ecc/2 byte errors")
     args = ap.parse_args()
+    grid.set_ecc(args.ecc)
 
     mode = grid.MODE_MONO if args.mode == "mono" else grid.MODE_COLOR8
     gw, gh = (int(v) for v in args.grid.split("x"))

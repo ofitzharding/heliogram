@@ -50,7 +50,11 @@ def main():
                          "predictable state: after one successful header "
                          "anywhere, seq is propagated by the capture clock and "
                          "the per-block CRC guards mispredictions. 0 = off")
+    ap.add_argument("--ecc", type=int, default=32,
+                    help="RS parity bytes per 255-byte codeword; "
+                         "corrects ecc/2 byte errors")
     args = ap.parse_args()
+    grid.set_ecc(args.ecc)
 
     gw, gh = (int(v) for v in args.grid.split("x"))
     layout = grid.Layout(gw, gh)
@@ -123,9 +127,21 @@ def main():
                 continue
             if args.combine:
                 acc = evidence.setdefault(header["seq"], [0.0, 0])
-                acc[0] = acc[0] + pay_samples
-                acc[1] += 1
-                payload = grid.decide_payload(header, acc[0] / acc[1])
+                if header["mode"] == grid.MODE_MONO:
+                    # majority vote per cell across captures of this frame:
+                    # robust to a degraded zone that wanders between passes,
+                    # and the vote fraction doubles as soft confidence
+                    lum = pay_samples.mean(axis=1)
+                    th, _ = cv2.threshold(np.clip(lum, 0, 255).astype(np.uint8),
+                                          0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                    acc[0] = acc[0] + (lum > th).astype(np.float32)
+                    acc[1] += 1
+                    pseudo = (acc[0] / acc[1] * 255.0)[:, None].repeat(3, axis=1)
+                    payload = grid.decide_payload(header, pseudo)
+                else:
+                    acc[0] = acc[0] + pay_samples
+                    acc[1] += 1
+                    payload = grid.decide_payload(header, acc[0] / acc[1])
             else:
                 payload = grid.decide_payload(header, pay_samples)
             if payload is None:

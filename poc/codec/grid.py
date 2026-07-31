@@ -25,6 +25,16 @@ MAGIC = b"SCPC"
 HEADER_LEN = 24          # bytes, pre-RS
 HEADER_ECC = 12          # RS parity bytes on the header
 PAYLOAD_ECC = 32         # RS parity bytes per 255-byte chunk of payload
+                         # (set_ecc() overrides; the value travels in the header)
+
+
+def set_ecc(n: int) -> None:
+    """Set payload parity per codeword. Measured on real captures: a mild
+    optical defect (one soft/glared screen edge) puts 25-30 byte errors in a
+    255-byte codeword while overall BER is only ~1.2%. ECC 32 corrects 16 and
+    fails; the errors are real and concentrated, not noise."""
+    global PAYLOAD_ECC
+    PAYLOAD_ECC = n
 
 MODE_MONO = 0
 MODE_COLOR8 = 1
@@ -328,11 +338,14 @@ def sample_frame(img: np.ndarray, layout: Layout, H: np.ndarray | None = None):
 def decide_payload(header: dict, pay_samples: np.ndarray):
     """Hard-decide cells from (possibly evidence-averaged) samples, then RS."""
     pay_lum = pay_samples.mean(axis=1)
+    margins = None
     if header["mode"] == MODE_MONO:
         th, _ = cv2.threshold(np.clip(pay_lum, 0, 255).astype(np.uint8), 0, 255,
                               cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         bits = (pay_lum > th).astype(np.uint8)
         raw = _bytes(bits)
+        spread = max(1e-3, np.percentile(pay_lum, 90) - np.percentile(pay_lum, 10))
+        margins = np.abs(pay_lum - th) / spread   # per-cell confidence
     else:
         # normalize channels against sampled extremes, then nearest palette color
         lo = np.percentile(pay_samples, 3, axis=0)
@@ -344,10 +357,31 @@ def decide_payload(header: dict, pay_samples: np.ndarray):
         raw = _bytes(bits)
 
     coded_len = rs_encoded_len(header["block_size"] + 4)  # +4: block CRC32
+    rs = RSCodec(PAYLOAD_ECC)
     try:
-        return bytes(RSCodec(PAYLOAD_ECC).decode(raw[:coded_len])[0])
+        return bytes(rs.decode(raw[:coded_len])[0])
     except ReedSolomonError:
+        pass
+    if margins is None:
         return None
+    # Soft-decision rescue: RS corrects e errors + s erasures with 2e+s <= 32,
+    # so telling it WHERE the doubt is doubles the budget. A byte is doubtful
+    # if it contains a cell whose luminance sat near the threshold.
+    byte_margin = margins[: (coded_len) * 8].reshape(-1, 8).min(axis=1)
+    out = bytearray()
+    pos = 0
+    while pos < coded_len:
+        k = min(255, coded_len - pos)
+        chunk = raw[pos:pos + k]
+        bm = byte_margin[pos:pos + k]
+        erase = list(np.argsort(bm)[: PAYLOAD_ECC - 6])   # keep >=3-error headroom
+        erase = [int(i) for i in erase if bm[i] < 0.15]
+        try:
+            out += rs.decode(chunk, erase_pos=erase)[0]
+        except ReedSolomonError:
+            return None
+        pos += k
+    return bytes(out)
 
 
 def decode_frame(img: np.ndarray, layout: Layout):
