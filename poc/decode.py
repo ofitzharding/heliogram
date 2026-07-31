@@ -113,9 +113,13 @@ def main():
         grid.set_radial(args.radial)
         print(f"radial k1 = {args.radial:+.3f} (given)")
     else:
+        # Decode-directed radial calibration. The Otsu-variance proxy was
+        # measured to land at k1=+0.035 where ground truth was +0.020, and BER
+        # is steep in k1 (0.44% vs ~4%). So optimise the objective we actually
+        # care about: how many probe frames produce a CRC-verified block.
         cal = cv2.VideoCapture(args.input)
-        ks = []
-        for fi in np.linspace(total * 0.25, total * 0.8, 8).astype(int):
+        probes = []
+        for fi in np.linspace(total * 0.2, total * 0.85, 14).astype(int):
             cal.set(cv2.CAP_PROP_POS_FRAMES, int(fi))
             ok, im = cal.read()
             if not ok:
@@ -124,12 +128,29 @@ def main():
             Hs = grid.locate(sm, layout)
             if Hs is None:
                 continue
-            Hf = (np.diag([2.0, 2.0, 1.0]) @ Hs) if im.shape[1] >= 3000 else Hs
-            ks.append(grid.estimate_radial(im, layout, Hf))
+            probes.append((im, (np.diag([2.0, 2.0, 1.0]) @ Hs)
+                           if im.shape[1] >= 3000 else Hs))
         cal.release()
-        k1 = float(np.median(ks)) if ks else 0.0
-        grid.set_radial(k1)
-        print(f"radial k1 = {k1:+.3f} (self-calibrated from {len(ks)} frames)")
+        best_k, best_hits = 0.0, -1
+        for k1 in np.arange(-0.02, 0.081, 0.005):
+            grid.set_radial(float(k1))
+            hits = 0
+            for im, Hf in probes:
+                hd, sm2, _st = grid.sample_frame(im, layout, Hf)
+                if hd is None or sm2 is None:
+                    continue
+                pl = grid.decide_payload(hd, sm2, layout)
+                if pl is None:
+                    continue
+                bsz = hd["block_size"]
+                if zlib.crc32(pl[4:4 + bsz]) & 0xFFFFFFFF == \
+                        struct.unpack("<I", pl[:4])[0]:
+                    hits += 1
+            if hits > best_hits:
+                best_k, best_hits = float(k1), hits
+        grid.set_radial(best_k)
+        print(f"radial k1 = {best_k:+.3f} "
+              f"(decode-directed: {best_hits}/{len(probes)} probe frames decode)")
 
     cap = cv2.VideoCapture(args.input)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
