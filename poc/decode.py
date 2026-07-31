@@ -78,11 +78,20 @@ def main():
         n += 1
         if args.max_frames and n > args.max_frames:
             break
+        if n % 100 == 0:
+            print(f"  ...frame {n}, {rs_ok} decoded", file=sys.stderr)
         H = None
+        if img.shape[1] >= 3000:
+            # 4K: detect on a half-scale copy, sample at full resolution
+            small = cv2.resize(img, None, fx=0.5, fy=0.5)
+            Hs = grid.locate(small, layout)
+            if Hs is not None:
+                H = np.diag([2.0, 2.0, 1.0]) @ Hs
         if args.track:
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
             window.append(gray)
-            H = grid.locate(img, layout)
+            if H is None:
+                H = grid.locate(img, layout)
             if H is None and len(window) >= 3:
                 mean = (sum(window) / len(window)).astype(np.uint8)
                 H = grid.locate(mean, layout)
@@ -123,7 +132,11 @@ def main():
                 continue
             added.add(header["seq"])
         else:
-            header, payload, stats = grid.decode_frame(img, layout)
+            header, pay_samples, stats = grid.sample_frame(img, layout, H)
+            payload = None
+            if header is not None:
+                payload = grid.decide_payload(header, pay_samples)
+                stats["rs_ok"] = payload is not None
             located += stats["located"]
             header_ok += stats["header_ok"]
             if stats["cell_margin"]:
