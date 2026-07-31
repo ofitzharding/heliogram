@@ -75,9 +75,11 @@ colour equalizer.
 
 ## Design notes
 
-- **Record-then-decode.** Every existing tool decodes live and pays a
-  real-time CPU tax in the loop (cimbar's effective fps is decode-bound).
-  We film with the iPhone at 240fps, then decode offline. Nobody does this.
+- **High-rate capture as the lever** (corrected claim — offline decoding
+  per se is not novel, PassiveCam 2024 names it; see wiki pass 4). The
+  camera is the admitted bottleneck (cimbar's own PERFORMANCE.md), so the
+  receiver treats shutter, frame rate and capture mode as design variables
+  rather than accepting camera defaults.
 - **Per-block CRC32 inside the RS payload.** RS(255,223) mis-corrects
   heavily damaged codewords into valid-but-wrong ones; one poisoned block
   silently corrupts the entire fountain output. Found by the straddle
