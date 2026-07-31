@@ -80,6 +80,13 @@ final class Renderer: NSObject, MTKViewDelegate {
     var measuredFPS: Double = 0
     weak var hud: NSTextField?
 
+    // --auto: run this schedule with no keyboard input, then quit.
+    // Order matters: the analyzer re-identifies each phase from its flicker
+    // signature, so one continuous slo-mo clip covers the whole session.
+    var autoMode = false
+    let appStart = CACurrentMediaTime()
+    let schedule: [(Pattern, Double)] = [(.alternate, 25), (.split, 25), (.staticRef, 25)]
+
     init(device: MTLDevice) {
         self.device = device
         self.queue = device.makeCommandQueue()!
@@ -147,6 +154,20 @@ final class Renderer: NSObject, MTKViewDelegate {
     func draw(in view: MTKView) {
         guard let drawable = view.currentDrawable,
               let rpd = view.currentRenderPassDescriptor else { return }
+        if autoMode {
+            let e = CACurrentMediaTime() - appStart
+            var t = 0.0
+            var current: Pattern? = nil
+            for (p, d) in schedule {
+                if e < t + d { current = p; break }
+                t += d
+            }
+            guard let p = current else {
+                DispatchQueue.main.async { NSApp.terminate(nil) }
+                return
+            }
+            pattern = p
+        }
         let elapsed = CACurrentMediaTime() - startTime
         var qs = quads(for: pattern, frame: frameIndex, elapsed: elapsed)
         frameIndex += 1
@@ -207,6 +228,7 @@ let view = KeyView(frame: screen.frame, device: device)
 view.colorPixelFormat = .bgra8Unorm
 view.preferredFramesPerSecond = 120   // ProMotion: request the full 120
 let renderer = Renderer(device: device)
+renderer.autoMode = CommandLine.arguments.contains("--auto")
 view.delegate = renderer
 view.renderer = renderer
 
