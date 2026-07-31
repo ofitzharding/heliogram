@@ -50,6 +50,29 @@ python3 poc/decode.py dirty.mp4 recovered.bin
 # AirDrop the capture, then decode.py the capture directly.
 ```
 
+## Current state (day 2)
+
+- **color4** (Oscar's call): 4-colour constellation, self-calibrating receiver
+  (local gray-world + k-means centroids labelled by structure). 248 KB/s raw
+  at 60fps, bit-exact through the simulated camera. The 8-colour set fails at
+  1.0 sigma margin; 4 colours has 4.0 sigma. The alphabet was the problem.
+- **adaptive** (waterfilling zones): mono at the edges, color4 elsewhere,
+  zone geometry in the v2 header. Slightly beats uniform color4 in sim even
+  under mild edge degradation; the decisive comparison needs real footage.
+- **bootstrap equalizer** (`bootstrap_decode.py`, mono-only for now): decodes
+  frames, learns the channel from them, redecodes. Recovered a file bit-exact
+  from a capture where the conventional receiver got zero blocks (23 -> 116
+  of 99 needed). Per-channel colour version deliberately waits for real
+  matrix footage, to avoid tuning against the simulator.
+- **Header v2**: ML sequence detection (soft correlation against all
+  candidate headers), clock-sync seq prediction, per-block CRC32 guarding
+  everything.
+
+Next real-world step: `./film_matrix.sh` — the honest 2x2
+({lights,dark} x {handheld,propped}), four 25s clips, which produces the
+operating-envelope numbers the paper needs and the training data for the
+colour equalizer.
+
 ## Design notes
 
 - **Record-then-decode.** Every existing tool decodes live and pays a

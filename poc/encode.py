@@ -28,11 +28,15 @@ def main():
     ap.add_argument("input")
     ap.add_argument("output", help=".mp4 path")
     ap.add_argument("--fps", type=int, default=30)
-    ap.add_argument("--mode", default="mono", choices=["mono", "color8", "gray4", "color4"])
+    ap.add_argument("--mode", default="mono", choices=["mono", "color8", "gray4", "color4", "adaptive"])
     ap.add_argument("--cell-px", type=int, default=12)
     ap.add_argument("--grid", default="120x68")
     ap.add_argument("--overhead", type=float, default=1.6)
     ap.add_argument("--frames-dir", help="also dump PNG frames here")
+    ap.add_argument("--zone-w", type=int, default=12,
+                    help="adaptive mode: edge-band width in cells")
+    ap.add_argument("--zones", default="mono,color4,color4",
+                    help="adaptive mode: alphabets for edge,mid,center zones")
     ap.add_argument("--ecc", type=int, default=32,
                     help="RS parity bytes per 255-byte codeword; "
                          "corrects ecc/2 byte errors")
@@ -40,14 +44,20 @@ def main():
     grid.set_ecc(args.ecc)
 
     mode = {"mono": grid.MODE_MONO, "color8": grid.MODE_COLOR8,
-            "gray4": grid.MODE_GRAY4,
-            "color4": grid.MODE_COLOR4}[args.mode]
+            "gray4": grid.MODE_GRAY4, "color4": grid.MODE_COLOR4,
+            "adaptive": grid.MODE_ADAPTIVE}[args.mode]
+    zone_w, zone_modes = 0, 0
+    if mode == grid.MODE_ADAPTIVE:
+        zone_w = args.zone_w
+        zmap = {"mono": 0, "color4": 1}
+        for i, name in enumerate(args.zones.split(",")):
+            zone_modes |= zmap[name.strip()] << (2 * i)
     gw, gh = (int(v) for v in args.grid.split("x"))
     layout = grid.Layout(gw, gh)
     # 4 bytes of the frame carry a CRC32 of the fountain block: RS(255,223)
     # can mis-correct a heavily damaged codeword into a wrong-but-valid one,
     # and one bad block silently poisons the whole fountain-decoded file.
-    block_size = layout.payload_capacity_bytes(mode) - 4
+    block_size = layout.payload_capacity_bytes(mode, zone_w, zone_modes) - 4
 
     data = Path(args.input).read_bytes()
     enc = fountain.Encoder(data, block_size)
@@ -71,8 +81,10 @@ def main():
         block = enc.block(seq)
         block = block + b"\x00" * (block_size - len(block))
         payload = struct.pack("<I", zlib.crc32(block) & 0xFFFFFFFF) + block
-        header = grid.pack_header(seq, enc.k, block_size, len(data), mode)
-        img = grid.render_frame(layout, header, payload, mode, args.cell_px)
+        header = grid.pack_header(seq, enc.k, block_size, len(data), mode,
+                                  zone_w, zone_modes)
+        img = grid.render_frame(layout, header, payload, mode, args.cell_px,
+                                zone_w, zone_modes)
         vw.write(img)
         if frames_dir:
             cv2.imwrite(str(frames_dir / f"f{seq:05d}.png"), img)

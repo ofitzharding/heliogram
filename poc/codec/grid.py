@@ -22,7 +22,7 @@ import numpy as np
 from reedsolo import RSCodec, ReedSolomonError
 
 MAGIC = b"SCPC"
-HEADER_LEN = 24          # bytes, pre-RS
+HEADER_LEN = 28          # bytes, pre-RS (v2: +zone_w, +zone_modes, +2 spare)
 HEADER_ECC = 40          # RS parity bytes on the header.
                          # Was 12 (corrects 6 byte errors) and measured as the
                          # dominant loss on real captures: 1346 frames located,
@@ -54,6 +54,20 @@ MODE_COLOR4 = 3  # black/red/green/blue, 2 bits/cell.
 COLOR4 = np.array([[0, 0, 0], [255, 0, 0], [0, 255, 0], [0, 0, 255]],
                   dtype=np.float32)   # RGB rows; rendered reversed to BGR
 COLOR4_BITS = np.array([[0, 0], [0, 1], [1, 0], [1, 1]], dtype=np.uint8)
+
+MODE_ADAPTIVE = 4  # spatially-adaptive bit-loading (waterfilling, pillar 3).
+                   # The screen is parallel subchannels with measured unequal
+                   # quality (0.0% error center vs 13% at one edge on real
+                   # captures; mono carries 9.8 sigma of unspent margin). A
+                   # uniform code transmits at worst-region rate everywhere.
+                   # This mode loads bits per zone: cells within `zone_w` of
+                   # the payload boundary use zone-0's alphabet, cells beyond
+                   # 3*zone_w use zone-2's, the band between uses zone-1's.
+                   # zone_modes packs 2 bits per zone: 0=mono(1b), 1=color4(2b).
+
+def zone_mode(zone_modes: int, z: int) -> int:
+    return (zone_modes >> (2 * z)) & 0x3   # 0=mono, 1=color4
+
 
 MODE_GRAY4 = 2   # 4 luminance levels, 2 bits/cell. Chosen from measurement:
                  # real captures show black/white separated by ~12 sigma while
@@ -103,9 +117,24 @@ class Layout:
         reserved = self.is_finder | self.is_sep | self.is_ring | self.is_header
         self.payload_cells = np.argwhere(~reserved)
 
-    def payload_capacity_bytes(self, mode: int) -> int:
-        bpc = {MODE_MONO: 1, MODE_COLOR8: 3, MODE_GRAY4: 2, MODE_COLOR4: 2}[mode]
-        bits = len(self.payload_cells) * bpc
+    def zone_of(self, zone_w: int) -> np.ndarray:
+        """Zone index (0 edge / 1 mid / 2 center) per payload cell."""
+        r, c = self.payload_cells[:, 0], self.payload_cells[:, 1]
+        d = np.minimum(np.minimum(r - 1, self.gh - 2 - r),
+                       np.minimum(c - 1, self.gw - 2 - c))
+        return np.where(d < zone_w, 0, np.where(d >= 3 * zone_w, 2, 1))
+
+    def bits_per_cell(self, mode: int, zone_w: int = 0, zone_modes: int = 0):
+        if mode != MODE_ADAPTIVE:
+            bpc = {MODE_MONO: 1, MODE_COLOR8: 3, MODE_GRAY4: 2, MODE_COLOR4: 2}[mode]
+            return np.full(len(self.payload_cells), bpc, dtype=np.int64)
+        z = self.zone_of(zone_w)
+        zm = np.array([zone_mode(zone_modes, i) for i in range(3)])
+        return np.where(zm[z] == 1, 2, 1)
+
+    def payload_capacity_bytes(self, mode: int, zone_w: int = 0,
+                               zone_modes: int = 0) -> int:
+        bits = int(self.bits_per_cell(mode, zone_w, zone_modes).sum())
         raw = bits // 8
         # largest b whose RS-encoded length fits in raw bytes
         b = raw * (255 - PAYLOAD_ECC) // 255
@@ -122,8 +151,10 @@ def rs_encoded_len(n: int) -> int:
     return n + chunks * PAYLOAD_ECC
 
 
-def pack_header(seq: int, k: int, block_size: int, file_size: int, mode: int) -> bytes:
-    body = MAGIC + struct.pack("<BBIIHIB", 1, mode, seq, k, block_size, file_size, PAYLOAD_ECC)
+def pack_header(seq: int, k: int, block_size: int, file_size: int, mode: int,
+                zone_w: int = 0, zone_modes: int = 0) -> bytes:
+    body = MAGIC + struct.pack("<BBIIHIBBB", 2, mode, seq, k, block_size,
+                               file_size, PAYLOAD_ECC, zone_w, zone_modes)
     body += b"\x00" * (HEADER_LEN - 2 - len(body))
     body += struct.pack("<H", zlib.crc32(body) & 0xFFFF)
     return bytes(RSCodec(HEADER_ECC).encode(body))
@@ -139,9 +170,10 @@ def unpack_header(raw: bytes):
     crc = struct.unpack("<H", body[-2:])[0]
     if zlib.crc32(body[:-2]) & 0xFFFF != crc:
         return None
-    ver, mode, seq, k, block_size, file_size, ecc = struct.unpack("<BBIIHIB", body[4:21])
-    return dict(version=ver, mode=mode, seq=seq, k=k,
-                block_size=block_size, file_size=file_size, ecc=ecc)
+    ver, mode, seq, k, block_size, file_size, ecc, zw, zm = \
+        struct.unpack("<BBIIHIBBB", body[4:23])
+    return dict(version=ver, mode=mode, seq=seq, k=k, block_size=block_size,
+                file_size=file_size, ecc=ecc, zone_w=zw, zone_modes=zm)
 
 
 def header_templates(proto: dict, max_seq: int) -> np.ndarray:
@@ -152,7 +184,9 @@ def header_templates(proto: dict, max_seq: int) -> np.ndarray:
     is one unknown integer, and the receiver can test all its values.
     """
     return np.array([_bits(pack_header(s, proto["k"], proto["block_size"],
-                                       proto["file_size"], proto["mode"]))
+                                       proto["file_size"], proto["mode"],
+                                       proto.get("zone_w", 0),
+                                       proto.get("zone_modes", 0)))
                      for s in range(max_seq + 1)], dtype=np.int8)
 
 
@@ -184,7 +218,8 @@ def _bytes(bits: np.ndarray) -> bytes:
 
 
 def render_frame(layout: Layout, header: bytes, payload: bytes,
-                 mode: int = MODE_MONO, cell_px: int = 12) -> np.ndarray:
+                 mode: int = MODE_MONO, cell_px: int = 12,
+                 zone_w: int = 0, zone_modes: int = 0) -> np.ndarray:
     """Returns a BGR image of the full frame."""
     gh, gw = layout.gh, layout.gw
     cells = np.zeros((gh, gw, 3), dtype=np.float32)
@@ -221,6 +256,18 @@ def render_frame(layout: Layout, header: bytes, payload: bytes,
         n = min(len(pb), len(layout.payload_cells))
         pc = layout.payload_cells[:n]
         cells[pc[:, 0], pc[:, 1]] = (255.0 * pb[:n])[:, None]
+    elif mode == MODE_ADAPTIVE:
+        pb = _bits(coded)
+        bpc = layout.bits_per_cell(mode, zone_w, zone_modes)
+        total = int(bpc.sum())
+        pb = np.concatenate([pb, np.zeros(max(0, total - len(pb)), np.uint8)])[:total]
+        starts = np.cumsum(bpc) - bpc
+        pc = layout.payload_cells
+        monoM = bpc == 1
+        colorM = ~monoM
+        cells[pc[monoM, 0], pc[monoM, 1]] = (255.0 * pb[starts[monoM]])[:, None]
+        syms = pb[starts[colorM]] * 2 + pb[starts[colorM] + 1]
+        cells[pc[colorM, 0], pc[colorM, 1]] = COLOR4[syms][:, ::-1]   # BGR
     elif mode == MODE_COLOR4:  # 2 bits per cell, 4-colour constellation
         pb = _bits(coded)
         pb = np.concatenate([pb, np.zeros((-len(pb)) % 2, dtype=np.uint8)])
@@ -455,7 +502,38 @@ def decide_payload(header: dict, pay_samples: np.ndarray,
     """Hard-decide cells from (possibly evidence-averaged) samples, then RS."""
     pay_lum = pay_samples.mean(axis=1)
     margins = None
-    if header["mode"] == MODE_COLOR4:
+    if header["mode"] == MODE_ADAPTIVE:
+        bpc = layout.bits_per_cell(MODE_ADAPTIVE, header["zone_w"],
+                                   header["zone_modes"])
+        n = min(len(bpc), len(pay_lum))
+        bpc = bpc[:n]
+        starts = np.cumsum(bpc) - bpc
+        total = int(bpc.sum())
+        bits = np.zeros(total, dtype=np.uint8)
+        margins = np.zeros(total, dtype=np.float32)
+        monoM = bpc == 1
+        colorM = ~monoM
+        # mono zone: Otsu over the mono cells only
+        ml = pay_lum[:n][monoM]
+        th, _ = cv2.threshold(np.clip(ml, 0, 255).astype(np.uint8), 0, 255,
+                              cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        bits[starts[monoM]] = (ml > th).astype(np.uint8)
+        spread = max(1e-3, np.percentile(ml, 90) - np.percentile(ml, 10))
+        margins[starts[monoM]] = np.abs(ml - th) / spread
+        # colour zone: self-calibrating 4-colour on those cells only
+        X = _local_normalize(pay_samples[:n], layout)[colorM]
+        cent = _learn_color4(X)
+        d = ((X[:, None, :] - cent[None]) ** 2).sum(axis=2)
+        syms = d.argmin(axis=1)
+        bits[starts[colorM]] = (syms >> 1).astype(np.uint8)
+        bits[starts[colorM] + 1] = (syms & 1).astype(np.uint8)
+        srt = np.sort(d, axis=1)
+        cm = ((np.sqrt(srt[:, 1]) - np.sqrt(srt[:, 0])) /
+              max(1e-3, float(np.median(np.sqrt(srt[:, 1])))))
+        margins[starts[colorM]] = cm
+        margins[starts[colorM] + 1] = cm
+        raw = _bytes(bits)
+    elif header["mode"] == MODE_COLOR4:
         # Self-calibrating constellation. Two stages, both measured as
         # necessary: (1) local gray-world normalisation removes the vignetting
         # and off-axis contrast roll-off that made a global palette fail;

@@ -34,6 +34,14 @@ def main():
     ap.add_argument("--repeat", type=int, default=1,
                     help="captures per displayed frame (camera fps / display fps); "
                          "each repeat gets independent jitter and noise")
+    ap.add_argument("--edge-fade", type=float, default=0.0,
+                    help="contrast collapse toward gray at the frame edges — "
+                         "the mechanism actually measured on real captures "
+                         "(edge blacks +30, whites -30). 0..1")
+    ap.add_argument("--edge-blur", type=float, default=0.0,
+                    help="extra blur that grows toward the frame edges — models "
+                         "off-axis defocus/contrast roll-off measured on real "
+                         "captures (screen edges 20 deg off-axis at 40cm)")
     args = ap.parse_args()
 
     cap = cv2.VideoCapture(args.input)
@@ -58,6 +66,14 @@ def main():
 
     frames = [f for f in frames for _ in range(args.repeat)]
     jit_state = np.zeros((4, 2))
+    # constant maps, hoisted out of the loop (were rebuilt per 4K frame)
+    yy, xx = np.mgrid[0:ch, 0:cw].astype(np.float32)
+    r2 = ((xx - cw / 2) / (cw / 2)) ** 2 + ((yy - ch / 2) / (ch / 2)) ** 2
+    vignette = (1.0 - 0.18 * r2)[..., None]
+    rr = np.maximum(np.abs(xx - cw / 2) / (cw / 2),
+                    np.abs(yy - ch / 2) / (ch / 2))
+    wgt = np.clip((rr - 0.35) / 0.45, 0, 1)[..., None]
+    inv_wgt = 1.0 - wgt
     for i, f in enumerate(frames):
         src_img = f
         if args.straddle > 0 and rng.random() < args.straddle and i + 1 < len(frames):
@@ -78,11 +94,15 @@ def main():
         if args.blur > 0:
             k = int(args.blur * 4) | 1
             out = cv2.GaussianBlur(out, (k, k), args.blur)
+        if args.edge_blur > 0:
+            kb = int(args.edge_blur * 4) | 1
+            heavy = cv2.GaussianBlur(out, (kb, kb), args.edge_blur)
+            out = (out * inv_wgt + heavy * wgt).astype(np.uint8)
         outf = out.astype(np.float32)
-        # mild vignette + gamma + sensor noise
-        yy, xx = np.mgrid[0:ch, 0:cw].astype(np.float32)
-        r2 = ((xx - cw / 2) / (cw / 2)) ** 2 + ((yy - ch / 2) / (ch / 2)) ** 2
-        outf *= (1.0 - 0.18 * r2)[..., None]
+        if args.edge_fade > 0:
+            f = args.edge_fade * wgt
+            outf = outf * (1 - f) + 127.0 * f
+        outf *= vignette
         outf = 255.0 * (outf / 255.0) ** args.gamma
         outf += rng.normal(0, args.noise, outf.shape)
         vw.write(np.clip(outf, 0, 255).astype(np.uint8))
