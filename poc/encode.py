@@ -74,6 +74,11 @@ def main():
             print(f"  rendered {seq}/{n_frames}", end="\r")
     vw.release()
     print(f"\nwrote {args.output}")
+    # The decoder cannot infer grid dimensions — it needs them to find the
+    # header in the first place. Print the exact command rather than let a
+    # mismatch surface as a silent "header ok 0".
+    print(f"\ndecode a capture of this with:\n"
+          f"  python3 decode.py <capture.mov> <out.bin> --grid {gw}x{gh}")
 
 
 if __name__ == "__main__":
