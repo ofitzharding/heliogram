@@ -131,6 +131,12 @@ def main():
     ap.add_argument("--grid", default="252x140")
     ap.add_argument("--ecc", type=int, default=80)
     ap.add_argument("--rounds", type=int, default=5)
+    ap.add_argument("--train-seconds", type=float, default=0,
+                    help="steady-state protocol: bootstrap ONLY on the first "
+                         "T seconds, then measure cold-start time-to-file on "
+                         "the remainder with the trained model. This is the "
+                         "honest goodput of a receiver that already knows the "
+                         "fingerprint.")
     args = ap.parse_args()
     grid.set_ecc(args.ecc)
 
@@ -151,6 +157,12 @@ def main():
     m = len(cells)
     tile_of = ((cells[:, 0] // TILE) * (gw // TILE + 1) + cells[:, 1] // TILE)
     tiles = np.unique(tile_of)
+
+    train_cut = None
+    if args.train_seconds > 0:
+        train_cut = int(args.train_seconds * fps)
+        print(f"steady-state protocol: training on captures 1..{train_cut}, "
+              f"measuring on the rest")
 
     dec = fountain.Decoder(proto["k"], proto["block_size"], proto["file_size"])
     decoded_blocks = {}   # seq -> block bytes (CRC-verified)
@@ -191,6 +203,10 @@ def main():
         return fields[seq]
 
     # ---- round 0: plain per-frame Otsu + vote fusion (the old receiver) ----
+    test_frames = None
+    if train_cut is not None:
+        test_frames = [f for f in frames if f["n"] > train_cut]
+        frames = [f for f in frames if f["n"] <= train_cut]
     by_seq = {}
     for f in frames:
         if f["seq"] is not None:
@@ -256,6 +272,7 @@ def main():
             thr[sel_c] = c[0] + 0.5 * c[1:].sum() + offset[sel_c]
             own_gain[sel_c] = c[5]
         ok_cells = own_gain > 1.0   # cells where the model learned a real gain
+        last_thr, last_ok = thr, ok_cells
 
         new = 0
         for seq, obs in by_seq.items():
@@ -278,6 +295,71 @@ def main():
               f"{len(train_seqs)} training frames)")
         if new == 0:
             break
+
+    # ---- steady-state measurement: trained receiver, cold start on the tail ----
+    if train_cut is not None:
+        if "last_thr" not in dir():
+            sys.exit("training phase never fit a model — lengthen --train-seconds")
+        dec2 = fountain.Decoder(proto["k"], proto["block_size"], proto["file_size"])
+        got2 = set()
+        votes = {}
+        n_start = train_cut
+        n_done = None
+        for f in test_frames:
+            if f["seq"] is None:
+                continue
+            lum = f["lum"][:m].astype(np.float32)
+            bits = np.where(last_ok, lum > last_thr, lum > np.median(lum))
+            acc = votes.setdefault(f["seq"], [np.zeros(m, dtype=np.float32), 0])
+            acc[0] += bits
+            acc[1] += 1
+            if f["seq"] in got2:
+                continue
+            pseudo = (acc[0] / acc[1] * 255.0)
+            payload = grid.decide_payload(dict(proto, seq=f["seq"]),
+                                          pseudo[:, None].repeat(3, axis=1))
+            if payload is None:
+                continue
+            bs = proto["block_size"]
+            crc = struct.unpack("<I", payload[:4])[0]
+            block = payload[4:4 + bs]
+            if zlib.crc32(block) & 0xFFFFFFFF != crc:
+                continue
+            got2.add(f["seq"])
+            dec2.add(f["seq"], block)
+            if not dec2.done and len(got2) >= dec2.k:
+                dec2.gaussian_fallback()
+            if dec2.done:
+                n_done = f["n"]
+                break
+        if n_done is None:
+            # Tail too short to gather k blocks. Report the quantity that
+            # actually determines throughput: per-capture decode yield with the
+            # trained model. time-to-file = k / (fps * yield), which is the
+            # honest steady-state rate, independent of how long this clip is.
+            attempted = sum(1 for f in test_frames if f["seq"] is not None)
+            yield_rate = len(got2) / max(1, len(set(f["seq"] for f in test_frames
+                                                    if f["seq"] is not None)))
+            t_file = proto["k"] / (fps * max(yield_rate, 1e-6))
+            print(f"\nSTEADY-STATE (trained receiver, single-pass yield):")
+            print(f"  tail: {attempted} captures, "
+                  f"{len(got2)} distinct blocks recovered of {proto['k']} needed")
+            print(f"  per-frame decode yield: {yield_rate*100:.0f}%")
+            print(f"  => time-to-file {t_file:.2f}s at {fps:.0f} fps display")
+            print(f"  => PROJECTED GOODPUT {proto['file_size']/t_file/1024:.1f} KB/s")
+            print(f"     (projection from measured yield, not a timed transfer)")
+            sys.exit(0)
+        data = dec2.result()
+        Path(args.output).write_bytes(data)
+        import hashlib
+        secs = (n_done - n_start) / fps
+        print(f"\nSTEADY-STATE (trained receiver, cold start):")
+        print(f"  recovered {len(data):,} bytes  "
+              f"sha256 {hashlib.sha256(data).hexdigest()[:16]}")
+        print(f"  time-to-file: {secs:.2f}s of capture "
+              f"({len(got2)} blocks gathered)")
+        print(f"  GOODPUT {len(data)/secs/1024:.1f} KB/s")
+        return
 
     if not dec.done:
         dec.gaussian_fallback()
