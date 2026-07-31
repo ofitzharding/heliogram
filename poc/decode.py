@@ -164,13 +164,13 @@ def main():
                     acc[0] = acc[0] + (lum > th).astype(np.float32)
                     acc[1] += 1
                     pseudo = (acc[0] / acc[1] * 255.0)[:, None].repeat(3, axis=1)
-                    payload = grid.decide_payload(header, pseudo)
+                    payload = grid.decide_payload(header, pseudo, layout)
                 else:
                     acc[0] = acc[0] + pay_samples
                     acc[1] += 1
-                    payload = grid.decide_payload(header, acc[0] / acc[1])
+                    payload = grid.decide_payload(header, acc[0] / acc[1], layout)
             else:
-                payload = grid.decide_payload(header, pay_samples)
+                payload = grid.decide_payload(header, pay_samples, layout)
             if payload is None:
                 continue
             added.add(header["seq"])
@@ -178,7 +178,7 @@ def main():
             header, pay_samples, stats = grid.sample_frame(img, layout, H)
             payload = None
             if header is not None:
-                payload = grid.decide_payload(header, pay_samples)
+                payload = grid.decide_payload(header, pay_samples, layout)
                 stats["rs_ok"] = payload is not None
             located += stats["located"]
             header_ok += stats["header_ok"]

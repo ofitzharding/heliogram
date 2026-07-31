@@ -172,7 +172,7 @@ def main():
         pseudo = (bits.astype(np.float32) * 255.0 if votes is None
                   else votes.astype(np.float32) * 255.0)
         payload = grid.decide_payload(dict(proto, seq=seq),
-                                      pseudo[:, None].repeat(3, axis=1))
+                                      pseudo[:, None].repeat(3, axis=1), layout)
         if payload is None:
             return False
         bs = proto["block_size"]
@@ -317,7 +317,7 @@ def main():
                 continue
             pseudo = (acc[0] / acc[1] * 255.0)
             payload = grid.decide_payload(dict(proto, seq=f["seq"]),
-                                          pseudo[:, None].repeat(3, axis=1))
+                                          pseudo[:, None].repeat(3, axis=1), layout)
             if payload is None:
                 continue
             bs = proto["block_size"]
