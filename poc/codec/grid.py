@@ -171,6 +171,52 @@ def render_frame(layout: Layout, header: bytes, payload: bytes,
 
 # ---------------------------------------------------------------- locating
 
+def known_cells(layout: Layout):
+    """(cells, expected01) for structure the receiver knows a priori:
+    the timing ring and the finder patterns."""
+    gh, gw, f = layout.gh, layout.gw, layout.finder
+    cells, exp = [], []
+    for c in range(gw):
+        cells += [(0, c), (gh - 1, c)]
+        exp += [c % 2 == 0] * 2
+    for r in range(1, gh - 1):
+        cells += [(r, 0), (r, gw - 1)]
+        exp += [r % 2 == 0] * 2
+    tpl = np.zeros((f, f), dtype=bool)
+    tpl[1:-1, 1:-1] = True
+    tpl[2:-2, 2:-2] = False
+    for (r0, c0) in [(1, 1), (1, gw - 1 - f), (gh - 1 - f, 1), (gh - 1 - f, gw - 1 - f)]:
+        for rr in range(f):
+            for cc in range(f):
+                cells.append((r0 + rr, c0 + cc))
+                exp.append(bool(tpl[rr, cc]))
+    return np.array(cells), np.array(exp, dtype=bool)
+
+
+def refine_H(img: np.ndarray, layout: Layout, H: np.ndarray, radius: int = 3):
+    """Snap an approximate (tracked) homography onto this capture by local
+    search over image-space translation, scored against the known timing
+    ring + finder cells. A tracked pose is a prediction; this is the
+    per-capture measurement update, and it converts alignment bias (which
+    evidence averaging cannot fix) into noise (which it can)."""
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+    cells, exp = known_cells(layout)
+    centers = np.stack([cells[:, 1] + 0.5, cells[:, 0] + 0.5], axis=1).astype(np.float32)
+    pts = cv2.perspectiveTransform(centers[None], H)[0]
+    h, w = gray.shape
+    best, best_off = None, (0, 0)
+    for dy in range(-radius, radius + 1):
+        for dx in range(-radius, radius + 1):
+            xs = np.clip((pts[:, 0] + dx).astype(int), 0, w - 1)
+            ys = np.clip((pts[:, 1] + dy).astype(int), 0, h - 1)
+            lum = gray[ys, xs].astype(np.float32)
+            score = lum[exp].mean() - lum[~exp].mean()
+            if best is None or score > best:
+                best, best_off = score, (dx, dy)
+    T = np.eye(3)
+    T[0, 2], T[1, 2] = best_off
+    return T @ H
+
 def _finder_centers(gray: np.ndarray):
     """QR-style finder detection: nested-contour test."""
     _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
@@ -244,10 +290,18 @@ def sample_cells(img: np.ndarray, layout: Layout, H: np.ndarray, cells: np.ndarr
     return acc / 9.0
 
 
-def decode_frame(img: np.ndarray, layout: Layout):
-    """Full frame decode. Returns (header_dict, payload_bytes, stats)."""
+def sample_frame(img: np.ndarray, layout: Layout, H: np.ndarray | None = None):
+    """Locate + sample + parse header, WITHOUT deciding the payload.
+    Returns (header_dict|None, pay_samples (n,3)|None, stats).
+
+    This split exists for the evidence-integrating receiver: samples from
+    multiple captures of the same displayed frame can be accumulated before
+    any hard decision is made. Pass H to skip detection and sample with a
+    tracked homography instead (the tracking receiver).
+    """
     stats = {"located": False, "header_ok": False, "rs_ok": False, "cell_margin": 0.0}
-    H = locate(img, layout)
+    if H is None:
+        H = locate(img, layout)
     if H is None:
         return None, None, stats
     stats["located"] = True
@@ -268,9 +322,15 @@ def decode_frame(img: np.ndarray, layout: Layout):
 
     spread = max(1e-3, np.percentile(pay_lum, 90) - np.percentile(pay_lum, 10))
     stats["cell_margin"] = float(np.mean(np.abs(pay_lum - th)) / spread)
+    return header, pay_samples, stats
 
-    enc = RSCodec(PAYLOAD_ECC)
+
+def decide_payload(header: dict, pay_samples: np.ndarray):
+    """Hard-decide cells from (possibly evidence-averaged) samples, then RS."""
+    pay_lum = pay_samples.mean(axis=1)
     if header["mode"] == MODE_MONO:
+        th, _ = cv2.threshold(np.clip(pay_lum, 0, 255).astype(np.uint8), 0, 255,
+                              cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         bits = (pay_lum > th).astype(np.uint8)
         raw = _bytes(bits)
     else:
@@ -285,8 +345,17 @@ def decode_frame(img: np.ndarray, layout: Layout):
 
     coded_len = rs_encoded_len(header["block_size"] + 4)  # +4: block CRC32
     try:
-        payload = bytes(enc.decode(raw[:coded_len])[0])
+        return bytes(RSCodec(PAYLOAD_ECC).decode(raw[:coded_len])[0])
     except ReedSolomonError:
-        return header, None, stats
-    stats["rs_ok"] = True
+        return None
+
+
+def decode_frame(img: np.ndarray, layout: Layout):
+    """Single-capture decode (the classical receiver). Returns (header, payload, stats)."""
+    header, pay_samples, stats = sample_frame(img, layout)
+    if header is None:
+        return None, None, stats
+    payload = decide_payload(header, pay_samples)
+    if payload is not None:
+        stats["rs_ok"] = True
     return header, payload, stats

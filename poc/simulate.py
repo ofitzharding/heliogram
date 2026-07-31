@@ -31,6 +31,9 @@ def main():
     ap.add_argument("--straddle", type=float, default=0.0)
     ap.add_argument("--gamma", type=float, default=1.15)
     ap.add_argument("--cam", default="1920x1080")
+    ap.add_argument("--repeat", type=int, default=1,
+                    help="captures per displayed frame (camera fps / display fps); "
+                         "each repeat gets independent jitter and noise")
     args = ap.parse_args()
 
     cap = cv2.VideoCapture(args.input)
@@ -53,6 +56,8 @@ def main():
     thh = int(tw * h / w)
     x0, y0 = (cw - tw) // 2, (ch - thh) // 2
 
+    frames = [f for f in frames for _ in range(args.repeat)]
+    jit_state = np.zeros((4, 2))
     for i, f in enumerate(frames):
         src_img = f
         if args.straddle > 0 and rng.random() < args.straddle and i + 1 < len(frames):
@@ -60,9 +65,11 @@ def main():
             src_img = f.copy()
             src_img[:boundary] = frames[i + 1][:boundary]
 
-        jit = rng.uniform(-args.tilt, args.tilt, (4, 2)).astype(np.float32)
+        # hand tremor is a smooth trajectory, not independent per-frame jumps:
+        # AR(1) random walk per corner, stationary std ~= 0.7 * tilt
+        jit_state = 0.9 * jit_state + rng.normal(0, args.tilt * 0.3, (4, 2))
         dst_pts = np.array([[x0, y0], [x0 + tw, y0], [x0, y0 + thh],
-                            [x0 + tw, y0 + thh]], dtype=np.float32) + jit
+                            [x0 + tw, y0 + thh]], dtype=np.float32) + jit_state.astype(np.float32)
         src_pts = np.array([[0, 0], [w, 0], [0, h], [w, h]], dtype=np.float32)
         H = cv2.getPerspectiveTransform(src_pts, dst_pts)
         out = cv2.warpPerspective(src_img, H, (cw, ch),

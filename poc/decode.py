@@ -17,9 +17,11 @@ import struct
 import sys
 import time
 import zlib
+from collections import deque
 from pathlib import Path
 
 import cv2
+import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
 from codec import fountain, grid
@@ -31,6 +33,23 @@ def main():
     ap.add_argument("output")
     ap.add_argument("--grid", default="120x68")
     ap.add_argument("--max-frames", type=int, default=0)
+    ap.add_argument("--combine", action="store_true",
+                    help="evidence-integrating receiver: average cell samples "
+                         "across every capture of the same displayed frame "
+                         "before deciding, instead of hard-deciding each "
+                         "capture independently")
+    ap.add_argument("--track", action="store_true",
+                    help="tracking receiver: when per-frame detection fails, "
+                         "locate on a sliding-window average of recent frames "
+                         "(fiducials are static, noise integrates away, tremor "
+                         "is smooth) and sample the current frame with that "
+                         "homography")
+    ap.add_argument("--repeat-hint", type=int, default=0,
+                    help="captures per displayed frame (camera fps / display "
+                         "fps). Lets the receiver treat the frame counter as "
+                         "predictable state: after one successful header "
+                         "anywhere, seq is propagated by the capture clock and "
+                         "the per-block CRC guards mispredictions. 0 = off")
     args = ap.parse_args()
 
     gw, gh = (int(v) for v in args.grid.split("x"))
@@ -44,6 +63,13 @@ def main():
     margins = []
     t0 = time.time()
     frames_at_done = None
+    evidence = {}   # seq -> [sum_of_samples, capture_count]
+    added = set()   # seqs already fed to the fountain
+    window = deque(maxlen=6)   # recent grayscale frames for tracked localization
+    tracked = 0
+    proto_header = None        # constants (k, block_size, mode) from any good header
+    offsets = []               # capture-clock-to-seq sync measurements
+    predicted = 0
 
     while True:
         ok, img = cap.read()
@@ -52,11 +78,56 @@ def main():
         n += 1
         if args.max_frames and n > args.max_frames:
             break
-        header, payload, stats = grid.decode_frame(img, layout)
-        located += stats["located"]
-        header_ok += stats["header_ok"]
-        if stats["cell_margin"]:
-            margins.append(stats["cell_margin"])
+        H = None
+        if args.track:
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
+            window.append(gray)
+            H = grid.locate(img, layout)
+            if H is None and len(window) >= 3:
+                mean = (sum(window) / len(window)).astype(np.uint8)
+                H = grid.locate(mean, layout)
+                if H is not None:
+                    tracked += 1
+            if H is None:
+                continue
+            H = grid.refine_H(img, layout, H)
+        if args.combine or args.track:
+            header, pay_samples, stats = grid.sample_frame(img, layout, H)
+            located += stats["located"]
+            header_ok += stats["header_ok"]
+            if stats["cell_margin"]:
+                margins.append(stats["cell_margin"])
+            if header is not None and args.repeat_hint:
+                # sync the capture clock to the sequence counter
+                offsets.append(n - header["seq"] * args.repeat_hint)
+                proto_header = header
+            if header is None and args.repeat_hint and proto_header is not None \
+                    and pay_samples is not None:
+                # header unreadable but geometry held: predict seq from the
+                # capture clock. A wrong prediction dies at the block CRC.
+                off = sorted(offsets)[len(offsets) // 2]
+                pred = (n - off) // args.repeat_hint
+                if pred >= 0:
+                    header = dict(proto_header, seq=pred)
+                    predicted += 1
+            if header is None or header["seq"] in added:
+                continue
+            if args.combine:
+                acc = evidence.setdefault(header["seq"], [0.0, 0])
+                acc[0] = acc[0] + pay_samples
+                acc[1] += 1
+                payload = grid.decide_payload(header, acc[0] / acc[1])
+            else:
+                payload = grid.decide_payload(header, pay_samples)
+            if payload is None:
+                continue
+            added.add(header["seq"])
+        else:
+            header, payload, stats = grid.decode_frame(img, layout)
+            located += stats["located"]
+            header_ok += stats["header_ok"]
+            if stats["cell_margin"]:
+                margins.append(stats["cell_margin"])
         if header is None or payload is None:
             continue
         bs = header["block_size"]
@@ -78,17 +149,20 @@ def main():
     wall = time.time() - t0
 
     print(f"frames read        {n}")
-    print(f"  located          {located}")
-    print(f"  header ok        {header_ok}")
+    print(f"  located          {located}" +
+          (f" ({tracked} rescued by tracking)" if args.track else ""))
+    print(f"  header ok        {header_ok}" +
+          (f" (+{predicted} seq-predicted)" if predicted else ""))
     print(f"  frame decoded    {rs_ok}")
     if margins:
-        import numpy as np
         print(f"cell margin        median {np.median(margins):.2f} "
               f"(>0.35 comfortable, <0.15 soft-decision territory)")
     if dec is None or not dec.done:
         got = 0 if dec is None else len(dec.decoded)
         want = 0 if dec is None else dec.k
-        sys.exit(f"FAILED: fountain incomplete ({got}/{want} blocks)")
+        held = 0 if dec is None else len(dec.pending)
+        sys.exit(f"FAILED: fountain incomplete ({got}/{want} blocks solved, "
+                 f"{held} coded blocks held as unsolved equations)")
 
     data = dec.result()
     Path(args.output).write_bytes(data)
