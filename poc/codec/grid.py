@@ -125,6 +125,37 @@ def unpack_header(raw: bytes):
                 block_size=block_size, file_size=file_size, ecc=ecc)
 
 
+def header_templates(proto: dict, max_seq: int) -> np.ndarray:
+    """Expected header bit patterns for every candidate seq, (max_seq+1, nbits).
+
+    Only `seq` varies between frames; k, block_size, file_size and mode are
+    constants of the transfer. So a header is not really 64 unknown bytes, it
+    is one unknown integer, and the receiver can test all its values.
+    """
+    return np.array([_bits(pack_header(s, proto["k"], proto["block_size"],
+                                       proto["file_size"], proto["mode"]))
+                     for s in range(max_seq + 1)], dtype=np.int8)
+
+
+def ml_header_seq(hdr_lum: np.ndarray, templates: np.ndarray):
+    """Maximum-likelihood seq from raw header luminances. Returns (seq, margin).
+
+    Correlates soft (unthresholded) measurements against every candidate
+    template. With ~500 bits of evidence the true seq wins by a wide margin
+    even when hard-decision RS decoding of the same strip fails outright,
+    which is the whole point: thresholding throws away the evidence that
+    distinguishes the candidates.
+    """
+    nb = templates.shape[1]
+    v = hdr_lum[:nb].astype(np.float64)
+    z = v - np.median(v)
+    scores = (templates.astype(np.float64) * 2 - 1) @ z
+    order = np.argsort(scores)[::-1]
+    best = int(order[0])
+    spread = scores.std() + 1e-9
+    return best, float((scores[order[0]] - scores[order[1]]) / spread)
+
+
 def _bits(data: bytes) -> np.ndarray:
     return np.unpackbits(np.frombuffer(data, dtype=np.uint8))
 
@@ -328,15 +359,17 @@ def sample_frame(img: np.ndarray, layout: Layout, H: np.ndarray | None = None):
     all_lum = np.concatenate([hdr_lum, pay_lum]).astype(np.uint8)
     th, _ = cv2.threshold(all_lum, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
+    spread = max(1e-3, np.percentile(pay_lum, 90) - np.percentile(pay_lum, 10))
+    stats["cell_margin"] = float(np.mean(np.abs(pay_lum - th)) / spread)
+
     n_hdr_bits = (HEADER_LEN + HEADER_ECC) * 8
     hdr_bits = (hdr_lum[:n_hdr_bits] > th).astype(np.uint8)
     header = unpack_header(_bytes(hdr_bits))
-    if header is None:
-        return None, None, stats
-    stats["header_ok"] = True
-
-    spread = max(1e-3, np.percentile(pay_lum, 90) - np.percentile(pay_lum, 10))
-    stats["cell_margin"] = float(np.mean(np.abs(pay_lum - th)) / spread)
+    stats["header_ok"] = header is not None
+    # Return the payload samples even when the header is unreadable: the
+    # geometry succeeded, so the frame is still worth rescuing by other means
+    # (see ml_header_seq). Discarding it here was throwing away 73% of
+    # successfully located frames on real captures.
     return header, pay_samples, stats
 
 
@@ -392,7 +425,7 @@ def decide_payload(header: dict, pay_samples: np.ndarray):
 def decode_frame(img: np.ndarray, layout: Layout):
     """Single-capture decode (the classical receiver). Returns (header, payload, stats)."""
     header, pay_samples, stats = sample_frame(img, layout)
-    if header is None:
+    if header is None or pay_samples is None:
         return None, None, stats
     payload = decide_payload(header, pay_samples)
     if payload is not None:

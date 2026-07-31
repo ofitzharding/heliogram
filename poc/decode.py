@@ -50,6 +50,13 @@ def main():
                          "predictable state: after one successful header "
                          "anywhere, seq is propagated by the capture clock and "
                          "the per-block CRC guards mispredictions. 0 = off")
+    ap.add_argument("--ml-header", action="store_true",
+                    help="when hard-decision header decoding fails, pick seq by "
+                         "maximum-likelihood correlation against all candidate "
+                         "headers using soft luminances")
+    ap.add_argument("--ml-margin", type=float, default=6.0,
+                    help="sigmas the winning candidate must beat the runner-up "
+                         "by; a wrong seq poisons the fountain, so be strict")
     ap.add_argument("--ecc", type=int, default=32,
                     help="RS parity bytes per 255-byte codeword; "
                          "corrects ecc/2 byte errors")
@@ -74,6 +81,8 @@ def main():
     proto_header = None        # constants (k, block_size, mode) from any good header
     offsets = []               # capture-clock-to-seq sync measurements
     predicted = 0
+    templates = None
+    ml_rescued = 0
 
     while True:
         ok, img = cap.read()
@@ -112,6 +121,22 @@ def main():
             header_ok += stats["header_ok"]
             if stats["cell_margin"]:
                 margins.append(stats["cell_margin"])
+            if header is not None:
+                proto_header = header   # transfer constants; seq is the only variable
+            if header is None and args.ml_header and proto_header is not None \
+                    and pay_samples is not None:
+                if templates is None:
+                    templates = grid.header_templates(
+                        proto_header, min(4000, 12 * proto_header["k"]))
+                Hh = H if H is not None else grid.locate(img, layout)
+                if Hh is None:
+                    continue
+                hdr_lum = grid.sample_cells(img, layout, Hh,
+                                            layout.header_cells).mean(axis=1)
+                seq, margin = grid.ml_header_seq(hdr_lum, templates)
+                if margin >= args.ml_margin:
+                    header = dict(proto_header, seq=seq)
+                    ml_rescued += 1
             if header is not None and args.repeat_hint:
                 # sync the capture clock to the sequence counter
                 offsets.append(n - header["seq"] * args.repeat_hint)
