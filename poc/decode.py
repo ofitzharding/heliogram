@@ -160,6 +160,7 @@ def main():
     margins = []
     t0 = time.time()
     frames_at_done = None
+    first_useful = None
     evidence = {}   # seq -> [sum_of_samples, capture_count]
     added = set()   # seqs already fed to the fountain
     window = deque(maxlen=6)   # recent grayscale frames for tracked localization
@@ -280,6 +281,8 @@ def main():
         if zlib.crc32(block) & 0xFFFFFFFF != crc:
             continue  # RS mis-correction or straddled frame — reject
         rs_ok += 1
+        if first_useful is None:
+            first_useful = n
         if dec is None:
             dec = fountain.Decoder(header["k"], bs, header["file_size"])
         dec.add(header["seq"], block)
@@ -310,11 +313,16 @@ def main():
 
     data = dec.result()
     Path(args.output).write_bytes(data)
+    # Honest accounting: a real transfer runs from the first capture that
+    # yields a block to the capture that completes the file. Dividing by the
+    # whole clip length understates the rate; dividing by frames_at_done
+    # includes dead lead-in before playback started.
+    span = (frames_at_done - (first_useful or 1) + 1) / fps
     seconds_of_video = frames_at_done / fps
-    goodput = len(data) / seconds_of_video / 1024
+    goodput = len(data) / span / 1024
     print(f"recovered          {len(data):,} bytes  sha256 {hashlib.sha256(data).hexdigest()[:16]}")
-    print(f"video time used    {seconds_of_video:.1f}s of capture ({frames_at_done} frames @ {fps:.0f}fps)")
-    print(f"GOODPUT            {goodput:.1f} KB/s")
+    print(f"transfer span      {span:.2f}s (frame {first_useful} -> {frames_at_done} @ {fps:.0f}fps)")
+    print(f"GOODPUT            {goodput:.1f} KB/s   ({goodput/129.2:.2f}x decimen)")
     print(f"decode wall time   {wall:.1f}s "
           f"({'faster' if wall < seconds_of_video else 'SLOWER'} than realtime)")
 
