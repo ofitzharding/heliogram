@@ -1,0 +1,4 @@
+captures/
+demo/*.mp4
+__pycache__/
+*.pyc

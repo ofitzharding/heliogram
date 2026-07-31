@@ -33,6 +33,15 @@ def main():
     ap.add_argument("--grid", default="120x68")
     ap.add_argument("--overhead", type=float, default=1.6)
     ap.add_argument("--frames-dir", help="also dump PNG frames here")
+    ap.add_argument("--strobe", action="store_true",
+                    help="interleave a black frame after every code frame and "
+                         "double the container fps. The display becomes the "
+                         "shutter: a handheld camera's long auto-exposure "
+                         "integrates one short flash plus darkness, so hand "
+                         "motion during the dark interval adds no blur. "
+                         "Transmit-side motion-freezing on an unmodified "
+                         "screen; the camera keeps all its light (the black "
+                         "interval contributes nothing but stillness)")
     ap.add_argument("--zone-w", type=int, default=12,
                     help="adaptive mode: edge-band width in cells")
     ap.add_argument("--zones", default="mono,color4,color4",
@@ -71,7 +80,9 @@ def main():
           f"(before capture losses)")
 
     size = (gw * args.cell_px, gh * args.cell_px)
-    vw = cv2.VideoWriter(args.output, cv2.VideoWriter_fourcc(*"mp4v"), args.fps, size)
+    out_fps = args.fps * 2 if args.strobe else args.fps
+    vw = cv2.VideoWriter(args.output, cv2.VideoWriter_fourcc(*"mp4v"), out_fps, size)
+    black = None
     frames_dir = None
     if args.frames_dir:
         frames_dir = Path(args.frames_dir)
@@ -86,6 +97,11 @@ def main():
         img = grid.render_frame(layout, header, payload, mode, args.cell_px,
                                 zone_w, zone_modes)
         vw.write(img)
+        if args.strobe:
+            if black is None:
+                import numpy as _np
+                black = _np.zeros_like(img)
+            vw.write(black)
         if frames_dir:
             cv2.imwrite(str(frames_dir / f"f{seq:05d}.png"), img)
         if seq % 50 == 0:

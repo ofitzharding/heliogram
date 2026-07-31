@@ -57,6 +57,13 @@ def main():
     ap.add_argument("--ml-margin", type=float, default=6.0,
                     help="sigmas the winning candidate must beat the runner-up "
                          "by; a wrong seq poisons the fountain, so be strict")
+    ap.add_argument("--min-margin", type=float, default=0.0,
+                    help="quality gate for fusion: captures below this cell "
+                         "margin do not vote. Handheld motion blur makes some "
+                         "frames garbage; letting them vote poisons the fusion")
+    ap.add_argument("--radial", type=float, default=None,
+                    help="lens radial distortion k1. Omit to self-calibrate "
+                         "from the footage (recommended); 0 disables")
     ap.add_argument("--ecc", type=int, default=32,
                     help="RS parity bytes per 255-byte codeword; "
                          "corrects ecc/2 byte errors")
@@ -64,7 +71,65 @@ def main():
     grid.set_ecc(args.ecc)
 
     gw, gh = (int(v) for v in args.grid.split("x"))
+    # Header format auto-detect: v2 (28B, zone fields) vs v1 (24B). The layout
+    # depends on it, so probe a few frames with each before committing.
     layout = grid.Layout(gw, gh)
+    probe = cv2.VideoCapture(args.input)
+    total = int(probe.get(cv2.CAP_PROP_FRAME_COUNT)) or 600
+    # Sample ACROSS the whole clip: real captures start and end with the code
+    # absent (playback hasn't begun / has finished), so probing only the head
+    # detects nothing and silently picks the wrong format.
+    probe_at = np.linspace(0, max(0, total - 1), 48).astype(int)
+    best, best_hits = 28, -1
+    for hl in (28, 24):
+        grid.set_header_len(hl)
+        lay = grid.Layout(gw, gh)
+        hits = 0
+        for fi in probe_at:
+            probe.set(cv2.CAP_PROP_POS_FRAMES, int(fi))
+            ok, im = probe.read()
+            if not ok:
+                continue
+            if im.shape[1] >= 3000:
+                sm = cv2.resize(im, None, fx=0.5, fy=0.5)
+                Hs = grid.locate(sm, lay)
+                H = np.diag([2.0, 2.0, 1.0]) @ Hs if Hs is not None else None
+            else:
+                H = grid.locate(im, lay)
+            if H is None:
+                continue
+            hd, _s, _st = grid.sample_frame(im, lay, H)
+            hits += hd is not None
+        if hits > best_hits:
+            best, best_hits = hl, hits
+    probe.release()
+    grid.set_header_len(best)
+    layout = grid.Layout(gw, gh)
+    print(f"header format v{'2' if best == 28 else '1'} "
+          f"({best}B, {best_hits} hits in probe)")
+
+    # Radial self-calibration: one k1 for the whole clip (lens is fixed).
+    if args.radial is not None:
+        grid.set_radial(args.radial)
+        print(f"radial k1 = {args.radial:+.3f} (given)")
+    else:
+        cal = cv2.VideoCapture(args.input)
+        ks = []
+        for fi in np.linspace(total * 0.25, total * 0.8, 8).astype(int):
+            cal.set(cv2.CAP_PROP_POS_FRAMES, int(fi))
+            ok, im = cal.read()
+            if not ok:
+                continue
+            sm = cv2.resize(im, None, fx=0.5, fy=0.5) if im.shape[1] >= 3000 else im
+            Hs = grid.locate(sm, layout)
+            if Hs is None:
+                continue
+            Hf = (np.diag([2.0, 2.0, 1.0]) @ Hs) if im.shape[1] >= 3000 else Hs
+            ks.append(grid.estimate_radial(im, layout, Hf))
+        cal.release()
+        k1 = float(np.median(ks)) if ks else 0.0
+        grid.set_radial(k1)
+        print(f"radial k1 = {k1:+.3f} (self-calibrated from {len(ks)} frames)")
 
     cap = cv2.VideoCapture(args.input)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -152,6 +217,8 @@ def main():
                     predicted += 1
             if header is None or header["seq"] in added:
                 continue
+            if args.combine and stats["cell_margin"] < args.min_margin:
+                continue   # blurred capture: not allowed to vote
             if args.combine:
                 acc = evidence.setdefault(header["seq"], [0.0, 0])
                 if header["mode"] == grid.MODE_MONO:
