@@ -490,6 +490,96 @@ def estimate_radial(img: np.ndarray, layout: Layout, H: np.ndarray,
     return best_k
 
 
+def estimate_psf_from_finders(img: np.ndarray, layout: Layout, H: np.ndarray,
+                              size: int = 9):
+    """Measure the camera's blur kernel using the finder patterns as a probe.
+
+    Every frame carries four 7x7 finder patterns whose exact shape the receiver
+    already knows. That makes them a free, in-band point-spread-function probe:
+    render the ideal finder, warp it through the same homography, and solve for
+    the kernel that turns ideal into observed. Blind deconvolution made
+    non-blind by the fiducials.
+
+    Motivation from measurement: ~26% of handheld captures are discarded as
+    motion-blurred (BER > 3%) while the sharp ones sit at 0.4%. Blur is a
+    linear, invertible corruption, so those frames are not noise — they are
+    recoverable signal that the receiver currently throws away.
+
+    Returns a (size, size) kernel normalised to sum 1, or None.
+    """
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+    gh, gw, f = layout.gh, layout.gw, layout.finder
+    ideal_cells = np.zeros((gh, gw), np.float32)
+    tpl = np.zeros((f, f), np.float32)
+    tpl[1:-1, 1:-1] = 255.0
+    tpl[2:-2, 2:-2] = 0.0
+    corners = [(1, 1), (1, gw - 1 - f), (gh - 1 - f, 1), (gh - 1 - f, gw - 1 - f)]
+    for (r0, c0) in corners:
+        ideal_cells[r0:r0 + f, c0:c0 + f] = tpl
+    # upsample the ideal grid to image scale, warp with the SAME homography
+    scale = 8
+    big = cv2.resize(ideal_cells, (gw * scale, gh * scale),
+                     interpolation=cv2.INTER_NEAREST)
+    S = np.array([[1.0 / scale, 0, 0], [0, 1.0 / scale, 0], [0, 0, 1]])
+    Hs = H @ S
+    warped = cv2.warpPerspective(big, Hs, (gray.shape[1], gray.shape[0]))
+
+    patches_i, patches_o = [], []
+    pad = size
+    for (r0, c0) in corners:
+        pt = cv2.perspectiveTransform(
+            np.array([[[c0 + f / 2.0, r0 + f / 2.0]]], np.float32),
+            H.astype(np.float32))[0][0]
+        x, y = int(round(pt[0])), int(round(pt[1]))
+        # patch big enough to contain the finder plus kernel support
+        half = int(abs(H[0, 0]) * f * 0.9) + pad
+        if x - half < 0 or y - half < 0 or \
+           x + half >= gray.shape[1] or y + half >= gray.shape[0]:
+            continue
+        patches_i.append(warped[y - half:y + half, x - half:x + half])
+        patches_o.append(gray[y - half:y + half, x - half:x + half].astype(np.float32))
+    if not patches_i:
+        return None
+
+    # Solve min ||conv(ideal, k) - observed||^2 in the frequency domain,
+    # accumulated over all available finders (Wiener-style, regularised).
+    num = None
+    den = None
+    for I, O in zip(patches_i, patches_o):
+        I = I - I.mean()
+        O = O - O.mean()
+        FI = np.fft.rfft2(I)
+        FO = np.fft.rfft2(O)
+        num = FI.conj() * FO if num is None else num + FI.conj() * FO
+        den = np.abs(FI) ** 2 if den is None else den + np.abs(FI) ** 2
+    K = np.fft.irfft2(num / (den + 1e-2 * den.max()), s=patches_i[0].shape)
+    K = np.fft.fftshift(K)
+    c = K.shape[0] // 2, K.shape[1] // 2
+    h = size // 2
+    k = K[c[0] - h:c[0] + h + 1, c[1] - h:c[1] + h + 1].astype(np.float32)
+    if k.size == 0 or not np.isfinite(k).all():
+        return None
+    s = k.sum()
+    if abs(s) < 1e-6:
+        return None
+    return k / s
+
+
+def deconvolve(img: np.ndarray, kernel: np.ndarray, iters: int = 12):
+    """Richardson-Lucy deconvolution with the measured kernel."""
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+    obs = gray.astype(np.float32) + 1e-3
+    est = obs.copy()
+    kf = kernel.astype(np.float32)
+    kfm = kf[::-1, ::-1].copy()
+    for _ in range(iters):
+        conv = cv2.filter2D(est, -1, kf, borderType=cv2.BORDER_REPLICATE)
+        rel = obs / np.maximum(conv, 1e-3)
+        est *= cv2.filter2D(rel, -1, kfm, borderType=cv2.BORDER_REPLICATE)
+        np.clip(est, 0, 255, out=est)
+    return est
+
+
 def sample_cells(img: np.ndarray, layout: Layout, H: np.ndarray, cells: np.ndarray):
     """Sample given (r,c) cells; returns float32 (n, 3) BGR means of 3x3 patches."""
     centers = np.stack([cells[:, 1] + 0.5, cells[:, 0] + 0.5], axis=1).astype(np.float32)

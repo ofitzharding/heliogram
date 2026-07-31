@@ -61,6 +61,9 @@ def main():
                     help="quality gate for fusion: captures below this cell "
                          "margin do not vote. Handheld motion blur makes some "
                          "frames garbage; letting them vote poisons the fusion")
+    ap.add_argument("--radial-refine", action="store_true",
+                    help="on a frame that fails to decode, retry at neighbouring "
+                         "k1 values. Free on frames that already work")
     ap.add_argument("--radial", type=float, default=None,
                     help="lens radial distortion k1. Omit to self-calibrate "
                          "from the footage (recommended); 0 disables")
@@ -170,6 +173,7 @@ def main():
     predicted = 0
     templates = None
     ml_rescued = 0
+    refined = 0
 
     while True:
         ok, img = cap.read()
@@ -202,79 +206,88 @@ def main():
             # NOTE: refine_H deliberately NOT applied — measured twice tonight
             # (sim noise-30 fusion 14->4 blocks, real v2 capture 97->4): under
             # real margins its translation snap injects alignment jitter.
-        if args.combine or args.track:
-            header, pay_samples, stats = grid.sample_frame(img, layout, H)
-            located += stats["located"]
-            header_ok += stats["header_ok"]
-            if stats["cell_margin"]:
-                margins.append(stats["cell_margin"])
-            if header is not None:
-                proto_header = header   # transfer constants; seq is the only variable
-            if header is None and args.ml_header and proto_header is not None \
-                    and pay_samples is not None:
+        # ONE path for every frame. This used to be split so that header
+        # recovery only ran under --combine/--track, which silently disabled
+        # --ml-header when used alone: a config sweep returned byte-identical
+        # results for plain / ml-header / ml-header+repeat-hint. Since the
+        # measured funnel puts the header stage as the dominant loss (65% of
+        # located frames), that bug sat directly on the critical path.
+        header, pay_samples, stats = grid.sample_frame(img, layout, H)
+        located += stats["located"]
+        header_ok += stats["header_ok"]
+        if stats["cell_margin"]:
+            margins.append(stats["cell_margin"])
+        if header is not None:
+            proto_header = header   # transfer constants; seq is the only variable
+            if args.repeat_hint:
+                offsets.append(n - header["seq"] * args.repeat_hint)
+
+        # Header unreadable but geometry held: recover seq rather than drop the
+        # frame. ML template correlation first (uses soft luminances), then the
+        # capture clock. A wrong seq dies at the per-block CRC below.
+        if header is None and pay_samples is not None and proto_header is not None:
+            if args.ml_header and H is not None:
                 if templates is None:
                     templates = grid.header_templates(
                         proto_header, min(4000, 12 * proto_header["k"]))
-                Hh = H if H is not None else grid.locate(img, layout)
-                if Hh is None:
-                    continue
-                hdr_lum = grid.sample_cells(img, layout, Hh,
+                hdr_lum = grid.sample_cells(img, layout, H,
                                             layout.header_cells).mean(axis=1)
                 seq, margin = grid.ml_header_seq(hdr_lum, templates)
                 if margin >= args.ml_margin:
                     header = dict(proto_header, seq=seq)
                     ml_rescued += 1
-            if header is not None and args.repeat_hint:
-                # sync the capture clock to the sequence counter
-                offsets.append(n - header["seq"] * args.repeat_hint)
-                proto_header = header
-            if header is None and args.repeat_hint and proto_header is not None \
-                    and pay_samples is not None:
-                # header unreadable but geometry held: predict seq from the
-                # capture clock. A wrong prediction dies at the block CRC.
+            if header is None and args.repeat_hint and offsets:
                 off = sorted(offsets)[len(offsets) // 2]
                 pred = (n - off) // args.repeat_hint
                 if pred >= 0:
                     header = dict(proto_header, seq=pred)
                     predicted += 1
-            if header is None or header["seq"] in added:
-                continue
-            if args.combine and stats["cell_margin"] < args.min_margin:
-                continue   # blurred capture: not allowed to vote
-            if args.combine:
-                acc = evidence.setdefault(header["seq"], [0.0, 0])
-                if header["mode"] == grid.MODE_MONO:
-                    # majority vote per cell across captures of this frame:
-                    # robust to a degraded zone that wanders between passes,
-                    # and the vote fraction doubles as soft confidence
-                    lum = pay_samples.mean(axis=1)
-                    th, _ = cv2.threshold(np.clip(lum, 0, 255).astype(np.uint8),
-                                          0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-                    acc[0] = acc[0] + (lum > th).astype(np.float32)
-                    acc[1] += 1
-                    pseudo = (acc[0] / acc[1] * 255.0)[:, None].repeat(3, axis=1)
-                    payload = grid.decide_payload(header, pseudo, layout)
-                else:
-                    acc[0] = acc[0] + pay_samples
-                    acc[1] += 1
-                    payload = grid.decide_payload(header, acc[0] / acc[1], layout)
-            else:
-                payload = grid.decide_payload(header, pay_samples, layout)
-            if payload is None:
-                continue
-            added.add(header["seq"])
-        else:
-            header, pay_samples, stats = grid.sample_frame(img, layout, H)
-            payload = None
-            if header is not None:
-                payload = grid.decide_payload(header, pay_samples, layout)
-                stats["rs_ok"] = payload is not None
-            located += stats["located"]
-            header_ok += stats["header_ok"]
-            if stats["cell_margin"]:
-                margins.append(stats["cell_margin"])
-        if header is None or payload is None:
+
+        if header is None or pay_samples is None:
             continue
+        if header["seq"] in added:
+            continue
+        if args.combine:
+            if stats["cell_margin"] < args.min_margin:
+                continue   # blurred capture: not allowed to vote
+            acc = evidence.setdefault(header["seq"], [0.0, 0])
+            if header["mode"] == grid.MODE_MONO:
+                # majority vote per cell across captures of this frame
+                lum = pay_samples.mean(axis=1)
+                th, _ = cv2.threshold(np.clip(lum, 0, 255).astype(np.uint8),
+                                      0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                acc[0] = acc[0] + (lum > th).astype(np.float32)
+                acc[1] += 1
+                pseudo = (acc[0] / acc[1] * 255.0)[:, None].repeat(3, axis=1)
+                payload = grid.decide_payload(header, pseudo, layout)
+            else:
+                acc[0] = acc[0] + pay_samples
+                acc[1] += 1
+                payload = grid.decide_payload(header, acc[0] / acc[1], layout)
+        else:
+            payload = grid.decide_payload(header, pay_samples, layout)
+            if payload is None and args.radial_refine and H is not None:
+                # Per-frame radial refinement. The global k1 is a median; the
+                # per-frame optimum was measured to vary 0.015-0.020, and BER is
+                # steep in k1. Retrying a failed frame at neighbouring k1 lifted
+                # frames-under-RS-limit from 70% to 80% in ground-truth tests.
+                # Costs nothing on frames that already decode.
+                k0 = grid.RADIAL_K1
+                for dk in (-0.008, +0.008, -0.004, +0.004, -0.012, +0.012):
+                    grid.set_radial(k0 + dk)
+                    s2 = grid.sample_cells(img, layout, H, layout.payload_cells)
+                    p2 = grid.decide_payload(header, s2, layout)
+                    if p2 is not None:
+                        bs2 = header["block_size"]
+                        if zlib.crc32(p2[4:4 + bs2]) & 0xFFFFFFFF == \
+                                struct.unpack("<I", p2[:4])[0]:
+                            payload = p2
+                            refined += 1
+                            break
+                grid.set_radial(k0)
+        if payload is None:
+            continue
+        added.add(header["seq"])
         bs = header["block_size"]
         crc = struct.unpack("<I", payload[:4])[0]
         block = payload[4:4 + bs]
@@ -299,7 +312,10 @@ def main():
     print(f"  located          {located}" +
           (f" ({tracked} rescued by tracking)" if args.track else ""))
     print(f"  header ok        {header_ok}" +
-          (f" (+{predicted} seq-predicted)" if predicted else ""))
+          (f" (+{ml_rescued} ML-rescued)" if ml_rescued else "") +
+          (f" (+{predicted} clock-predicted)" if predicted else ""))
+    if refined:
+        print(f"  radial-refined   {refined} frames rescued")
     print(f"  frame decoded    {rs_ok}")
     if margins:
         print(f"cell margin        median {np.median(margins):.2f} "
