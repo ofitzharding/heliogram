@@ -88,14 +88,12 @@ These are measurements, not estimates:
 
 ## What I need from you
 
-**1. Kill or confirm my remaining claim.** Each Reed-Solomon codeword is made
-its own fountain symbol, so a frame damaged in one region contributes every
-codeword that survived instead of nothing (measured: 50% of frames usable ->
-65% of codewords recovered from the same captures). Combined with soft
-erasures placed by per-cell confidence (2e + s <= parity, so marking doubt
-doubles RS reach). Is per-codeword fountain granularity with soft erasure
-placement published in screen-camera, barcode, or optical camera
-communication? Check libcimbar's wirehair usage specifically.
+**1. ANSWERED 2026-08-01 — claim KILLED, skip this.** libcimbar already runs
+10 fountain chunks per displayed frame (GridConf.h `fountain_chunks_per_frame()`,
+source comment "ex: 10 chunks per frame"), so sub-frame fountain granularity is
+prior art in the nearest competitor; and confidence-ranked erasure escalation is
+Forney's GMD decoding (1966). The measured benefit stands; the novelty claim is
+retracted. Do not re-litigate.
 
 **2. Challenge the simulator.** My synthetic channel is Gaussian blur +
 perspective + noise + vignette + gamma. It has been WRONG repeatedly: it
