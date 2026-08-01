@@ -58,7 +58,7 @@ def _dialog(msg, buttons, default):
     Falls back to Return-in-terminal when osascript is unavailable."""
     try:
         r = subprocess.run(
-            ["osascript", "-e",
+            ["/usr/bin/osascript", "-e",
              f'display dialog "{msg}" buttons {{{buttons}}} '
              f'default button "{default}" with title "optical"'],
             capture_output=True, timeout=3600)
