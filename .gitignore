@@ -2,3 +2,5 @@ captures/
 demo/*.mp4
 __pycache__/
 *.pyc
+demo/_tx_*
+demo/_countdown*

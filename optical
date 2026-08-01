@@ -53,6 +53,32 @@ def run(cmd, **kw):
 
 
 
+def _screen_points():
+    """Logical (point) size of the main display. ffplay windows are sized in
+    points; a window this size covers the screen while keeping the drawable
+    small enough to present at a true 60 fps."""
+    try:
+        r = subprocess.run(
+            ["/usr/bin/osascript", "-e",
+             'tell application "Finder" to get bounds of window of desktop'],
+            capture_output=True, timeout=10, text=True)
+        parts = [int(v) for v in r.stdout.strip().split(", ")]
+        if len(parts) == 4 and parts[2] > 100:
+            return parts[2], parts[3]
+    except Exception:
+        pass
+    return 1512, 982
+
+
+def _video_size(path):
+    import cv2
+    cap = cv2.VideoCapture(str(path))
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 2842
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1568
+    cap.release()
+    return w, h
+
+
 def _dialog(msg, buttons, default):
     """macOS dialog; returns True if the default (non-Cancel) button was hit.
     Falls back to Return-in-terminal when osascript is unavailable."""
@@ -72,19 +98,16 @@ def _dialog(msg, buttons, default):
             return False
 
 
-def _make_countdown(dst, like):
-    """5-second countdown clip matching the code video's geometry, so the
-    phone is already recording and framed before the first data frame."""
+def _make_countdown(dst, like, seconds=8, size=None):
+    """Countdown clip matching the code video's geometry, so the phone is
+    already recording and framed before the first data frame."""
     import cv2
-    cap = cv2.VideoCapture(str(like))
-    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 2842
-    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1568
-    cap.release()
+    W, H = size if size else _video_size(like)
     try:
         import numpy as np
         vw = cv2.VideoWriter(str(dst), cv2.VideoWriter_fourcc(*"mp4v"), 60,
                              (W, H))
-        for sec in (5, 4, 3, 2, 1):
+        for sec in range(seconds, 0, -1):
             f = np.zeros((H, W, 3), np.uint8)
             cv2.putText(f, "HIT RECORD", (W // 2 - 460, H // 2 - 200),
                         cv2.FONT_HERSHEY_SIMPLEX, 3.2, (255, 255, 255), 8)
@@ -127,32 +150,61 @@ def cmd_send(args):
 
     print("\nOn the phone: 4K 60fps, landscape, 1x, AE/AF locked (tap and")
     print("hold on the code), all four corner markers in frame, brightness MAX.")
-    if not _dialog("Ready to film.\n\n"
-                   "1. Press Start.\n"
-                   "2. Hit RECORD on the phone during the 5-second countdown.\n"
-                   "3. Playback stops by itself after "
-                   f"{args.loops} loops (~{args.loops * 13}s).",
-                   '"Cancel", "Start"', "Start"):
-        return
+    if not args.auto:
+        if not _dialog("Ready to film.\n\n"
+                       "1. Press Start.\n"
+                       "2. Hit RECORD on the phone during the countdown.\n"
+                       "3. Playback stops by itself after "
+                       f"{args.loops} loops (~{args.loops * 13}s).",
+                       '"Cancel", "Start"', "Start"):
+            return
     # The raw encode is ~430 Mbps mpeg4, which ffplay decodes in software and
     # drops frames on (measured: 104/760 dropped, with a 0.7s stall). Every
     # dropped display frame is a missing fountain symbol. Transcode a playback
     # copy to hardware-decodable H.264 once and play that instead.
-    play = out.with_name(out.stem + "_play.mp4")
+    #
+    # PLAYBACK GEOMETRY — measured, not guessed.
+    #
+    # The raw encode is a ~430 Mbps mpeg4 that ffplay decodes in software.
+    # Worse, ffplay FULLSCREEN on a Retina panel presents a 3024x1964
+    # drawable through a single-threaded YUV->RGB path and tops out at
+    # 26.7 fps: measured 28.5s wall for a 12.67s clip, with zero frames
+    # dropped (it runs late rather than dropping). At 26.7 fps the real
+    # data rate is 0.44x what the profile claims, silently.
+    #
+    # A 1512x982 borderless window measures 58.9 fps with 0 drops, and on
+    # this 2x Retina panel it still covers the whole screen — each backing
+    # pixel is drawn as 2x2 physical, so cells keep their physical size.
+    # The 2:1 downscale is exact (uniform 14px cell blocks -> 7px), so no
+    # aliasing is introduced.
+    #
+    sw, sh = _screen_points()
+    vw, vh = _video_size(out)
+    scale = min(1.0, min(sw / vw, sh / vh))
+    tw, th = int(vw * scale) // 2 * 2, int(vh * scale) // 2 * 2
+    play = out.with_name(out.stem + f"_play{sw}x{sh}.mp4")
     if not play.exists() or play.stat().st_mtime < out.stat().st_mtime:
-        print("preparing smooth playback copy (one-time)…")
-        rc = run(f'ffmpeg -v error -y -i "{out}" -c:v libx264 -crf 10 '
-                 f'-preset fast -tune stillimage -pix_fmt yuv420p "{play}"')
+        print(f"preparing playback copy at {tw}x{th} in a {sw}x{sh} window "
+              f"(one-time)…")
+        rc = run(f'ffmpeg -v error -y -i "{out}" '
+                 f'-vf "scale={tw}:{th}:flags=neighbor,'
+                 f'pad={sw}:{sh}:(ow-iw)/2:(oh-ih)/2:black" '
+                 f'-c:v libx264 -crf 8 -preset fast -tune stillimage '
+                 f'-pix_fmt yuv420p "{play}"')
         if rc.returncode:
             play = out          # fall back to the raw encode
-    cd_clip = out.parent / "_countdown.mp4"
+    cd_clip = out.parent / f"_countdown{args.countdown}.mp4"
     if not cd_clip.exists():
-        _make_countdown(cd_clip, play)
+        _make_countdown(cd_clip, play, args.countdown, (sw, sh))
     if cd_clip.exists():
-        run(f'ffplay -fs -alwaysontop -noborder -autoexit "{cd_clip}"')
+        print(f"\ncountdown starts NOW — hit record on the phone when you "
+              f"see it on screen ({args.countdown}s).")
+        run(f'ffplay -alwaysontop -noborder -autoexit -left 0 -top 0 '
+            f'-x {sw} -y {sh} "{cd_clip}"')
     print("playing… stops by itself, keep filming until the screen goes back to normal")
     t0 = time.time()
-    run(f'ffplay -fs -alwaysontop -noborder -loop {args.loops} -autoexit "{play}"')
+    run(f'ffplay -alwaysontop -noborder -loop {args.loops} -autoexit '
+        f'-left 0 -top 0 -x {sw} -y {sh} "{play}"')
     shown = time.time() - t0
     meta.write_text(json.dumps(dict(file=src.name, size=size,
                                     profile=args.profile, shown_seconds=round(shown, 2),
@@ -162,9 +214,10 @@ def cmd_send(args):
     print("\n3. Stop recording. AirDrop the capture to this Mac")
     print(f"   (it lands in ~/Downloads), then:")
     print(f"\n   ./optical recv ~/Downloads/<capture>.mov")
-    _dialog(f"Done: the code was displayed for {shown:.1f}s.\n\n"
-            "Stop recording, AirDrop the capture to this Mac, then run:\n\n"
-            "./optical recv ~/Downloads/<capture>.mov", '"OK"', "OK")
+    if not args.auto:
+        _dialog(f"Done: the code was displayed for {shown:.1f}s.\n\n"
+                "Stop recording, AirDrop the capture to this Mac, then run:\n\n"
+                "./optical recv ~/Downloads/<capture>.mov", '"OK"', "OK")
 
 
 def _detect(capture):
@@ -253,6 +306,11 @@ def main():
     s.add_argument("--profile", default="fast", choices=list(PROFILES))
     s.add_argument("--overhead", type=float, default=2.2)
     s.add_argument("--loops", type=int, default=3)
+    s.add_argument("--auto", action="store_true",
+                   help="no dialogs: countdown, play, stop. The countdown IS "
+                        "the cue to hit record.")
+    s.add_argument("--countdown", type=int, default=8,
+                   help="seconds of on-screen countdown before the code")
     s.add_argument("--force", action="store_true")
     s.set_defaults(fn=cmd_send)
 
