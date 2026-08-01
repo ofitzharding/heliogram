@@ -51,6 +51,53 @@ def run(cmd, **kw):
     return subprocess.run(cmd, shell=True, **kw)
 
 
+
+
+def _dialog(msg, buttons, default):
+    """macOS dialog; returns True if the default (non-Cancel) button was hit.
+    Falls back to Return-in-terminal when osascript is unavailable."""
+    try:
+        r = subprocess.run(
+            ["osascript", "-e",
+             f'display dialog "{msg}" buttons {{{buttons}}} '
+             f'default button "{default}" with title "optical"'],
+            capture_output=True, timeout=3600)
+        return r.returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        print(msg)
+        try:
+            input("(Return to continue) ")
+            return True
+        except (EOFError, KeyboardInterrupt):
+            return False
+
+
+def _make_countdown(dst, like):
+    """5-second countdown clip matching the code video's geometry, so the
+    phone is already recording and framed before the first data frame."""
+    import cv2
+    cap = cv2.VideoCapture(str(like))
+    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 2842
+    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1568
+    cap.release()
+    try:
+        import numpy as np
+        vw = cv2.VideoWriter(str(dst), cv2.VideoWriter_fourcc(*"mp4v"), 60,
+                             (W, H))
+        for sec in (5, 4, 3, 2, 1):
+            f = np.zeros((H, W, 3), np.uint8)
+            cv2.putText(f, "HIT RECORD", (W // 2 - 460, H // 2 - 200),
+                        cv2.FONT_HERSHEY_SIMPLEX, 3.2, (255, 255, 255), 8)
+            cv2.putText(f, str(sec), (W // 2 - 70, H // 2 + 220),
+                        cv2.FONT_HERSHEY_SIMPLEX, 9.0, (255, 255, 255), 24)
+            for _ in range(60):
+                vw.write(f)
+        vw.release()
+    except Exception:
+        if dst.exists():
+            dst.unlink()
+
+
 def cmd_send(args):
     p = PROFILES[args.profile]
     src = Path(args.file).expanduser().resolve()
@@ -80,11 +127,12 @@ def cmd_send(args):
 
     print("\nOn the phone: 4K 60fps, landscape, 1x, AE/AF locked (tap and")
     print("hold on the code), all four corner markers in frame, brightness MAX.")
-    print("\n1. START RECORDING on the phone.")
-    print("2. Press Return here. Playback is timed from that moment.")
-    try:
-        input()
-    except (EOFError, KeyboardInterrupt):
+    if not _dialog("Ready to film.\n\n"
+                   "1. Press Start.\n"
+                   "2. Hit RECORD on the phone during the 5-second countdown.\n"
+                   "3. Playback stops by itself after "
+                   f"{args.loops} loops (~{args.loops * 13}s).",
+                   '"Cancel", "Start"', "Start"):
         return
     # The raw encode is ~430 Mbps mpeg4, which ffplay decodes in software and
     # drops frames on (measured: 104/760 dropped, with a 0.7s stall). Every
@@ -97,7 +145,12 @@ def cmd_send(args):
                  f'-preset fast -tune stillimage -pix_fmt yuv420p "{play}"')
         if rc.returncode:
             play = out          # fall back to the raw encode
-    print("playing… film at least 2 full loops (~30s), then press q in the video window")
+    cd_clip = out.parent / "_countdown.mp4"
+    if not cd_clip.exists():
+        _make_countdown(cd_clip, play)
+    if cd_clip.exists():
+        run(f'ffplay -fs -alwaysontop -noborder -autoexit "{cd_clip}"')
+    print("playing… stops by itself, keep filming until the screen goes back to normal")
     t0 = time.time()
     run(f'ffplay -fs -alwaysontop -noborder -loop {args.loops} -autoexit "{play}"')
     shown = time.time() - t0
@@ -109,6 +162,9 @@ def cmd_send(args):
     print("\n3. Stop recording. AirDrop the capture to this Mac")
     print(f"   (it lands in ~/Downloads), then:")
     print(f"\n   ./optical recv ~/Downloads/<capture>.mov")
+    _dialog(f"Done: the code was displayed for {shown:.1f}s.\n\n"
+            "Stop recording, AirDrop the capture to this Mac, then run:\n\n"
+            "./optical recv ~/Downloads/<capture>.mov", '"OK"', "OK")
 
 
 def _detect(capture):
@@ -196,7 +252,7 @@ def main():
     s.add_argument("file")
     s.add_argument("--profile", default="fast", choices=list(PROFILES))
     s.add_argument("--overhead", type=float, default=2.2)
-    s.add_argument("--loops", type=int, default=20)
+    s.add_argument("--loops", type=int, default=3)
     s.add_argument("--force", action="store_true")
     s.set_defaults(fn=cmd_send)
 
