@@ -759,13 +759,25 @@ def sample_frame(img: np.ndarray, layout: Layout, H: np.ndarray | None = None):
     pay_lum = pay_samples.mean(axis=1)
     all_lum = np.concatenate([hdr_lum, pay_lum]).astype(np.uint8)
     th, _ = cv2.threshold(all_lum, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # The header is always a TWO-level (mono) sub-code, even when the payload
+    # is gray4/color. Thresholding it against the payload's own histogram is
+    # therefore wrong whenever the payload has more than two levels: the
+    # multi-level population drags the split away from the header's own eye.
+    # Measured on a real gray4 capture: global Otsu read 0/6 headers, a
+    # header-only Otsu read 1/6 (the one it recovered agreed exactly with ML
+    # sequence detection).
+    hdr_th, _ = cv2.threshold(hdr_lum.astype(np.uint8), 0, 255,
+                              cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
     spread = max(1e-3, np.percentile(pay_lum, 90) - np.percentile(pay_lum, 10))
     stats["cell_margin"] = float(np.mean(np.abs(pay_lum - th)) / spread)
 
     n_hdr_bits = (HEADER_LEN + HEADER_ECC) * 8
-    hdr_bits = (hdr_lum[:n_hdr_bits] > th).astype(np.uint8)
-    header = unpack_header(_bytes(hdr_bits))
+    header = None
+    for t in (hdr_th, th):
+        header = unpack_header(_bytes((hdr_lum[:n_hdr_bits] > t).astype(np.uint8)))
+        if header is not None:
+            break
     stats["header_ok"] = header is not None
     # Return the payload samples even when the header is unreadable: the
     # geometry succeeded, so the frame is still worth rescuing by other means

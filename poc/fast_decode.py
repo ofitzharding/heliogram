@@ -40,6 +40,9 @@ def _init(cfg):
     grid.set_radial(cfg["radial"])
 
 
+_TEMPLATES = [None]
+
+
 def _worker(rng):
     """Decode a contiguous frame range; return (frame_no, seq, block) hits."""
     start, end = rng
@@ -49,6 +52,10 @@ def _worker(rng):
     cap.set(cv2.CAP_PROP_POS_FRAMES, start)
     out = []
     proto = None
+    proto_full = _CFG.get("proto_full")
+    if proto_full is not None and _TEMPLATES[0] is None:
+        _TEMPLATES[0] = grid.header_templates(proto_full,
+                                              _CFG.get("max_seq", 1500))
     n = start
     while n < end:
         ok, img = cap.read()
@@ -65,8 +72,30 @@ def _worker(rng):
         if H is None:
             continue
         header, samples, _st = grid.sample_frame(img, layout, H)
-        if header is None or samples is None:
+        if samples is None:
             continue
+        if header is None:
+            # ML SEQUENCE RESCUE. Only `seq` varies between frames; k,
+            # block_size, file_size and mode are transfer constants, so a
+            # header is one unknown integer, not 68 unknown bytes. Correlate
+            # the SOFT header luminances against every candidate template.
+            #
+            # This is the §10b bug: the old code dropped every frame whose
+            # hard header failed, discarding perfectly good payload samples.
+            # On a real gray4 capture hard decode read 1/6 headers while ML
+            # read 6/6 at 3.9-9.8 sigma, and the recovered sequence numbers
+            # advanced exactly 300 per 5s at 60fps (wrapping at the loop
+            # length) — self-consistent, so provably correct.
+            if _TEMPLATES[0] is None or proto_full is None:
+                continue
+            hl = grid.sample_cells(img, layout, H,
+                                   layout.header_cells).mean(axis=1)
+            seq, margin = grid.ml_header_seq(hl, _TEMPLATES[0])
+            if margin < _CFG.get("ml_margin", 3.0):
+                continue
+            header = dict(proto_full, seq=seq)
+        elif proto_full is None:
+            proto_full = dict(header)
         if proto is None:
             proto = {k: header[k] for k in ("k", "block_size", "file_size", "mode")}
         if _CFG.get("subblock"):
@@ -180,9 +209,48 @@ def main():
         radial = best
         print(f"k1 scan: {radial:+.3f} ({best_hits}/{len(probes)} probe frames)")
 
+    # PROTO PRE-PASS. ML sequence rescue needs the transfer constants (k,
+    # block_size, file_size, mode) to build candidate templates, and those
+    # come from any single frame whose hard header decodes. Learn them once
+    # here rather than per-worker: a worker whose whole range is marginal
+    # would otherwise never acquire them and would rescue nothing.
+    grid.set_ecc(args.ecc); grid.set_header_len(args.header_len)
+    grid.set_header_centered(not args.header_top); grid.set_radial(radial)
+    layout = grid.Layout(gw, gh)
+    proto_full, max_seq = None, 1500
+    c = cv2.VideoCapture(args.input)
+    seqs = []
+    for fi in np.linspace(total * 0.15, total * 0.9, 40).astype(int):
+        c.set(cv2.CAP_PROP_POS_FRAMES, int(fi))
+        ok, im = c.read()
+        if not ok:
+            continue
+        sm = cv2.resize(im, None, fx=0.5, fy=0.5) if im.shape[1] >= 3000 else im
+        Hs = grid.locate(sm, layout)
+        H = (np.diag([2., 2., 1.]) @ Hs) if (Hs is not None and im.shape[1] >= 3000) else Hs
+        if H is None:
+            H = grid.locate(im, layout)
+        if H is None:
+            continue
+        hd, _s, _st = grid.sample_frame(im, layout, H)
+        if hd is not None:
+            seqs.append(hd["seq"])
+            if proto_full is None:
+                proto_full = dict(hd)
+    c.release()
+    if proto_full is not None:
+        max_seq = max(1500, int(max(seqs) * 1.5))
+        print(f"proto learned from {len(seqs)}/40 probe frames: "
+              f"k={proto_full['k']} block={proto_full['block_size']} "
+              f"mode={proto_full['mode']} -> ML rescue armed (max_seq {max_seq})")
+    else:
+        print("proto NOT learned: no probe frame produced a hard header; "
+              "ML rescue disabled")
+
     cfg = dict(path=args.input, gw=gw, gh=gh, ecc=args.ecc,
                header_len=args.header_len, radial=radial,
-               centered=not args.header_top, subblock=args.subblock)
+               centered=not args.header_top, subblock=args.subblock,
+               proto_full=proto_full, max_seq=max_seq)
     chunk = max(30, total // (args.workers * 4))
     ranges = [(s, min(s + chunk, total)) for s in range(0, total, chunk)]
     t0 = time.time()
