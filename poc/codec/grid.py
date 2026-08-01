@@ -799,6 +799,42 @@ def _learn_color4(X: np.ndarray) -> np.ndarray:
     return out
 
 
+def raw_bits_and_conf(header: dict, pay_samples: np.ndarray,
+                      layout: 'Layout' = None):
+    """Demodulate to raw bytes plus per-byte confidence, WITHOUT running RS.
+
+    Sub-block recovery needs the pre-ECC bitstream so it can split it into
+    codewords and decode each independently; decide_payload folds RS in and
+    returns all-or-nothing. Confidence is the distance to the nearest decision
+    boundary, which is what lets the RS layer place erasures intelligently.
+    """
+    pay_lum = pay_samples.mean(axis=1)
+    mode = header["mode"]
+    if mode == MODE_GRAY4:
+        v = pay_lum.astype(np.float32).reshape(-1, 1)
+        crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 40, 0.2)
+        _r, lab, cent = cv2.kmeans(v, 4, None, crit, 6, cv2.KMEANS_PP_CENTERS)
+        order = np.argsort(cent.ravel())
+        rank = np.empty(4, np.int64)
+        rank[order] = np.arange(4)
+        syms = rank[lab.ravel()]
+        bits = np.array([GRAY4_BITS[int(x)] for x in syms], dtype=np.uint8).reshape(-1)
+        c = np.sort(cent.ravel())
+        bounds = (c[:-1] + c[1:]) / 2.0
+        dist = np.min(np.abs(pay_lum[:, None] - bounds[None]), axis=1)
+        conf = np.repeat(dist / max(1e-3, c[-1] - c[0]), 2)
+    else:
+        th, _ = cv2.threshold(np.clip(pay_lum, 0, 255).astype(np.uint8), 0, 255,
+                              cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        bits = (pay_lum > th).astype(np.uint8)
+        spread = max(1e-3, np.percentile(pay_lum, 90) - np.percentile(pay_lum, 10))
+        conf = np.abs(pay_lum - th) / spread
+    raw = _bytes(bits)
+    nb = min(len(raw), len(conf) // 8)
+    byte_conf = conf[: nb * 8].reshape(nb, 8).min(axis=1)
+    return raw, byte_conf
+
+
 def decide_payload(header: dict, pay_samples: np.ndarray,
                    layout: 'Layout' = None):
     """Hard-decide cells from (possibly evidence-averaged) samples, then RS."""

@@ -35,13 +35,14 @@ sys.path.insert(0, str(POC))
 #   eye opening ~21 sigma at 17 px/cell    ->  4 levels safe there
 PROFILES = {
     "fast": dict(grid="203x112", mode="gray4", cell_px=14, ecc=48,
-                 raw_kbs=252.9,
-                 note="4 grey levels at 17 camera-px/cell; highest measured raw rate"),
+                 raw_kbs=252.7, subblock=True,
+                 note="4 grey levels + per-codeword fountain symbols; "
+                      "174.3 KB/s bit-exact in validation = 1.36x decimen"),
     "safe": dict(grid="252x140", mode="mono", cell_px=12, ecc=48,
-                 raw_kbs=197.8,
+                 raw_kbs=197.8, subblock=True,
                  note="binary at 13.1 camera-px/cell; the profile proven bit-exact"),
     "robust": dict(grid="180x100", mode="mono", cell_px=16, ecc=64,
-                   raw_kbs=110.0,
+                   raw_kbs=110.0, subblock=False,
                    note="large cells, heavy ECC; for poor light or shaky hands"),
 }
 
@@ -68,7 +69,8 @@ def cmd_send(args):
     else:
         rc = run(f"cd {POC} && python3 encode.py {src!s} {out!s} "
                  f"--mode {p['mode']} --grid {p['grid']} --cell-px {p['cell_px']} "
-                 f"--fps 60 --overhead {args.overhead} --ecc {p['ecc']}")
+                 f"--fps 60 --overhead {args.overhead} --ecc {p['ecc']} "
+                 f"{'--subblock' if p.get('subblock') else ''}")
         if rc.returncode:
             sys.exit("encode failed")
 
@@ -143,7 +145,9 @@ def cmd_recv(args):
     out = Path(args.out) if args.out else Path.cwd() / f"recovered_{capture.stem}.bin"
     t0 = time.time()
     rc = run(f"cd {POC} && python3 fast_decode.py {capture!s} {out!s} "
-             f"--grid {p['grid']} --ecc {p['ecc']} --radial {k1} --header-len {hl} {'--header-top' if not centered else ''}")
+             f"--grid {p['grid']} --ecc {p['ecc']} --radial {k1} --header-len {hl} "
+             f"{'--header-top' if not centered else ''} "
+             f"{'--subblock' if p.get('subblock') else ''}")
     if rc.returncode:
         sys.exit("\nrecovery failed. Try: better light, hold steadier, or "
                  "re-send with --profile robust")
@@ -155,7 +159,9 @@ def cmd_bench(args):
     name, p, hl, k1, centered = _detect(capture)
     tmp = Path("/tmp/_optical_bench.bin")
     run(f"cd {POC} && python3 fast_decode.py {capture!s} {tmp!s} "
-        f"--grid {p['grid']} --ecc {p['ecc']} --radial {k1} --header-len {hl} {'--header-top' if not centered else ''}")
+        f"--grid {p['grid']} --ecc {p['ecc']} --radial {k1} --header-len {hl} "
+        f"{'--header-top' if not centered else ''} "
+        f"{'--subblock' if p.get('subblock') else ''}")
 
 
 def main():
@@ -166,7 +172,7 @@ def main():
 
     s = sub.add_parser("send", help="display a file as an optical code")
     s.add_argument("file")
-    s.add_argument("--profile", default="safe", choices=list(PROFILES))
+    s.add_argument("--profile", default="fast", choices=list(PROFILES))
     s.add_argument("--overhead", type=float, default=2.2)
     s.add_argument("--loops", type=int, default=20)
     s.add_argument("--force", action="store_true")

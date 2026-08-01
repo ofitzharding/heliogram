@@ -69,6 +69,40 @@ def _worker(rng):
             continue
         if proto is None:
             proto = {k: header[k] for k in ("k", "block_size", "file_size", "mode")}
+        if _CFG.get("subblock"):
+            # Per-codeword recovery: soft-erasure RS on each codeword, then its
+            # own CRC. Every survivor is an independent fountain symbol, so a
+            # frame damaged in one region still contributes the rest.
+            from reedsolo import RSCodec, ReedSolomonError
+            ecc = _CFG["ecc"]
+            raw, bconf = grid.raw_bits_and_conf(header, samples, layout)
+            rs = RSCodec(ecc)
+            sub_size = (255 - ecc) - 4
+            n_sub = max(1, (header["block_size"] + 4) // 255)
+            for j in range(min(n_sub, len(raw) // 255)):
+                chunk = raw[j * 255:(j + 1) * 255]
+                dec = None
+                try:
+                    dec = bytes(rs.decode(chunk)[0])
+                except ReedSolomonError:
+                    m = bconf[j * 255:(j + 1) * 255]
+                    if len(m) == 255:
+                        order = np.argsort(m)
+                        for n_er in range(4, int(ecc * 0.7) + 1, 6):
+                            try:
+                                dec = bytes(rs.decode(chunk,
+                                            erase_pos=[int(i) for i in order[:n_er]])[0])
+                                break
+                            except ReedSolomonError:
+                                continue
+                if dec is None or len(dec) < 4 + sub_size:
+                    continue
+                blk = dec[4:4 + sub_size]
+                if zlib.crc32(blk) & 0xFFFFFFFF != struct.unpack("<I", dec[:4])[0]:
+                    continue
+                out.append((n, header["seq"] * n_sub + j, blk,
+                            dict(proto, block_size=sub_size)))
+            continue
         payload = grid.decide_payload(header, samples, layout)
         if payload is None:
             continue
@@ -92,6 +126,10 @@ def main():
     ap.add_argument("--header-top", action="store_true",
                     help="older captures put the header at the top edge")
     ap.add_argument("--workers", type=int, default=max(2, os.cpu_count() - 2))
+    ap.add_argument("--subblock", action="store_true",
+                    help="frames carry one fountain symbol per RS codeword; "
+                         "recover every codeword that survives instead of "
+                         "discarding the whole frame")
     ap.add_argument("--scan", action="store_true",
                     help="sweep k1 on a frame sample first, pick the best")
     args = ap.parse_args()
@@ -144,7 +182,7 @@ def main():
 
     cfg = dict(path=args.input, gw=gw, gh=gh, ecc=args.ecc,
                header_len=args.header_len, radial=radial,
-               centered=not args.header_top)
+               centered=not args.header_top, subblock=args.subblock)
     chunk = max(30, total // (args.workers * 4))
     ranges = [(s, min(s + chunk, total)) for s in range(0, total, chunk)]
     t0 = time.time()
@@ -157,7 +195,10 @@ def main():
     if not hits:
         sys.exit("FAILED: no blocks")
     proto = hits[0][3]
-    dec = fountain.Decoder(proto["k"], proto["block_size"], proto["file_size"])
+    k = proto["k"]
+    if args.subblock:
+        k = -(-proto["file_size"] // proto["block_size"])   # symbols, not frames
+    dec = fountain.Decoder(k, proto["block_size"], proto["file_size"])
     first = done = None
     for n, seq, blk, _p in hits:
         if seq in dec.seen:
