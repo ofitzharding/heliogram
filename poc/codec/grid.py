@@ -454,6 +454,24 @@ def locate(img: np.ndarray, layout: Layout):
         [layout.gw - 1 - f + fc, layout.gh - 1 - f + fc],
     ], dtype=np.float32)
     dst = np.array([tl, tr, bl, br], dtype=np.float32)
+
+    # Reject degenerate quads. The sum/diff ordering happily returns the SAME
+    # point as both TL and BL when the candidates are nearly collinear, and
+    # getPerspectiveTransform then yields a garbage homography that every
+    # downstream stage reports as "located" — which is how a failed take was
+    # scored as 100% localization on six different profiles at once.
+    # Real cause of that collinearity: the macOS Dock was in frame and its
+    # rounded-square icons are textbook nested-contour finder candidates,
+    # outranking the true markers by area.
+    for i in range(4):
+        for j in range(i + 1, 4):
+            if np.hypot(*(dst[i] - dst[j])) < 8.0:
+                return None
+    quad = dst[[0, 1, 3, 2]].astype(np.float32)     # TL, TR, BR, BL
+    area = abs(cv2.contourArea(quad))
+    side = np.hypot(*(dst[1] - dst[0])) * np.hypot(*(dst[2] - dst[0]))
+    if area < 0.25 * max(side, 1.0):                # near-collinear
+        return None
     return cv2.getPerspectiveTransform(src, dst)
 
 

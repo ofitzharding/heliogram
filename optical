@@ -53,6 +53,40 @@ def run(cmd, **kw):
 
 
 
+def _chrome_hidden():
+    """Hide the Dock and menu bar for the duration of a take.
+
+    Not cosmetic. The window-mode playback (needed for true 60fps) leaves
+    both visible, and Dock icons are rounded nested squares — i.e. textbook
+    QR finder candidates, larger in area than the real corner markers. The
+    first take at this geometry detected two Dock icons as finders, produced
+    a degenerate homography, and decoded nothing.
+    """
+    import contextlib
+
+    @contextlib.contextmanager
+    def ctx():
+        def setdock(auto_dock, auto_menu):
+            try:
+                subprocess.run(
+                    ["/usr/bin/osascript", "-e",
+                     'tell application "System Events" to tell dock preferences '
+                     f'to set autohide to {auto_dock}',
+                     "-e",
+                     'tell application "System Events" to tell dock preferences '
+                     f'to set autohide menu bar to {auto_menu}'],
+                    capture_output=True, timeout=15)
+            except Exception:
+                pass
+        setdock("true", "true")
+        time.sleep(0.8)         # let the hide animation finish
+        try:
+            yield
+        finally:
+            setdock("false", "false")
+    return ctx()
+
+
 def _screen_points():
     """Logical (point) size of the main display. ffplay windows are sized in
     points; a window this size covers the screen while keeping the drawable
@@ -196,16 +230,18 @@ def cmd_send(args):
     cd_clip = out.parent / f"_countdown{args.countdown}.mp4"
     if not cd_clip.exists():
         _make_countdown(cd_clip, play, args.countdown, (sw, sh))
-    if cd_clip.exists():
-        print(f"\ncountdown starts NOW — hit record on the phone when you "
-              f"see it on screen ({args.countdown}s).")
-        run(f'ffplay -alwaysontop -noborder -autoexit -left 0 -top 0 '
-            f'-x {sw} -y {sh} "{cd_clip}"')
-    print("playing… stops by itself, keep filming until the screen goes back to normal")
-    t0 = time.time()
-    run(f'ffplay -alwaysontop -noborder -loop {args.loops} -autoexit '
-        f'-left 0 -top 0 -x {sw} -y {sh} "{play}"')
-    shown = time.time() - t0
+    with _chrome_hidden():
+        if cd_clip.exists():
+            print(f"\ncountdown starts NOW — hit record on the phone when you "
+                  f"see it on screen ({args.countdown}s).")
+            run(f'ffplay -alwaysontop -noborder -autoexit -left 0 -top 0 '
+                f'-x {sw} -y {sh} "{cd_clip}"')
+        print("playing… stops by itself, keep filming until the screen goes "
+              "back to normal")
+        t0 = time.time()
+        run(f'ffplay -alwaysontop -noborder -loop {args.loops} -autoexit '
+            f'-left 0 -top 0 -x {sw} -y {sh} "{play}"')
+        shown = time.time() - t0
     meta.write_text(json.dumps(dict(file=src.name, size=size,
                                     profile=args.profile, shown_seconds=round(shown, 2),
                                     loops=args.loops, **p), indent=2))
