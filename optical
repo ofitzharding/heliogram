@@ -86,9 +86,20 @@ def cmd_send(args):
         input()
     except (EOFError, KeyboardInterrupt):
         return
+    # The raw encode is ~430 Mbps mpeg4, which ffplay decodes in software and
+    # drops frames on (measured: 104/760 dropped, with a 0.7s stall). Every
+    # dropped display frame is a missing fountain symbol. Transcode a playback
+    # copy to hardware-decodable H.264 once and play that instead.
+    play = out.with_name(out.stem + "_play.mp4")
+    if not play.exists() or play.stat().st_mtime < out.stat().st_mtime:
+        print("preparing smooth playback copy (one-time)…")
+        rc = run(f'ffmpeg -v error -y -i "{out}" -c:v libx264 -crf 10 '
+                 f'-preset fast -tune stillimage -pix_fmt yuv420p "{play}"')
+        if rc.returncode:
+            play = out          # fall back to the raw encode
     print("playing… film at least 2 full loops (~30s), then press q in the video window")
     t0 = time.time()
-    run(f'ffplay -fs -alwaysontop -noborder -loop {args.loops} -autoexit "{out}"')
+    run(f'ffplay -fs -alwaysontop -noborder -loop {args.loops} -autoexit "{play}"')
     shown = time.time() - t0
     meta.write_text(json.dumps(dict(file=src.name, size=size,
                                     profile=args.profile, shown_seconds=round(shown, 2),
