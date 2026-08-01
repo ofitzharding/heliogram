@@ -85,10 +85,25 @@ PALETTE = np.array([
 ], dtype=np.float32)  # index = 3 bits
 
 
+def finder_scale_for(gw: int) -> int:
+    """Cells per finder module, derived from grid width so BOTH ends agree
+    without signalling it.
+
+    Measured failure that motivated this: at 560 cells across, a 7-cell finder
+    is only ~40 camera px and its three-ring structure stops resolving — the
+    dense capture located 0/10 frames despite the cells themselves being
+    perfectly sharp. Detection, not sampling, is what caps density. Scaling
+    the finder keeps markers ~100+ px at any density; the cost is under 2% of
+    payload cells. gw=252 maps to 1, preserving existing captures.
+    """
+    return max(1, round(gw / 180))
+
+
 class Layout:
-    def __init__(self, gw: int = 120, gh: int = 68):
+    def __init__(self, gw: int = 120, gh: int = 68, finder_scale: int = None):
         self.gw, self.gh = gw, gh
-        self.finder = 7
+        self.fs = finder_scale_for(gw) if finder_scale is None else finder_scale
+        self.finder = 7 * self.fs
         f = self.finder
         # cell classes
         self.is_finder = np.zeros((gh, gw), dtype=bool)
@@ -103,13 +118,21 @@ class Layout:
             self.is_sep[max(0, r0 - 1):r0 + f + 1, max(0, c0 - 1):c0 + f + 1] = True
         self.is_sep &= ~self.is_finder
 
-        # header region: rows just inside the top ring, between the finder zones
+        # Header region: CENTRED rows, not the top edge.
+        #
+        # It used to sit in rows 1-3, which measurement showed is the worst
+        # real estate on the grid: radial distortion is largest at the frame
+        # edge, and a top edge is the first thing lost when framing drifts.
+        # Headers were readable on only ~65% of located frames, and since a
+        # frame without a header is discarded entirely, that alone capped
+        # yield. The centre measured 0.0% cell error on the same captures.
         need_bits = (HEADER_LEN + HEADER_ECC) * 8
         c_lo, c_hi = f + 2, gw - f - 2
         per_row = c_hi - c_lo
         n_rows = int(np.ceil(need_bits / per_row))
         self.is_header = np.zeros((gh, gw), dtype=bool)
-        self.is_header[1:1 + n_rows, c_lo:c_hi] = True
+        r0 = max(1, (gh - n_rows) // 2) if HEADER_CENTERED else 1
+        self.is_header[r0:r0 + n_rows, c_lo:c_hi] = True
         self.is_header &= ~(self.is_finder | self.is_sep | self.is_ring)
         self.header_cells = np.argwhere(self.is_header)  # (r, c) row-major
         assert len(self.header_cells) >= need_bits, "grid too small for header"
@@ -158,6 +181,19 @@ def pack_header(seq: int, k: int, block_size: int, file_size: int, mode: int,
     body += b"\x00" * (HEADER_LEN - 2 - len(body))
     body += struct.pack("<H", zlib.crc32(body) & 0xFFFF)
     return bytes(RSCodec(HEADER_ECC).encode(body))
+
+
+HEADER_CENTERED = True   # v3 layout. Older captures have it at the top edge.
+
+
+def set_header_centered(on: bool) -> None:
+    """Header row placement. Must be set before constructing a Layout.
+
+    Captures made before the centring change carry the header at the top, so
+    a receiver has to be able to try both.
+    """
+    global HEADER_CENTERED
+    HEADER_CENTERED = on
 
 
 def set_header_len(n: int) -> None:
@@ -254,9 +290,11 @@ def render_frame(layout: Layout, header: bytes, payload: bytes,
 
     # finders: black 7x7, white 5x5, black 3x3
     f = layout.finder
-    tpl = np.zeros((f, f), dtype=np.float32)
-    tpl[1:-1, 1:-1] = 255.0
-    tpl[2:-2, 2:-2] = 0.0
+    m = layout.fs
+    base = np.zeros((7, 7), dtype=np.float32)
+    base[1:-1, 1:-1] = 255.0
+    base[2:-2, 2:-2] = 0.0
+    tpl = np.kron(base, np.ones((m, m), dtype=np.float32))
     for (r0, c0) in [(1, 1), (1, gw - 1 - f), (gh - 1 - f, 1), (gh - 1 - f, gw - 1 - f)]:
         cells[r0:r0 + f, c0:c0 + f] = tpl[..., None]
 
@@ -420,6 +458,14 @@ def locate(img: np.ndarray, layout: Layout):
 
 
 RADIAL_K1 = 0.0   # lens radial distortion, normalized by image width
+_FAST_SAMPLE = True   # grayscale box-filter + single gather (see sample_cells)
+_BOX_CACHE = {}
+
+
+def set_fast_sample(on: bool) -> None:
+    """Fast path is grayscale-only. Colour modes must disable it."""
+    global _FAST_SAMPLE
+    _FAST_SAMPLE = on
 
 
 def set_radial(k1: float) -> None:
@@ -580,11 +626,87 @@ def deconvolve(img: np.ndarray, kernel: np.ndarray, iters: int = 12):
     return est
 
 
+def refine_homography(img: np.ndarray, layout: Layout, H: np.ndarray,
+                      span: float = 2.5, rounds: int = 3):
+    """Subpixel-refine H against every cell whose value we already know.
+
+    A homography fitted from four finder centres has fixed pixel accuracy, but
+    the DAMAGE that accuracy does scales with density: at 252 cells a one-cell
+    sampling error needs ~13 px of geometric error, at 466 cells only ~7.45 px.
+    Measured consequence: 0.4% BER at 252 cells, 14% at 466 with identical
+    optics and exposure.
+
+    So refine. The timing ring and the four finder patterns are hundreds of
+    cells whose values are known a priori, which is enough signal to hill-climb
+    the four corner correspondences to subpixel precision. This is the same
+    role QR alignment patterns play in production decoders.
+    """
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+    grayf = gray.astype(np.float32)
+    h_, w_ = gray.shape
+    cells, exp = known_cells(layout)
+    centers = np.stack([cells[:, 1] + 0.5, cells[:, 0] + 0.5],
+                       axis=1).astype(np.float32)
+    f = layout.finder
+    fc = f / 2.0
+    src = np.array([
+        [1 + fc, 1 + fc],
+        [layout.gw - 1 - f + fc, 1 + fc],
+        [1 + fc, layout.gh - 1 - f + fc],
+        [layout.gw - 1 - f + fc, layout.gh - 1 - f + fc],
+    ], dtype=np.float32)
+    dst = cv2.perspectiveTransform(src.reshape(1, 4, 2),
+                                   H.astype(np.float32)).reshape(4, 2)
+
+    def score(d):
+        Hc = cv2.getPerspectiveTransform(src, d.astype(np.float32))
+        pts = cv2.perspectiveTransform(centers[None], Hc)[0]
+        pts = _apply_radial(pts, img.shape)
+        xs = np.clip(pts[:, 0].round().astype(np.int32), 0, w_ - 1)
+        ys = np.clip(pts[:, 1].round().astype(np.int32), 0, h_ - 1)
+        v = grayf[ys, xs]
+        # separation between cells known-white and known-black
+        return float(v[exp].mean() - v[~exp].mean())
+
+    best = score(dst)
+    step = span
+    for _ in range(rounds):
+        improved = True
+        while improved:
+            improved = False
+            for i in range(4):
+                for dx, dy in ((step, 0), (-step, 0), (0, step), (0, -step)):
+                    cand = dst.copy()
+                    cand[i] += (dx, dy)
+                    s = score(cand)
+                    if s > best:
+                        best, dst, improved = s, cand, True
+        step *= 0.4
+    return cv2.getPerspectiveTransform(src, dst.astype(np.float32))
+
+
 def sample_cells(img: np.ndarray, layout: Layout, H: np.ndarray, cells: np.ndarray):
     """Sample given (r,c) cells; returns float32 (n, 3) BGR means of 3x3 patches."""
     centers = np.stack([cells[:, 1] + 0.5, cells[:, 0] + 0.5], axis=1).astype(np.float32)
     pts = cv2.perspectiveTransform(centers[None], H)[0]
     pts = _apply_radial(pts, img.shape)
+    if _FAST_SAMPLE:
+        # ONE box-filter over the image then ONE gather, instead of nine
+        # gathers over ~170k cells. Measured at 29.2 ms/frame on 4K, which was
+        # the wall for real-time decoding: box filtering is SIMD and a single
+        # gather is far more cache-friendly.
+        h_, w_ = img.shape[:2]
+        xs = np.clip(pts[:, 0].round().astype(np.int32), 1, w_ - 2)
+        ys = np.clip(pts[:, 1].round().astype(np.int32), 1, h_ - 2)
+        blurred = _BOX_CACHE.get("img")
+        if blurred is None or _BOX_CACHE.get("id") is not id(img):
+            g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+            blurred = cv2.boxFilter(g, cv2.CV_32F, (3, 3))
+            _BOX_CACHE.clear()
+            _BOX_CACHE["img"] = blurred
+            _BOX_CACHE["id"] = id(img)
+        v = blurred[ys, xs]
+        return np.repeat(v[:, None], 3, axis=1)
     h, w = img.shape[:2]
     xs = np.clip(pts[:, 0].round().astype(int), 1, w - 2)
     ys = np.clip(pts[:, 1].round().astype(int), 1, h - 2)
@@ -735,15 +857,18 @@ def decide_payload(header: dict, pay_samples: np.ndarray,
         # ~uniform, so quartile means are unbiased estimates), then classify
         # by nearest learned center — the receiver adapts to whatever gamma,
         # exposure, and contrast the channel actually delivered
-        q = np.quantile(pay_lum, [0.125, 0.375, 0.625, 0.875])
-        edges = np.quantile(pay_lum, [0.25, 0.5, 0.75])
-        centers = np.array([
-            pay_lum[pay_lum <= edges[0]].mean(),
-            pay_lum[(pay_lum > edges[0]) & (pay_lum <= edges[1])].mean(),
-            pay_lum[(pay_lum > edges[1]) & (pay_lum <= edges[2])].mean(),
-            pay_lum[pay_lum > edges[2]].mean(),
-        ])
-        syms = np.abs(pay_lum[:, None] - centers[None]).argmin(axis=1)
+        # 1-D k-means rather than quantile slicing: quantiles collapse to empty
+        # slices whenever many cells share a value (which happens on any clean
+        # frame), and that produced NaN centres. k-means is robust to that and
+        # still adapts to whatever gamma/exposure the channel delivered.
+        v = pay_lum.astype(np.float32).reshape(-1, 1)
+        crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 40, 0.2)
+        _r, lab, cent = cv2.kmeans(v, 4, None, crit, 6, cv2.KMEANS_PP_CENTERS)
+        order = np.argsort(cent.ravel())          # dark -> bright
+        rank = np.empty(4, np.int64)
+        rank[order] = np.arange(4)
+        centers = np.sort(cent.ravel())
+        syms = rank[lab.ravel()]
         bits = np.array([GRAY4_BITS[int(s)] for s in syms], dtype=np.uint8).reshape(-1)
         raw = _bytes(bits)
         bounds = (centers[:-1] + centers[1:]) / 2

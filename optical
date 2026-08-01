@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+"""
+optical — send and receive files over a screen-to-camera link.
+
+    ./optical send FILE               display FILE as a code, fullscreen
+    ./optical recv CAPTURE OUT        recover FILE from a phone capture
+    ./optical recv CAPTURE            recover, auto-naming the output
+    ./optical bench CAPTURE           report goodput without writing a file
+
+The send side picks the profile measured to work on consumer hardware; the
+receive side auto-detects grid, mode, header version and lens distortion from
+the capture itself, so a receiver needs no configuration and no camera
+profile.
+
+Recording, on any phone:
+    normal video mode, 4K 60fps, landscape, 1x lens
+    tap and hold on the code for AE/AF lock
+    fill the frame but keep all four corner markers visible
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+POC = HERE / "poc"
+sys.path.insert(0, str(POC))
+
+# Profiles, ordered by throughput. Constants are MEASURED on real captures:
+#   camera blur sigma ~3.6 px  ->  cells below ~13 camera-px collapse
+#   eye opening 7.7 sigma at 13.1 px/cell  ->  2 levels only at that density
+#   eye opening ~21 sigma at 17 px/cell    ->  4 levels safe there
+PROFILES = {
+    "fast": dict(grid="203x112", mode="gray4", cell_px=14, ecc=48,
+                 raw_kbs=252.9,
+                 note="4 grey levels at 17 camera-px/cell; highest measured raw rate"),
+    "safe": dict(grid="252x140", mode="mono", cell_px=12, ecc=48,
+                 raw_kbs=197.8,
+                 note="binary at 13.1 camera-px/cell; the profile proven bit-exact"),
+    "robust": dict(grid="180x100", mode="mono", cell_px=16, ecc=64,
+                   raw_kbs=110.0,
+                   note="large cells, heavy ECC; for poor light or shaky hands"),
+}
+
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, shell=True, **kw)
+
+
+def cmd_send(args):
+    p = PROFILES[args.profile]
+    src = Path(args.file).expanduser().resolve()
+    if not src.exists():
+        sys.exit(f"no such file: {src}")
+    out = HERE / "demo" / f"_tx_{src.stem}_{args.profile}.mp4"
+    out.parent.mkdir(exist_ok=True)
+
+    size = src.stat().st_size
+    print(f"file      {src.name}  ({size:,} bytes)")
+    print(f"profile   {args.profile}: {p['note']}")
+    print(f"raw rate  {p['raw_kbs']} KB/s at 60 fps\n")
+
+    if out.exists() and not args.force:
+        print(f"reusing {out.name} (pass --force to re-encode)")
+    else:
+        rc = run(f"cd {POC} && python3 encode.py {src!s} {out!s} "
+                 f"--mode {p['mode']} --grid {p['grid']} --cell-px {p['cell_px']} "
+                 f"--fps 60 --overhead {args.overhead} --ecc {p['ecc']}")
+        if rc.returncode:
+            sys.exit("encode failed")
+
+    meta = out.with_suffix(".json")
+    meta.write_text(json.dumps(dict(file=src.name, size=size,
+                                    profile=args.profile, **p), indent=2))
+
+    print(f"\nStart recording on the phone, THEN press Return here.")
+    print("  4K 60fps, landscape, 1x, AE/AF locked, all four corners in frame.")
+    try:
+        input()
+    except (EOFError, KeyboardInterrupt):
+        return
+    print("playing… press q in the video window when your recording is done")
+    run(f'ffplay -fs -alwaysontop -noborder -loop {args.loops} -autoexit "{out}"')
+    print(f"\nDone. Now:  ./optical recv <your-capture.mov> {src.name}")
+
+
+def _detect(capture):
+    """Recover transmission parameters from the capture itself."""
+    import cv2
+    import numpy as np
+    from codec import grid
+
+    cap = cv2.VideoCapture(str(capture))
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 600
+    frames = []
+    for fi in np.linspace(total * 0.2, total * 0.85, 8).astype(int):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(fi))
+        ok, im = cap.read()
+        if ok:
+            frames.append(im)
+    cap.release()
+    if not frames:
+        sys.exit("could not read the capture")
+
+    best = None
+    for name, p in PROFILES.items():
+        gw, gh = (int(v) for v in p["grid"].split("x"))
+        for hl, centered in ((28, True), (28, False), (24, False)):
+            grid.set_ecc(p["ecc"])
+            grid.set_header_len(hl)
+            grid.set_header_centered(centered)
+            grid.set_fast_sample(p["mode"] == "mono")
+            layout = grid.Layout(gw, gh)
+            for k1 in (0.020, 0.0):
+                grid.set_radial(k1)
+                hits = 0
+                for im in frames:
+                    H = grid.locate(im, layout)
+                    if H is None:
+                        continue
+                    hd, _s, _st = grid.sample_frame(im, layout, H)
+                    hits += hd is not None
+                if best is None or hits > best[0]:
+                    best = (hits, name, p, hl, k1, centered)
+    hits, name, p, hl, k1, centered = best
+    if hits == 0:
+        sys.exit("no readable frames: check that the whole code, including all "
+                 "four corner markers, is in frame and in focus")
+    print(f"detected  profile={name} grid={p['grid']} mode={p['mode']} "
+          f"header=v{'2' if hl == 28 else '1'}{'-centred' if centered else '-top'} "
+          f"k1={k1:+.3f}  ({hits}/{len(frames)} probe frames)")
+    return name, p, hl, k1, centered
+
+
+def cmd_recv(args):
+    capture = Path(args.capture).expanduser().resolve()
+    if not capture.exists():
+        sys.exit(f"no such capture: {capture}")
+    name, p, hl, k1, centered = _detect(capture)
+    out = Path(args.out) if args.out else Path.cwd() / f"recovered_{capture.stem}.bin"
+    t0 = time.time()
+    rc = run(f"cd {POC} && python3 fast_decode.py {capture!s} {out!s} "
+             f"--grid {p['grid']} --ecc {p['ecc']} --radial {k1} --header-len {hl} {'--header-top' if not centered else ''}")
+    if rc.returncode:
+        sys.exit("\nrecovery failed. Try: better light, hold steadier, or "
+                 "re-send with --profile robust")
+    print(f"\nwrote {out}  ({time.time()-t0:.0f}s)")
+
+
+def cmd_bench(args):
+    capture = Path(args.capture).expanduser().resolve()
+    name, p, hl, k1, centered = _detect(capture)
+    tmp = Path("/tmp/_optical_bench.bin")
+    run(f"cd {POC} && python3 fast_decode.py {capture!s} {tmp!s} "
+        f"--grid {p['grid']} --ecc {p['ecc']} --radial {k1} --header-len {hl} {'--header-top' if not centered else ''}")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="optical",
+                                 formatter_class=argparse.RawDescriptionHelpFormatter,
+                                 description=__doc__)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("send", help="display a file as an optical code")
+    s.add_argument("file")
+    s.add_argument("--profile", default="safe", choices=list(PROFILES))
+    s.add_argument("--overhead", type=float, default=2.2)
+    s.add_argument("--loops", type=int, default=20)
+    s.add_argument("--force", action="store_true")
+    s.set_defaults(fn=cmd_send)
+
+    r = sub.add_parser("recv", help="recover a file from a phone capture")
+    r.add_argument("capture")
+    r.add_argument("out", nargs="?")
+    r.set_defaults(fn=cmd_recv)
+
+    b = sub.add_parser("bench", help="measure goodput from a capture")
+    b.add_argument("capture")
+    b.set_defaults(fn=cmd_bench)
+
+    a = ap.parse_args()
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()
