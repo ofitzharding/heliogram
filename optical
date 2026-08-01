@@ -78,15 +78,26 @@ def cmd_send(args):
     meta.write_text(json.dumps(dict(file=src.name, size=size,
                                     profile=args.profile, **p), indent=2))
 
-    print(f"\nStart recording on the phone, THEN press Return here.")
-    print("  4K 60fps, landscape, 1x, AE/AF locked, all four corners in frame.")
+    print("\nOn the phone: 4K 60fps, landscape, 1x, AE/AF locked (tap and")
+    print("hold on the code), all four corner markers in frame, brightness MAX.")
+    print("\n1. START RECORDING on the phone.")
+    print("2. Press Return here. Playback is timed from that moment.")
     try:
         input()
     except (EOFError, KeyboardInterrupt):
         return
-    print("playing… press q in the video window when your recording is done")
+    print("playing… film at least 2 full loops (~30s), then press q in the video window")
+    t0 = time.time()
     run(f'ffplay -fs -alwaysontop -noborder -loop {args.loops} -autoexit "{out}"')
-    print(f"\nDone. Now:  ./optical recv <your-capture.mov> {src.name}")
+    shown = time.time() - t0
+    meta.write_text(json.dumps(dict(file=src.name, size=size,
+                                    profile=args.profile, shown_seconds=round(shown, 2),
+                                    loops=args.loops, **p), indent=2))
+    print(f"\ndisplayed for {shown:.1f}s  "
+          f"(raw budget at {p['raw_kbs']} KB/s: {p['raw_kbs'] * shown:,.0f} KB shown)")
+    print("\n3. Stop recording. AirDrop the capture to this Mac")
+    print(f"   (it lands in ~/Downloads), then:")
+    print(f"\n   ./optical recv ~/Downloads/<capture>.mov")
 
 
 def _detect(capture):
