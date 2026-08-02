@@ -282,11 +282,28 @@ def cmd_send(args):
                  f'-pix_fmt yuv420p "{play}"')
         if rc.returncode:
             play = out          # fall back to the raw encode
+    # PREFLIGHT. The failure this prevents: a take was filmed 43 seconds
+    # before its own encode finished, against a stale playback copy, and
+    # nothing in the tool said so. Verify every input is complete and newer
+    # than its source, and refuse to roll if not.
+    if not play.exists() or play.stat().st_size < 1_000_000:
+        sys.exit(f"playback copy missing or truncated: {play}")
+    if play.stat().st_mtime < out.stat().st_mtime:
+        sys.exit("playback copy is OLDER than the encode - rerun to rebuild")
+    pf = _video_frames(play)
+    if pf < 10:
+        sys.exit(f"playback copy unreadable ({pf} frames)")
+    print(f"playback  {play.name}  {pf} frames in a {sw}x{sh} window")
+
     cd_clip = out.parent / f"_countdown_{args.profile}_{args.countdown}.mp4"
     if not cd_clip.exists():
         _make_countdown(cd_clip, play, args.countdown, (sw, sh))
+    if not cd_clip.exists() or _video_frames(cd_clip) < args.countdown * 30:
+        sys.exit("countdown clip failed to build - refusing to roll without "
+                 "the AE/AF lock target (it silently skipped once and cost a "
+                 "take)")
     with _chrome_hidden():
-        if cd_clip.exists():
+        if True:
             print(f"\ncountdown starts NOW — hit record on the phone when you "
                   f"see it on screen ({args.countdown}s).")
             run(f'ffplay -alwaysontop -noborder -autoexit -left 0 -top 0 '
