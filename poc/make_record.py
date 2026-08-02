@@ -59,6 +59,25 @@ def main():
                     help="lock-in lead: this transmit's own frames "
                          "with a countdown drawn over them")
     args = ap.parse_args()
+    build(Path(args.payload).read_bytes(), args.out, args.grid, args.cell_px,
+          args.ecc, args.fps, args.frames, args.crf, args.lead_seconds,
+          Path(args.payload).name)
+
+
+def build(data, out, grid_spec="252x163", cell_px=12, ecc=48, fps=60,
+          frames=0, crf=10, lead_seconds=22.0, label="payload"):
+    """Render `data` to a transmit video plus its lock-in lead.
+
+    frames=0 sizes the loop from the payload: enough distinct frames to carry
+    the file several times over, so a receiver that starts anywhere in the loop
+    still collects a full set without waiting for a wrap.
+    """
+    class A:
+        pass
+    args = A()
+    args.out, args.grid, args.cell_px, args.ecc = out, grid_spec, cell_px, ecc
+    args.fps, args.crf, args.lead_seconds = fps, crf, lead_seconds
+    args.payload = label
 
     grid.set_ecc(args.ecc); grid.set_header_len(28)
     grid.set_header_centered(True)
@@ -66,15 +85,17 @@ def main():
     L = grid.Layout(gw, gh)
     n_sub = grid.sub_count(L, grid.MODE_MONO)
     SUB = (255 - args.ecc) - 4
-    data = Path(args.payload).read_bytes()
     enc = fountain.Encoder(data, SUB)
+    # Enough distinct frames to carry the file ~4x over, so a receiver that
+    # starts anywhere in the loop still gets a full set before it wraps.
+    args.frames = frames or max(600, int(np.ceil(4.0 * enc.k / n_sub)))
     W, H = gw * args.cell_px, gh * args.cell_px
     if W > PW or H > PH:
         sys.exit(f"{W}x{H} does not fit the {PW}x{PH} panel")
 
     rate = n_sub * SUB * args.fps / 1024
     need = 1.05 * enc.k / n_sub
-    print(f"payload      {len(data):,} B  ({Path(args.payload).name})")
+    print(f"payload      {len(data):,} B  ({label})")
     print(f"grid         {gw}x{gh} @ {args.cell_px}px = {W}x{H} on {PW}x{PH} "
           f"({100*W*H/(PW*PH):.1f}% of the panel)")
     print(f"codewords    {n_sub}/frame of {SUB} B, ecc {args.ecc}")
@@ -174,8 +195,8 @@ def main():
     print(f"\nwrote {args.out} ({sz/1e6:.0f} MB)")
     print(f"wrote {args.out.replace('.mp4', '_lead.mp4')} ({lz/1e6:.0f} MB, "
           f"{args.lead_seconds:.0f}s lock-in)")
-    print(f"\ndecode with:\n  python3 fast_decode.py <capture.MOV> out.bin "
-          f"--grid {gw}x{gh} --ecc {args.ecc} --subblock --soft --scan")
+    return dict(grid=f"{gw}x{gh}", ecc=args.ecc, k=enc.k, n_sub=n_sub,
+                frames=args.frames, ceiling=rate, lead=lead_out)
 
 
 if __name__ == "__main__":
