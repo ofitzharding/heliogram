@@ -260,6 +260,15 @@ class FrameDecoder:
         blocks, cmask, cbits = self.certify(bits1d, bc)
         best = (len(blocks), blocks, cmask, cbits, x0)
 
+        # Nothing left to win on this frame, so do not pay 192 ms for the
+        # equalizer. Half the frames of a good take certify in full from hard
+        # decisions alone, and PRML was running on every one of them.
+        if self.prml and self.tap is not None and len(blocks) >= self.n_sub:
+            self.pending = (y, header, len(blocks), cmask, cbits, x0)
+            if allow_refit:
+                self.commit()
+            return blocks
+
         if self.prml and self.tap is not None:
             xt = self.struct_truth(header)
             x1 = T.prml_tiles(y, self.tap, self.bias, self.known, xt, x0,

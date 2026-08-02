@@ -347,6 +347,24 @@ def set_header_len(n: int) -> None:
     HEADER_LEN = n
 
 
+_HDR_RS = [None]
+_HDR_PHASE_HINT = [None]
+
+
+def set_phase_hint(ph):
+    """Whitening phase to try FIRST.
+
+    Only one phase can ever match a given seq (unpack_header verifies
+    seq % HDR_PHASES == ph), so trying phases in arbitrary order means ~9
+    guaranteed-doomed Reed-Solomon decodes per attempt. On a frame whose
+    header is unreadable the caller then repeats that across every threshold
+    rule, which profiled at 349 ms/frame - 23% of the whole decoder, to read
+    68 bytes. The caller knows roughly which seq to expect (the previous one
+    plus one, at hold=1), and that fixes the phase.
+    """
+    _HDR_PHASE_HINT[0] = None if ph is None else int(ph) % HDR_PHASES
+
+
 def unpack_header(raw: bytes):
     # Try whitened first, then raw: captures filmed before whitening was
     # introduced must keep decoding, and one extra RS attempt is free.
@@ -354,11 +372,19 @@ def unpack_header(raw: bytes):
     # for captures filmed before whitening existed. A phase is only accepted
     # if the seq it decodes to actually belongs to that phase, which makes a
     # false accept require an RS miscorrection AND a phase coincidence.
+    if _HDR_RS[0] is None:
+        # was constructed INSIDE the phase loop, so up to 40 generator-
+        # polynomial builds per frame
+        _HDR_RS[0] = RSCodec(HEADER_ECC)
+    order = list(range(HDR_PHASES))
+    hint = _HDR_PHASE_HINT[0]
+    if hint is not None:
+        order = [hint] + [p for p in order if p != hint]
     body = None
-    for ph in list(range(HDR_PHASES)) + [-1, None]:
+    for ph in order + [-1, None]:
         cand = raw if ph is None else _hdr_xor(raw, ph)
         try:
-            b = bytes(RSCodec(HEADER_ECC).decode(cand)[0])
+            b = bytes(_HDR_RS[0].decode(cand)[0])
         except ReedSolomonError:
             continue
         if b[:4] != MAGIC:

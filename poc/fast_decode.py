@@ -40,12 +40,15 @@ def _init(cfg):
     grid.set_radial(cfg["radial"])
     _K1[0] = cfg["radial"]
     grid.set_local_threshold(cfg.get("local_th", grid.LOCAL_TH))
+    _H_PREV[0] = None
+    grid.set_phase_hint(None)
 
 
 _TEMPLATES = [None]
 _FD = [None]        # per-process FrameDecoder, holds the rolling kernel donor
 _ALLC = [None]
 _K1 = [0.0]         # per-worker tracked radial coefficient
+_H_PREV = [None]    # last accepted homography (see HOMOGRAPHY REUSE)
 
 
 def _worker(rng):
@@ -67,18 +70,39 @@ def _worker(rng):
         if not ok:
             break
         n += 1
-        small = cv2.resize(img, None, fx=0.5, fy=0.5) if img.shape[1] >= 3000 else img
-        Hs = grid.locate(small, layout)
-        if Hs is None:
-            Hs = grid.locate(img, layout)     # dense grids need full res
-            H = Hs
-        else:
-            H = (np.diag([2.0, 2.0, 1.0]) @ Hs) if img.shape[1] >= 3000 else Hs
-        if H is None:
-            continue
-        header, samples, _st = grid.sample_frame(img, layout, H)
+        # HOMOGRAPHY REUSE. locate() re-runs contour finding from scratch on
+        # every frame - 101 ms/frame, 6.8% of the decoder - to re-find a code
+        # that moved by a fraction of a cell in 1/60 s. Try the PREVIOUS
+        # frame's homography first and keep it if the header still decodes,
+        # which is a stricter test than any tracking residual: 68 bytes behind
+        # RS(68,28) and a CRC16 do not pass by accident on a stale geometry.
+        header = samples = None
+        if _H_PREV[0] is not None:
+            header, samples, _st = grid.sample_frame(img, layout, _H_PREV[0])
+            if header is not None:
+                H = _H_PREV[0]
+            else:
+                header = samples = None
+        if header is None:
+            small = (cv2.resize(img, None, fx=0.5, fy=0.5)
+                     if img.shape[1] >= 3000 else img)
+            Hs = grid.locate(small, layout)
+            if Hs is None:
+                Hs = grid.locate(img, layout)     # dense grids need full res
+                H = Hs
+            else:
+                H = (np.diag([2.0, 2.0, 1.0]) @ Hs) if img.shape[1] >= 3000 else Hs
+            if H is None:
+                _H_PREV[0] = None
+                continue
+            header, samples, _st = grid.sample_frame(img, layout, H)
         if samples is None:
             continue
+        if header is not None:
+            _H_PREV[0] = H
+            # only one whitening phase can match a given seq, so predicting the
+            # next seq collapses ten doomed RS decodes into one
+            grid.set_phase_hint(int(header["seq"]) + 1)
         if header is None:
             # ML SEQUENCE RESCUE. Only `seq` varies between frames; k,
             # block_size, file_size and mode are transfer constants, so a
