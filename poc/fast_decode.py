@@ -316,6 +316,11 @@ def main():
     ap.add_argument("--no-track-k1", action="store_true",
                     help="hold one radial coefficient for the whole clip")
     ap.add_argument("--k1-step", type=float, default=0.0025)
+    ap.add_argument("--full", action="store_true",
+                    help="decode every frame instead of stopping "
+                         "when the file completes. Needed when the "
+                         "reported RATE is the point, since the "
+                         "best-window search wants all the frames.")
     ap.add_argument("--reuse-homography", action="store_true",
                     help="skip locate() when the previous frame's "
                          "homography still reads the header. MEASURED NET LOSS on IMG_7872: 10%% fewer blocks for 5%% less wall time, "
@@ -471,15 +476,75 @@ def main():
     # whose range is a short contiguous run spends most of it re-bootstrapping.
     # Give each worker one long run instead of four short ones.
     per = 4 if not args.soft else 1
-    chunk = max(30, total // (args.workers * per))
-    ranges = [(s, min(s + chunk, total)) for s in range(0, total, chunk)]
+
+    def _decode_span(lo, hi):
+        """Run the worker pool over [lo, hi) and return sorted hits."""
+        span = hi - lo
+        ch = max(30, span // (args.workers * per))
+        rs = [(s, min(s + ch, hi)) for s in range(lo, hi, ch)]
+        with Pool(args.workers, initializer=_init, initargs=(cfg,)) as pool:
+            res = pool.map(_worker, rs)
+        return sorted([h for r in res for h in r], key=lambda x: x[0])
+
+    def _try_assemble(hs):
+        if not hs:
+            return None, None
+        pr = hs[0][3]
+        kk = pr["k"]
+        if args.subblock:
+            kk = -(-pr["file_size"] // pr["block_size"])
+        d = fountain.Decoder(kk, pr["block_size"], pr["file_size"])
+        for _n, sq, bl, _p in hs:
+            if sq in d.seen:
+                continue
+            d.add(sq, bl)
+            if len(d.seen) >= d.k and not d.done:
+                d.gaussian_fallback()
+            if d.done:
+                break
+        if not d.done:
+            d.gaussian_fallback()
+        return (d, pr) if d.done else (None, pr)
+
     t0 = time.time()
-    with Pool(args.workers, initializer=_init, initargs=(cfg,)) as pool:
-        results = pool.map(_worker, ranges)
+    # INCREMENTAL DECODE. The file completes in ~77 frames; a take is thousands.
+    # Decoding all of them to recover something that finished in the first
+    # second and a half is most of the wall clock this decoder spends. Widen a
+    # window about the middle of the capture - past the AE/AF settling
+    # transient, before the operator starts lowering the phone - and stop as
+    # soon as the fountain closes.
+    #
+    # This trades the BEST WINDOW search, which wants every frame it can get,
+    # for time-to-file. Use --full when the reported rate is the point.
+    hits = []
+    if args.full:
+        hits = _decode_span(0, total)
+        scanned = total
+    else:
+        seen_lo, seen_hi = None, None
+        for frac in (0.10, 0.25, 0.55, 1.0):
+            w = max(240, int(total * frac))
+            lo = max(0, total // 2 - w // 2)
+            hi = min(total, lo + w)
+            if seen_lo is None:
+                hits = _decode_span(lo, hi)
+            else:
+                if lo < seen_lo:
+                    hits = _decode_span(lo, seen_lo) + hits
+                if hi > seen_hi:
+                    hits = hits + _decode_span(seen_hi, hi)
+                hits.sort(key=lambda x: x[0])
+            seen_lo = lo if seen_lo is None else min(seen_lo, lo)
+            seen_hi = hi if seen_hi is None else max(seen_hi, hi)
+            print(f"  window {seen_lo}-{seen_hi} ({(seen_hi-seen_lo)/fps:.1f}s): "
+                  f"{len(hits)} blocks, {time.time()-t0:.0f}s elapsed")
+            d, _pr = _try_assemble(hits)
+            if d is not None:
+                break
+        scanned = (seen_hi - seen_lo)
     wall = time.time() - t0
-    hits = sorted([h for r in results for h in r], key=lambda x: x[0])
-    print(f"decoded {len(hits)} blocks in {wall:.1f}s wall "
-          f"({total/max(wall,1e-6):.0f} frames/s)")
+    print(f"decoded {len(hits)} blocks from {scanned} of {total} frames "
+          f"in {wall:.1f}s wall ({scanned/max(wall,1e-6):.0f} frames/s)")
     if not hits:
         sys.exit("FAILED: no blocks")
     proto = hits[0][3]
