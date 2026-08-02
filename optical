@@ -116,6 +116,15 @@ def _screen_points():
     return 1512, 982
 
 
+def _video_frames(path):
+    """Frame count, used by preflight to prove a clip is complete."""
+    import cv2
+    cap = cv2.VideoCapture(str(path))
+    n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap.release()
+    return n
+
+
 def _video_size(path):
     import cv2
     cap = cv2.VideoCapture(str(path))
