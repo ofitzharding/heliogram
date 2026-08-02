@@ -195,7 +195,7 @@ def rs_encoded_len(n: int) -> int:
 _HDR_MASK_CACHE = {}
 
 
-def _hdr_mask(n: int) -> bytes:
+def _hdr_mask(n: int, phase: int = 0) -> bytes:
     """Deterministic whitening sequence for the header.
 
     The header is structurally low-entropy — magic bytes, small integers
@@ -210,8 +210,9 @@ def _hdr_mask(n: int) -> bytes:
     Whitening is the standard fix (DVB, Ethernet, USB all scramble). XOR is
     applied AFTER Reed-Solomon so the code structure is untouched.
     """
-    if n not in _HDR_MASK_CACHE:
-        x = 0xACE1
+    key = (n, phase)
+    if key not in _HDR_MASK_CACHE:
+        x = 0xACE1 ^ (0x1D3F * (phase + 1) & 0xFFFF) or 0xACE1
         out = bytearray()
         for _ in range(n):
             for _ in range(8):
@@ -220,12 +221,15 @@ def _hdr_mask(n: int) -> bytes:
                 if lsb:
                     x ^= 0xB400
             out.append(x & 0xFF)
-        _HDR_MASK_CACHE[n] = bytes(out)
-    return _HDR_MASK_CACHE[n]
+        _HDR_MASK_CACHE[key] = bytes(out)
+    return _HDR_MASK_CACHE[key]
 
 
-def _hdr_xor(b: bytes) -> bytes:
-    m = _hdr_mask(len(b))
+HDR_PHASES = 8      # header whitening cycles over this many patterns
+
+
+def _hdr_xor(b: bytes, phase: int = 0) -> bytes:
+    m = _hdr_mask(len(b), phase)
     return bytes(x ^ y for x, y in zip(b, m))
 
 
@@ -235,7 +239,16 @@ def pack_header(seq: int, k: int, block_size: int, file_size: int, mode: int,
                                file_size, PAYLOAD_ECC, zone_w, zone_modes)
     body += b"\x00" * (HEADER_LEN - 2 - len(body))
     body += struct.pack("<H", zlib.crc32(body) & 0xFFFF)
-    return _hdr_xor(bytes(RSCodec(HEADER_ECC).encode(body)))
+    # Whiten with a SEQ-DEPENDENT phase. A fixed mask left the band static:
+    # only `seq` differs between frames, and the RS codeword is systematic,
+    # so the 28 data bytes (all constant but seq) land together and barely
+    # change. Measured on the rendered transmit: rows 76 and 78 varied at
+    # 29% of a typical payload row while row 77 varied normally — i.e. TWO
+    # stationary bands with a moving one between them, exactly as observed.
+    # Cycling the mask makes every header cell change frame to frame and
+    # pushes template Hamming distance toward the ideal 50%, which is what
+    # ML sequence detection discriminates on.
+    return _hdr_xor(bytes(RSCodec(HEADER_ECC).encode(body)), seq % HDR_PHASES)
 
 
 HEADER_CENTERED = True   # v3 layout. Older captures have it at the top edge.
@@ -265,15 +278,24 @@ def set_header_len(n: int) -> None:
 def unpack_header(raw: bytes):
     # Try whitened first, then raw: captures filmed before whitening was
     # introduced must keep decoding, and one extra RS attempt is free.
+    # ML proposes, RS verifies: try each whitening phase, plus the raw path
+    # for captures filmed before whitening existed. A phase is only accepted
+    # if the seq it decodes to actually belongs to that phase, which makes a
+    # false accept require an RS miscorrection AND a phase coincidence.
     body = None
-    for cand in (_hdr_xor(raw), raw):
+    for ph in list(range(HDR_PHASES)) + [None]:
+        cand = raw if ph is None else _hdr_xor(raw, ph)
         try:
             b = bytes(RSCodec(HEADER_ECC).decode(cand)[0])
         except ReedSolomonError:
             continue
-        if b[:4] == MAGIC:
-            body = b
-            break
+        if b[:4] != MAGIC:
+            continue
+        if ph is not None and len(b) >= 10:
+            if struct.unpack("<I", b[6:10])[0] % HDR_PHASES != ph:
+                continue
+        body = b
+        break
     if body is None:
         return None
     crc = struct.unpack("<H", body[-2:])[0]
@@ -373,7 +395,8 @@ def render_frame(layout: Layout, header: bytes, payload: bytes,
     # this is photometric only and changes no protocol.
     rest = layout.header_cells[len(hb):]
     if len(rest):
-        filler = _bits(_hdr_mask(-(-len(rest) // 8) + 1))[: len(rest)]
+        filler = _bits(_hdr_mask(-(-len(rest) // 8) + 1,
+                                 sum(header) % HDR_PHASES))[: len(rest)]
         cells[rest[:, 0], rest[:, 1]] = (255.0 * filler)[:, None]
 
     # payload
