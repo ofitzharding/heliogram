@@ -94,10 +94,22 @@ def _worker(rng):
             if margin < _CFG.get("ml_margin", 3.0):
                 continue
             header = dict(proto_full, seq=seq)
-        elif proto_full is None:
-            proto_full = dict(header)
+        elif proto_full is not None and (
+                header["k"], header["file_size"]) != (
+                proto_full["k"], proto_full["file_size"]):
+            continue          # a frame from a different transmission
         if proto is None:
-            proto = {k: header[k] for k in ("k", "block_size", "file_size", "mode")}
+            # Prefer the MAJORITY proto learned in the pre-pass. Each worker
+            # otherwise adopts the first header in ITS range, and a countdown
+            # clip rendered from another transmit carries a valid header for a
+            # different file - so workers disagreed and the fountain was built
+            # for the wrong k while 9932 good codewords sat unused.
+            if proto_full is not None:
+                proto = {k: proto_full[k]
+                         for k in ("k", "block_size", "file_size", "mode")}
+            else:
+                proto = {k: header[k]
+                         for k in ("k", "block_size", "file_size", "mode")}
         if _CFG.get("subblock"):
             # Per-codeword recovery: soft-erasure RS on each codeword, then its
             # own CRC. Every survivor is an independent fountain symbol, so a
@@ -200,6 +212,28 @@ def main():
                 hd, s, _ = grid.sample_frame(im, layout, H)
                 if hd is None or s is None:
                     continue
+                if args.subblock:
+                    # SUBBLOCK MODE: a frame carries n_sub INDEPENDENT
+                    # codewords, so the whole-block CRC never passes and the
+                    # scan scored 0 hits at every k1 - then defaulted to
+                    # k1=0.0 and overrode the correct value _detect had
+                    # already found. Count certified codewords instead.
+                    from reedsolo import RSCodec, ReedSolomonError
+                    raw, _bc = grid.raw_bits_and_conf(hd, s, layout)
+                    rs_ = RSCodec(args.ecc)
+                    ssz = (255 - args.ecc) - 4
+                    ns_ = grid.sub_count(layout, hd["mode"],
+                                         hd.get("zone_w", 0), hd.get("zone_modes", 0))
+                    for j in range(min(ns_, len(raw) // 255)):
+                        try:
+                            d_ = bytes(rs_.decode(raw[j*255:(j+1)*255])[0])
+                        except ReedSolomonError:
+                            continue
+                        if len(d_) >= 4 + ssz and \
+                           zlib.crc32(d_[4:4+ssz]) & 0xFFFFFFFF == \
+                           struct.unpack("<I", d_[:4])[0]:
+                            hits += 1
+                    continue
                 pl = grid.decide_payload(hd, s, layout)
                 if pl is None:
                     continue
@@ -208,8 +242,14 @@ def main():
                     hits += 1
             if hits > best_hits:
                 best, best_hits = float(k1), hits
-        radial = best
-        print(f"k1 scan: {radial:+.3f} ({best_hits}/{len(probes)} probe frames)")
+        # A scan that found NOTHING must not override the caller's value.
+        if best_hits <= 0:
+            print(f"k1 scan: no hits at any k1, keeping --radial {args.radial:+.3f}")
+            radial = args.radial
+        else:
+            radial = best
+            print(f"k1 scan: {radial:+.3f} ({best_hits} hits over "
+                  f"{len(probes)} probe frames)")
 
     # PROTO PRE-PASS. ML sequence rescue needs the transfer constants (k,
     # block_size, file_size, mode) to build candidate templates, and those
@@ -222,6 +262,7 @@ def main():
     proto_full, max_seq = None, 1500
     c = cv2.VideoCapture(args.input)
     seqs = []
+    hdrs = []
     for fi in np.linspace(total * 0.15, total * 0.9, 40).astype(int):
         c.set(cv2.CAP_PROP_POS_FRAMES, int(fi))
         ok, im = c.read()
@@ -237,9 +278,25 @@ def main():
         hd, _s, _st = grid.sample_frame(im, layout, H)
         if hd is not None:
             seqs.append(hd["seq"])
-            if proto_full is None:
-                proto_full = dict(hd)
+            hdrs.append(dict(hd))
     c.release()
+    # MAJORITY proto, not the first one seen. The countdown clip carries a
+    # valid header for a DIFFERENT file (it was rendered from another
+    # transmit), so "first header wins" learned k=5525/file=1.12MB from
+    # countdown frames and then tried to reconstruct that from a 277KB
+    # transmission - 9840 codewords decoded, 9 blocks assembled.
+    if hdrs:
+        from collections import Counter
+        key = Counter((h["k"], h["block_size"], h["file_size"], h["mode"])
+                      for h in hdrs).most_common(1)[0][0]
+        for h in hdrs:
+            if (h["k"], h["block_size"], h["file_size"], h["mode"]) == key:
+                proto_full = h
+                break
+        if len(set((h["k"], h["file_size"]) for h in hdrs)) > 1:
+            print(f"  NOTE: {len(set((h['k'],h['file_size']) for h in hdrs))} "
+                  f"distinct transmissions in this capture; using the majority "
+                  f"(k={key[0]}, file={key[2]:,} B)")
     if proto_full is not None:
         max_seq = max(1500, int(max(seqs) * 1.5))
         print(f"proto learned from {len(seqs)}/40 probe frames: "
