@@ -145,20 +145,57 @@ def _dialog(msg, buttons, default):
 
 
 def _make_countdown(dst, like, seconds=8, size=None):
-    """Countdown clip matching the code video's geometry, so the phone is
-    already recording and framed before the first data frame."""
+    """Countdown clip whose BACKGROUND IS REAL CODE CONTENT.
+
+    The first version showed white digits on black. That is a trap: the user
+    locks AE/AF during the countdown, so the camera meters a ~5-luma scene,
+    opens up, and then the code (50% duty cycle mono, ~127 luma) arrives
+    massively overexposed — whites clip and the level spacing at the bright
+    end compresses. The failed gray4 capture shows exactly that signature:
+    levels at 106/158/211/241, i.e. spacings 52, 52, then 30.
+
+    So the countdown must be photometrically identical to the payload. It
+    uses a real rendered frame as background and writes the digits into the
+    letterbox margin, where there are no data cells to occlude.
+    """
     import cv2
+    import numpy as np
     W, H = size if size else _video_size(like)
+    bg = None
+    cap = cv2.VideoCapture(str(like))
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 3)
+    ok, frame = cap.read()
+    cap.release()
+    if ok and frame is not None:
+        bg = cv2.resize(frame, (W, H), interpolation=cv2.INTER_NEAREST)
+    if bg is None:
+        bg = np.full((H, W, 3), 127, np.uint8)      # at least match the mean
+
+    # find the letterbox margin: rows that are entirely dark in the render
+    g = cv2.cvtColor(bg, cv2.COLOR_BGR2GRAY)
+    rowmax = g.max(axis=1)
+    dark = np.where(rowmax < 40)[0]
+    band = None
+    if len(dark):
+        lo = dark[dark > H // 2]
+        if len(lo) > 40:
+            band = (int(lo[0]), int(lo[-1]))
+    if band is None:
+        band = (H - 90, H - 10)
+    cy = (band[0] + band[1]) // 2
+    bh = band[1] - band[0]
+
     try:
-        import numpy as np
         vw = cv2.VideoWriter(str(dst), cv2.VideoWriter_fourcc(*"mp4v"), 60,
                              (W, H))
         for sec in range(seconds, 0, -1):
-            f = np.zeros((H, W, 3), np.uint8)
-            cv2.putText(f, "HIT RECORD", (W // 2 - 460, H // 2 - 200),
-                        cv2.FONT_HERSHEY_SIMPLEX, 3.2, (255, 255, 255), 8)
-            cv2.putText(f, str(sec), (W // 2 - 70, H // 2 + 220),
-                        cv2.FONT_HERSHEY_SIMPLEX, 9.0, (255, 255, 255), 24)
+            f = bg.copy()
+            txt = f"HIT RECORD + LOCK AE/AF   {sec}"
+            scale = max(0.8, min(2.2, bh / 55.0))
+            (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX,
+                                          scale, 3)
+            cv2.putText(f, txt, (max(4, (W - tw) // 2), cy + th // 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, scale, (255, 255, 255), 3)
             for _ in range(60):
                 vw.write(f)
         vw.release()
@@ -245,7 +282,7 @@ def cmd_send(args):
                  f'-pix_fmt yuv420p "{play}"')
         if rc.returncode:
             play = out          # fall back to the raw encode
-    cd_clip = out.parent / f"_countdown{args.countdown}.mp4"
+    cd_clip = out.parent / f"_countdown_{args.profile}_{args.countdown}.mp4"
     if not cd_clip.exists():
         _make_countdown(cd_clip, play, args.countdown, (sw, sh))
     with _chrome_hidden():
