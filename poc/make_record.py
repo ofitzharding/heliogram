@@ -44,7 +44,7 @@ PW, PH = 3024, 1964
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--payload", default=str(Path(__file__).parent.parent /
-                                             "demo" / "payload.png"))
+                                             "demo" / "kitten.png"))
     ap.add_argument("--out", default=str(Path(__file__).parent.parent /
                                          "demo" / "_tx_record163.mp4"))
     ap.add_argument("--grid", default="252x163")

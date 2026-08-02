@@ -5,3 +5,6 @@ __pycache__/
 demo/_tx_*
 demo/_countdown*
 *.dat.npy
+demo/payload.png
+demo/payload_big.png
+demo/recovered.png
