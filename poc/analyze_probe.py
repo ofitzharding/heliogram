@@ -77,6 +77,38 @@ def main():
         n_sub = grid.sub_count(L, grid.MODE_MONO)
         layouts[spec] = (L, TB.SubBlock(L, 48, n_sub * (255 - 48)), n_sub)
 
+    # RADIAL PRE-PASS. k1 is a property of the framing distance, not a
+    # constant: this take needed 0.01 where earlier ones needed 0.0 or 0.020,
+    # and a hardcoded value silently decoded NOTHING. Learn it once from
+    # probe frames by maximising header decodes, then reuse it.
+    cap0 = cv2.VideoCapture(args.capture)
+    tot0 = int(cap0.get(cv2.CAP_PROP_FRAME_COUNT))
+    probes = []
+    for fi in np.linspace(tot0 * 0.1, tot0 * 0.9, 26).astype(int):
+        cap0.set(cv2.CAP_PROP_POS_FRAMES, int(fi))
+        ok, im = cap0.read()
+        if ok:
+            probes.append(im)
+    cap0.release()
+    best_k1, best_hits = 0.0, -1
+    for k1 in (0.0, 0.005, 0.010, 0.015, 0.020, 0.025):
+        grid.set_radial(k1)
+        hits = 0
+        for im in probes:
+            for spec, (L, sub, n_sub) in layouts.items():
+                H = grid.locate(im, L)
+                if H is None:
+                    continue
+                hd, _s, _t = grid.sample_frame(im, L, H)
+                if hd is not None:
+                    hits += 1
+                    break
+        if hits > best_hits:
+            best_k1, best_hits = k1, hits
+    grid.set_radial(best_k1)
+    print(f"radial pre-pass: k1={best_k1:+.3f} "
+          f"({best_hits}/{len(probes)} probe frames headered)\n")
+
     cap = cv2.VideoCapture(args.capture)
     total = min(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), args.max_frames)
     fields, stripe = [], {}
