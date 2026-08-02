@@ -192,13 +192,50 @@ def rs_encoded_len(n: int) -> int:
     return n + chunks * PAYLOAD_ECC
 
 
+_HDR_MASK_CACHE = {}
+
+
+def _hdr_mask(n: int) -> bytes:
+    """Deterministic whitening sequence for the header.
+
+    The header is structurally low-entropy — magic bytes, small integers
+    whose high bytes are zero, and literal zero padding — so it renders as a
+    visibly dark band across the middle of every frame: measured 39% white
+    with a 45-cell run of solid black. Three consequences, none cosmetic:
+    a global threshold computed over header+payload is dragged off the
+    header's own eye; long uniform runs carry no transitions, so they cannot
+    excite a channel estimate; and the band's mean luma differs from the
+    payload's, which biases camera metering.
+
+    Whitening is the standard fix (DVB, Ethernet, USB all scramble). XOR is
+    applied AFTER Reed-Solomon so the code structure is untouched.
+    """
+    if n not in _HDR_MASK_CACHE:
+        x = 0xACE1
+        out = bytearray()
+        for _ in range(n):
+            for _ in range(8):
+                lsb = x & 1
+                x >>= 1
+                if lsb:
+                    x ^= 0xB400
+            out.append(x & 0xFF)
+        _HDR_MASK_CACHE[n] = bytes(out)
+    return _HDR_MASK_CACHE[n]
+
+
+def _hdr_xor(b: bytes) -> bytes:
+    m = _hdr_mask(len(b))
+    return bytes(x ^ y for x, y in zip(b, m))
+
+
 def pack_header(seq: int, k: int, block_size: int, file_size: int, mode: int,
                 zone_w: int = 0, zone_modes: int = 0) -> bytes:
     body = MAGIC + struct.pack("<BBIIHIBBB", 2, mode, seq, k, block_size,
                                file_size, PAYLOAD_ECC, zone_w, zone_modes)
     body += b"\x00" * (HEADER_LEN - 2 - len(body))
     body += struct.pack("<H", zlib.crc32(body) & 0xFFFF)
-    return bytes(RSCodec(HEADER_ECC).encode(body))
+    return _hdr_xor(bytes(RSCodec(HEADER_ECC).encode(body)))
 
 
 HEADER_CENTERED = True   # v3 layout. Older captures have it at the top edge.
@@ -226,11 +263,18 @@ def set_header_len(n: int) -> None:
 
 
 def unpack_header(raw: bytes):
-    try:
-        body = bytes(RSCodec(HEADER_ECC).decode(raw)[0])
-    except ReedSolomonError:
-        return None
-    if body[:4] != MAGIC:
+    # Try whitened first, then raw: captures filmed before whitening was
+    # introduced must keep decoding, and one extra RS attempt is free.
+    body = None
+    for cand in (_hdr_xor(raw), raw):
+        try:
+            b = bytes(RSCodec(HEADER_ECC).decode(cand)[0])
+        except ReedSolomonError:
+            continue
+        if b[:4] == MAGIC:
+            body = b
+            break
+    if body is None:
         return None
     crc = struct.unpack("<H", body[-2:])[0]
     if zlib.crc32(body[:-2]) & 0xFFFF != crc:
