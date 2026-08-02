@@ -81,7 +81,7 @@ def main():
     sub_enc = sub_size = n_sub = None
     if args.subblock:
         # one fountain symbol per RS codeword; 4 bytes of each go to its CRC
-        n_sub = max(1, (block_size + 4) // 255)
+        n_sub = grid.sub_count(layout, mode, zone_w, zone_modes)
         sub_size = (255 - args.ecc) - 4
         sub_enc = fountain.Encoder(data, sub_size)
         n_frames = max(int(np.ceil(sub_enc.k / n_sub)) + 4,
@@ -116,7 +116,7 @@ def main():
                 b = sub_enc.block(s)
                 b = b + b"\x00" * (sub_size - len(b))
                 parts.append(struct.pack("<I", zlib.crc32(b) & 0xFFFFFFFF) + b)
-            payload = b"".join(parts)[:block_size + 4]
+            payload = b"".join(parts)
         else:
             block = enc.block(seq)
             block = block + b"\x00" * (block_size - len(block))

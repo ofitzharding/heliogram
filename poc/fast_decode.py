@@ -107,7 +107,9 @@ def _worker(rng):
             raw, bconf = grid.raw_bits_and_conf(header, samples, layout)
             rs = RSCodec(ecc)
             sub_size = (255 - ecc) - 4
-            n_sub = max(1, (header["block_size"] + 4) // 255)
+            n_sub = grid.sub_count(layout, header["mode"],
+                                   header.get("zone_w", 0),
+                                   header.get("zone_modes", 0))
             for j in range(min(n_sub, len(raw) // 255)):
                 chunk = raw[j * 255:(j + 1) * 255]
                 dec = None

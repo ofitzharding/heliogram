@@ -168,6 +168,24 @@ class Layout:
         return b
 
 
+def sub_count(layout, mode: int, zone_w: int = 0, zone_modes: int = 0) -> int:
+    """Number of 255-byte codewords a frame can carry in subblock mode.
+
+    Derived from the grid's RAW cell capacity, not from block_size. The old
+    rule, n_sub = (block_size + 4) // 255, floors against a block_size that
+    is itself already RS-inflated, so it systematically under-fills: measured
+    77-81% of every grid painted, the remaining ~20% rendered as dead black
+    cells. That is a fifth of the transmit rate thrown away on every profile,
+    and it also corrupts receiver palette estimation (the dead mass is an
+    extra population the k-means has to model).
+
+    Both encoder and decoder compute this from (layout, mode) alone, so it
+    needs no header field and stays compatible either way.
+    """
+    raw_bytes = int(layout.bits_per_cell(mode, zone_w, zone_modes).sum()) // 8
+    return max(1, raw_bytes // 255)
+
+
 def rs_encoded_len(n: int) -> int:
     """reedsolo chunks into 223-data + 32-parity codewords."""
     chunks = -(-n // (255 - PAYLOAD_ECC))

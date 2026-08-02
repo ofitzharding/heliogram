@@ -41,6 +41,18 @@ PROFILES = {
     "safe": dict(grid="252x140", mode="mono", cell_px=12, ecc=48,
                  raw_kbs=197.8, subblock=True,
                  note="binary at 13.1 camera-px/cell; the profile proven bit-exact"),
+    "record": dict(grid="280x155", mode="mono", cell_px=10, ecc=48,
+                   raw_kbs=243.6, subblock=True,
+                   note="mono at 12.1 camera-px/cell with the grid actually "
+                        "FULL (n_sub from raw capacity, not the RS-inflated "
+                        "block) — 243.6 KB/s of data; needs 53% yield to pass "
+                        "decimen. Mono because measured glare leaves 2 levels "
+                        "~6 sigma and 4 levels only ~2."),
+    "stretch": dict(grid="302x168", mode="mono", cell_px=9, ecc=48,
+                    raw_kbs=280.1, subblock=True,
+                    note="11.3 camera-px/cell — past the 13.1 binary wall but "
+                         "well short of the 9.1 that failed; needs only 46% "
+                         "yield. The gamble worth filming second."),
     "robust": dict(grid="180x100", mode="mono", cell_px=16, ecc=64,
                    raw_kbs=110.0, subblock=False,
                    note="large cells, heavy ECC; for poor light or shaky hands"),
