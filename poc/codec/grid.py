@@ -212,7 +212,11 @@ def _hdr_mask(n: int, phase: int = 0) -> bytes:
     """
     key = (n, phase)
     if key not in _HDR_MASK_CACHE:
-        x = 0xACE1 ^ (0x1D3F * (phase + 1) & 0xFFFF) or 0xACE1
+        # phase < 0 reproduces the original single-mask whitening. Transmits
+        # rendered during the brief window when whitening was fixed-mask are
+        # otherwise undecodable, because no non-negative phase reuses that
+        # seed. That cost a filmed take; keep it forever.
+        x = 0xACE1 if phase < 0 else (0xACE1 ^ (0x1D3F * (phase + 1) & 0xFFFF)) or 0xACE1
         out = bytearray()
         for _ in range(n):
             for _ in range(8):
@@ -283,7 +287,7 @@ def unpack_header(raw: bytes):
     # if the seq it decodes to actually belongs to that phase, which makes a
     # false accept require an RS miscorrection AND a phase coincidence.
     body = None
-    for ph in list(range(HDR_PHASES)) + [None]:
+    for ph in list(range(HDR_PHASES)) + [-1, None]:
         cand = raw if ph is None else _hdr_xor(raw, ph)
         try:
             b = bytes(RSCodec(HEADER_ECC).decode(cand)[0])
@@ -291,7 +295,7 @@ def unpack_header(raw: bytes):
             continue
         if b[:4] != MAGIC:
             continue
-        if ph is not None and len(b) >= 10:
+        if ph is not None and ph >= 0 and len(b) >= 10:
             if struct.unpack("<I", b[6:10])[0] % HDR_PHASES != ph:
                 continue
         body = b
@@ -525,22 +529,61 @@ def _finder_centers(gray: np.ndarray):
     for a, x, y in cands:
         if all((x - x2) ** 2 + (y - y2) ** 2 > a * 0.5 for _, x2, y2 in out):
             out.append((a, x, y))
-    return [(x, y) for _, x, y in out[:4]]
+    return [(x, y) for _, x, y in out[:12]]
+
+
+def _best_quad(pts, aspect):
+    """Choose the 4 points that actually look like the code's corners.
+
+    Taking the top 4 by area is wrong twice over, and both failures were
+    observed on real frames: a Dock icon outranks a true marker (rounded
+    nested squares are the same pattern), and on a clean render a chance
+    nested quad in the random payload displaced the top-left finder, after
+    which the sum/diff ordering assigned one point to both TL and BL.
+
+    Score every 4-subset by how close it is to a parallelogram of the right
+    aspect, which is what four corners of a plane actually project to.
+    """
+    import itertools
+    best, best_score = None, -1.0
+    for combo in itertools.combinations(range(len(pts)), 4):
+        q = pts[list(combo)]
+        s_ = q.sum(axis=1)
+        d_ = q[:, 0] - q[:, 1]
+        tl, br = q[np.argmin(s_)], q[np.argmax(s_)]
+        tr, bl = q[np.argmax(d_)], q[np.argmin(d_)]
+        dst = np.array([tl, tr, bl, br], dtype=np.float32)
+        if min(np.hypot(*(dst[i] - dst[j]))
+               for i in range(4) for j in range(i + 1, 4)) < 8.0:
+            continue
+        w = (np.hypot(*(dst[1] - dst[0])) + np.hypot(*(dst[3] - dst[2]))) / 2
+        h = (np.hypot(*(dst[2] - dst[0])) + np.hypot(*(dst[3] - dst[1]))) / 2
+        if w < 20 or h < 20:
+            continue
+        # parallelogram-ness: opposite sides should match
+        par = (abs(np.hypot(*(dst[1] - dst[0])) - np.hypot(*(dst[3] - dst[2]))) / w +
+               abs(np.hypot(*(dst[2] - dst[0])) - np.hypot(*(dst[3] - dst[1]))) / h)
+        asp = abs((w / h) - aspect) / aspect
+        score = w * h / (1.0 + 6.0 * par + 6.0 * asp)
+        if score > best_score:
+            best, best_score = dst, score
+    return best
 
 
 def locate(img: np.ndarray, layout: Layout):
     """Return homography unit-grid -> image, or None."""
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
     pts = _finder_centers(gray)
-    if len(pts) != 4:
+    if len(pts) < 4:
         return None
     pts = np.array(pts, dtype=np.float32)
-    # order TL, TR, BL, BR by the classic sum/diff trick
-    s = pts.sum(axis=1)
-    d = pts[:, 0] - pts[:, 1]
-    tl = pts[np.argmin(s)]; br = pts[np.argmax(s)]
-    tr = pts[np.argmax(d)]; bl = pts[np.argmin(d)]
     f = layout.finder
+    span_w = layout.gw - 1 - f      # centre-to-centre in cells
+    span_h = layout.gh - 1 - f
+    dst_best = _best_quad(pts, span_w / max(span_h, 1))
+    if dst_best is None:
+        return None
+    tl, tr, bl, br = dst_best
     fc = f / 2.0  # finder center offset from its zone origin, in cells
     src = np.array([
         [1 + fc, 1 + fc],
