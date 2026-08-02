@@ -444,7 +444,7 @@ def cmd_recv(args):
     rc = run(f"cd {POC} && python3 fast_decode.py {capture!s} {out!s} "
              f"--grid {p['grid']} --ecc {p['ecc']} --radial {k1} --header-len {hl} "
              f"{'--header-top' if not centered else ''} "
-             f"{'--subblock' if p.get('subblock') else ''}")
+             f"{'--subblock' if p.get('subblock') else ''} --scan")
     if rc.returncode:
         sys.exit("\nrecovery failed. Try: better light, hold steadier, or "
                  "re-send with --profile robust")
@@ -458,7 +458,7 @@ def cmd_bench(args):
     run(f"cd {POC} && python3 fast_decode.py {capture!s} {tmp!s} "
         f"--grid {p['grid']} --ecc {p['ecc']} --radial {k1} --header-len {hl} "
         f"{'--header-top' if not centered else ''} "
-        f"{'--subblock' if p.get('subblock') else ''}")
+        f"{'--subblock' if p.get('subblock') else ''} --scan")
 
 
 def main():
