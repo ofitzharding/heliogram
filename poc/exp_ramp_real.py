@@ -39,7 +39,7 @@ R = 2
 SUB = 255 - 48 - 4
 
 
-def truth_frame(L, seq, enc, n_sub, file_size):
+def truth_frame(L, seq, enc, n_sub, file_size, zone_w=0):
     parts = []
     for j in range(n_sub):
         b = enc.block(seq * n_sub + j)
@@ -47,7 +47,7 @@ def truth_frame(L, seq, enc, n_sub, file_size):
         parts.append(struct.pack("<I", zlib.crc32(b) & 0xFFFFFFFF) + b)
     hdr = grid.pack_header(seq, enc.k,
                            L.payload_capacity_bytes(grid.MODE_MONO) - 4,
-                           file_size, grid.MODE_MONO, 0, 0)
+                           file_size, grid.MODE_MONO, zone_w, 0)
     im = grid.render_frame(L, hdr, b"".join(parts), grid.MODE_MONO, cell_px=1)
     return (cv2.cvtColor(im, cv2.COLOR_BGR2GRAY) > 127).astype(np.float32)
 
@@ -69,10 +69,16 @@ def main():
     allS = np.argwhere(np.ones((Ls.gh, Ls.gw), bool))
     allD = np.argwhere(np.ones((Ld.gh, Ld.gw), bool))
 
-    protoD = dict(k=encd.k, block_size=Ld.payload_capacity_bytes(grid.MODE_MONO) - 4,
-                  file_size=len(data), mode=0, zone_w=0, zone_modes=0)
-    print("building ML header templates for 350x194 ...")
-    TPL = grid.header_templates(protoD, 400)
+    # make_probe stamps the HOLD into zone_w (1, 2 or 4). Templates built with
+    # zone_w=0 mismatch every real header by construction, which is why the
+    # first two runs of this test found zero usable frames.
+    print("building ML header templates for 350x194 (one set per hold) ...")
+    TPLS = {}
+    for hold_v in (1, 2, 4):
+        TPLS[hold_v] = grid.header_templates(
+            dict(k=encd.k,
+                 block_size=Ld.payload_capacity_bytes(grid.MODE_MONO) - 4,
+                 file_size=len(data), mode=0, zone_w=hold_v, zone_modes=0), 400)
 
     cap = cv2.VideoCapture(CAP)
     tot = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -141,24 +147,29 @@ def main():
             H = grid.locate(img, Ld)
             if H is None:
                 continue
-            cells, exp = grid.known_cells(Ld)
-            sm = grid.sample_cells(img, Ld, H, cells).mean(axis=1)
-            ag = float(((sm > np.percentile(sm, 50)).astype(np.uint8) == exp).mean())
-            if ag > 0.85:
-                hit = (H, k1, ag)
+            # NOT structure agreement: that metric is biased at finder_scale>1
+            # (bigger finders shift the black/white balance of the known set,
+            # so a median threshold misclassifies). The clean transmit file
+            # scores only 72.8% at 350x194 while its header decodes perfectly.
+            # Gate on ML header margin instead, which is what actually matters.
+            hl_ = grid.sample_cells(img, Ld, H, Ld.header_cells).mean(axis=1)
+            for hv, TP in TPLS.items():
+                _sq, mg = grid.ml_header_seq(hl_, TP)
+                if mg >= 3.0:
+                    hit = (H, k1, mg, hv, TP)
+                    break
+            if hit:
                 break
         if hit is None:
             continue
-        H, k1, ag = hit
+        H, k1, margin, hv, TP = hit
         grid.set_radial(k1)
         hl = grid.sample_cells(img, Ld, H, Ld.header_cells).mean(axis=1)
-        seq, margin = grid.ml_header_seq(hl, TPL)
-        if margin < 3.0:
-            continue
+        seq, margin = grid.ml_header_seq(hl, TP)
         c = np.array([[0, 0], [Ld.gw, 0]], np.float32).reshape(-1, 1, 2)
         p = cv2.perspectiveTransform(c, H).reshape(-1, 2)
         pxc = float(np.linalg.norm(p[1] - p[0]) / Ld.gw)
-        xt = truth_frame(Ld, seq, encd, nd, len(data))
+        xt = truth_frame(Ld, seq, encd, nd, len(data), zone_w=hv)
         y = grid.sample_cells(img, Ld, H, allD).mean(axis=1
              ).reshape(Ld.gh, Ld.gw).astype(np.float32)
         th, _ = cv2.threshold(np.clip(y.ravel(), 0, 255).astype(np.uint8),
