@@ -364,7 +364,17 @@ def render_frame(layout: Layout, header: bytes, payload: bytes,
     hb = _bits(header)
     hc = layout.header_cells[: len(hb)]
     cells[hc[:, 0], hc[:, 1]] = (255.0 * hb)[:, None]
-    # unused header cells stay black
+    # Fill the LEFTOVER header cells with the whitening sequence instead of
+    # leaving them black. The header band is sized in whole rows, so the
+    # remainder is large — 200 of 744 cells at 280x155, i.e. 27% of the band
+    # nailed to black in every frame. That is what reads as a dark stationary
+    # line across the middle of the picture: measured 72 luma against 127 for
+    # payload rows. The receiver only ever reads the first len(hb) cells, so
+    # this is photometric only and changes no protocol.
+    rest = layout.header_cells[len(hb):]
+    if len(rest):
+        filler = _bits(_hdr_mask(-(-len(rest) // 8) + 1))[: len(rest)]
+        cells[rest[:, 0], rest[:, 1]] = (255.0 * filler)[:, None]
 
     # payload
     coded = bytes(RSCodec(PAYLOAD_ECC).encode(payload))
