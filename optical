@@ -226,8 +226,14 @@ def cmd_send(args):
     #
     sw, sh = _screen_points()
     vw, vh = _video_size(out)
-    scale = min(1.0, min(sw / vw, sh / vh))
-    tw, th = int(vw * scale) // 2 * 2, int(vh * scale) // 2 * 2
+    # INTEGER downscale only. The largest scale that merely fits (e.g. 0.54)
+    # resamples a uniform N-px cell pattern onto a non-integer grid, which
+    # aliases exactly the high-frequency content the cells ARE. 1/n keeps
+    # every cell a whole number of pixels, so the downscale is lossless for
+    # block-constant images.
+    n = max(1, -(-max(vw / sw, vh / sh) // 1))          # ceil
+    n = int(n)
+    tw, th = vw // n, vh // n
     play = out.with_name(out.stem + f"_play{sw}x{sh}.mp4")
     if not play.exists() or play.stat().st_mtime < out.stat().st_mtime:
         print(f"preparing playback copy at {tw}x{th} in a {sw}x{sh} window "
