@@ -112,20 +112,31 @@ def main():
     print(f"\n  ESTIMATE (hard RS, no PRML): {est:.1f} KB/s")
     print(f"  the soft path adds roughly 1.4x on top of this\n")
 
-    # ---- verdict. The two failure modes need opposite responses.
+    # ---- verdict.
+    #
+    # Driven by the estimated RATE, with the photometric readings used only to
+    # explain a shortfall. An earlier version gated on the readings themselves
+    # and called IMG_7872 REFILM over a 24-count exposure skew while that take
+    # was in fact certifying 87.9% of codewords - the best yet measured. A
+    # proxy that the decoder already handles is not a reason to refilm.
+    #
+    # Low header yield in particular is usually not a header problem: measured
+    # on IMG_7872, frames whose header failed carried a median of 2/19
+    # codewords, so the header was an honest gate on frames that were bad
+    # anyway. Recovering every one of them would have been worth 1.19x.
     bad = []
-    if p50 > (p5 + p95) / 2 + 22:
-        bad.append("OVEREXPOSED: the median cell sits well above the midpoint "
-                   "of the eye, so black cells are being flooded. Film in "
-                   "evening light with ONE lamp. Do NOT use the exposure "
-                   "slider.")
     if mid > 0.18:
         bad.append(f"STRADDLE {100*mid:.0f}%: the camera is integrating across "
-                   "two displayed frames. Re-lock AE/AF and hold still; if it "
-                   "persists the display and camera are fighting at 60Hz.")
-    if hy < 0.7:
-        bad.append(f"HEADER YIELD {100*hy:.0f}%: most frames are unreadable "
-                   "before the payload is even reached.")
+                   "two displayed frames. Re-lock AE/AF and hold still.")
+    if p50 > (p5 + p95) / 2 + 35:
+        bad.append("OVEREXPOSED: the median cell sits well above the midpoint "
+                   "of the eye, so black cells are being flooded. Evening "
+                   "light, ONE lamp, and do NOT use the exposure slider.")
+    if cy < 0.6:
+        bad.append(f"CODEWORD YIELD {100*cy:.0f}%: even the frames that "
+                   "decode are marginal, so this is the optics, not the gate.")
+    if est * 1.4 >= 200:
+        bad = []
     if not bad and est * 1.4 >= 200:
         print("  VERDICT: GOOD — decode it in full:")
         print(f"    python3 poc/fast_decode.py {args.capture} /tmp/out.bin \\")

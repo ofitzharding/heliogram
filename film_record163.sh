@@ -32,9 +32,14 @@ cat <<'EOF'
      decoder reports the best window as well as the full span.
 ------------------------------------------------------------------
 EOF
-sleep 4
-echo "playing ~75s. keep filming until the screen goes normal."
+sleep 3
+echo "22s LOCK-IN with an on-screen countdown, then ~75s of code."
 T0=$(python3 -c 'import time;print(time.time())')
+# The lock-in is this transmit's OWN frames with the countdown drawn over
+# them: same header, same file, so it cannot teach the receiver the wrong k
+# the way the old shared countdown clip did. Separate file so the countdown
+# plays once rather than every time the code loop wraps.
+ffplay -v error -fs -alwaysontop -noborder -autoexit demo/_tx_record163_lead.mp4
 ffplay -v error -fs -alwaysontop -noborder -loop 5 -autoexit demo/_tx_record163.mp4
 T1=$(python3 -c 'import time;print(time.time())')
 osascript -e 'tell application "System Events" to tell dock preferences to set autohide to false' \

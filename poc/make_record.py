@@ -55,6 +55,9 @@ def main():
                     help="distinct code frames; the script loops the file, so "
                          "this only has to exceed what one transfer consumes")
     ap.add_argument("--crf", type=int, default=10)
+    ap.add_argument("--lead-seconds", type=float, default=22.0,
+                    help="lock-in lead: this transmit's own frames "
+                         "with a countdown drawn over them")
     args = ap.parse_args()
 
     grid.set_ecc(args.ecc); grid.set_header_len(28)
@@ -90,6 +93,67 @@ def main():
            "-pix_fmt", "yuv420p", args.out]
     p = subprocess.Popen(cmd, stdin=subprocess.PIPE)
     canvas = np.zeros((PH, PW, 3), np.uint8)
+
+    # LOCK-IN LEAD. The camera needs a target to lock AE/AF onto and the
+    # operator needs to see when to do it, but a SEPARATE countdown clip is
+    # what caused the k=5525 disaster: rendered from another transmit, it
+    # carried a perfectly valid header for a different file, and "first header
+    # wins" then tried to rebuild a 1.12MB file out of a 277KB transmission.
+    #
+    # So the lead is this transmit's OWN frames with a counter drawn over
+    # them. Luminance-matched by construction (it IS the code), it advertises
+    # the correct file, and the overlay only costs the codewords it covers -
+    # which are the settling-transient frames the fountain was going to get
+    # nothing from anyway. Overlaid cells fail RS and are rejected by CRC, so
+    # they cannot corrupt anything either.
+    # Written as its OWN file so the operator sees the countdown once, at the
+    # start, instead of every time the code loop wraps. Same transmit, same
+    # header, same file - so unlike the old separate countdown it cannot teach
+    # the receiver the wrong k.
+    lead_out = args.out.replace(".mp4", "_lead.mp4")
+    pl = subprocess.Popen(
+        ["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24",
+         "-s", f"{PW}x{PH}", "-r", str(args.fps), "-i", "-",
+         "-c:v", "libx264", "-preset", "fast", "-crf", str(args.crf),
+         "-pix_fmt", "yuv420p", lead_out], stdin=subprocess.PIPE)
+    p, p_code = pl, p
+    lead = int(args.lead_seconds * args.fps)
+    for i in range(lead):
+        seq = i % args.frames
+        parts = []
+        for j in range(n_sub):
+            b = enc.block(seq * n_sub + j)
+            b = b + b"\x00" * (SUB - len(b))
+            parts.append(struct.pack("<I", zlib.crc32(b) & 0xFFFFFFFF) + b)
+        hdr = grid.pack_header(seq, enc.k, SUB, len(data), grid.MODE_MONO, 0, 0)
+        img = grid.render_frame(L, hdr, b"".join(parts), grid.MODE_MONO,
+                                cell_px=args.cell_px)
+        canvas[:] = 0
+        canvas[y0:y0 + H, x0:x0 + W] = img
+        left = args.lead_seconds - i / args.fps
+        txt = f"{left:0.0f}" if left > 3 else "HOLD STILL"
+        sc = 22.0 if left > 3 else 6.0
+        (tw, th_), _b = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, sc, 40)
+        org = ((PW - tw) // 2, (PH + th_) // 2)
+        cv2.putText(canvas, txt, org, cv2.FONT_HERSHEY_SIMPLEX, sc,
+                    (0, 0, 0), 90, cv2.LINE_AA)
+        cv2.putText(canvas, txt, org, cv2.FONT_HERSHEY_SIMPLEX, sc,
+                    (255, 255, 255), 40, cv2.LINE_AA)
+        msg = "TAP-HOLD TO LOCK AE/AF NOW - do NOT touch the exposure slider"
+        (mw, mh), _b2 = cv2.getTextSize(msg, cv2.FONT_HERSHEY_SIMPLEX, 2.2, 6)
+        cv2.putText(canvas, msg, ((PW - mw) // 2, PH - 120),
+                    cv2.FONT_HERSHEY_SIMPLEX, 2.2, (0, 0, 0), 16, cv2.LINE_AA)
+        cv2.putText(canvas, msg, ((PW - mw) // 2, PH - 120),
+                    cv2.FONT_HERSHEY_SIMPLEX, 2.2, (255, 255, 255), 6,
+                    cv2.LINE_AA)
+        p.stdin.write(canvas.tobytes())
+        if i % 50 == 0:
+            print(f"  lead-in {i}/{lead}", end="\r")
+    pl.stdin.close()
+    pl.wait()
+    canvas[:] = 0
+    p = p_code
+
     for seq in range(args.frames):
         parts = []
         for j in range(n_sub):
@@ -106,7 +170,10 @@ def main():
     p.stdin.close()
     p.wait()
     sz = Path(args.out).stat().st_size
+    lz = Path(args.out.replace(".mp4", "_lead.mp4")).stat().st_size
     print(f"\nwrote {args.out} ({sz/1e6:.0f} MB)")
+    print(f"wrote {args.out.replace('.mp4', '_lead.mp4')} ({lz/1e6:.0f} MB, "
+          f"{args.lead_seconds:.0f}s lock-in)")
     print(f"\ndecode with:\n  python3 fast_decode.py <capture.MOV> out.bin "
           f"--grid {gw}x{gh} --ecc {args.ecc} --subblock --soft --scan")
 
