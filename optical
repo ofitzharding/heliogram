@@ -98,6 +98,56 @@ def _chrome_hidden():
     return ctx()
 
 
+def _screen_decodes(profile):
+    """Screenshot the panel mid-playback and try to decode the screenshot.
+
+    The check that four wasted takes needed. A display path that cannot
+    decode its OWN screen output will never be recoverable by a camera, and
+    the failure is invisible to the eye: the window-mode render looked
+    perfectly fine on screen while sitting at 47% structure agreement.
+    """
+    import tempfile
+    import cv2
+    from codec import grid
+    p = PROFILES[profile]
+    gw, gh = (int(v) for v in p["grid"].split("x"))
+    shot = Path(tempfile.gettempdir()) / "_optical_selfcheck.png"
+    if subprocess.run(["screencapture", "-x", "-t", "png", str(shot)],
+                      capture_output=True).returncode:
+        return None, "screencapture unavailable"
+    img = cv2.imread(str(shot))
+    shot.unlink(missing_ok=True)
+    if img is None:
+        return None, "screenshot unreadable"
+    grid.set_ecc(p["ecc"]); grid.set_header_len(28)
+    grid.set_header_centered(True); grid.set_radial(0.0)
+    layout = grid.Layout(gw, gh)
+    H = grid.locate(img, layout)
+    if H is None:
+        return False, "code not locatable in the screen output"
+    cells, exp = grid.known_cells(layout)
+    import numpy as np
+    sm = grid.sample_cells(img, layout, H, cells).mean(axis=1)
+    agree = 100 * ((sm > np.percentile(sm, 50)).astype(np.uint8) == exp).mean()
+    hd, _s, _t = grid.sample_frame(img, layout, H)
+    return (hd is not None and agree > 80), \
+           f"structure {agree:.1f}%, header {'OK' if hd else 'FAIL'}"
+
+
+def _panel_pixels():
+    """Physical framebuffer size, which is what a fullscreen app draws into."""
+    try:
+        r = subprocess.run(["system_profiler", "SPDisplaysDataType"],
+                           capture_output=True, timeout=20, text=True)
+        import re
+        m = re.search(r"Resolution:\s*(\d+)\s*x\s*(\d+)", r.stdout)
+        if m:
+            return int(m.group(1)), int(m.group(2))
+    except Exception:
+        pass
+    return 3024, 1964
+
+
 def _screen_points():
     """Logical (point) size of the main display. ffplay windows are sized in
     points; a window this size covers the screen while keeping the drawable
@@ -249,63 +299,51 @@ def cmd_send(args):
                        f"{args.loops} loops (~{args.loops * 13}s).",
                        '"Cancel", "Start"', "Start"):
             return
-    # The raw encode is ~430 Mbps mpeg4, which ffplay decodes in software and
-    # drops frames on (measured: 104/760 dropped, with a 0.7s stall). Every
-    # dropped display frame is a missing fountain symbol. Transcode a playback
-    # copy to hardware-decodable H.264 once and play that instead.
+    # DISPLAY PATH, measured by screenshotting the panel and decoding the
+    # screenshot. That is the only test that matters, and it is the one that
+    # was missing while four takes were filmed against a broken path:
     #
-    # PLAYBACK GEOMETRY — measured, not guessed.
+    #   1512-point window   981/1000 mid-band px, 47% structure, header FAIL
+    #   fullscreen native    19/1000 mid-band px, 96% structure, header OK
     #
-    # The raw encode is a ~430 Mbps mpeg4 that ffplay decodes in software.
-    # Worse, ffplay FULLSCREEN on a Retina panel presents a 3024x1964
-    # drawable through a single-threaded YUV->RGB path and tops out at
-    # 26.7 fps: measured 28.5s wall for a 12.67s clip, with zero frames
-    # dropped (it runs late rather than dropping). At 26.7 fps the real
-    # data rate is 0.44x what the profile claims, silently.
+    # The window is not DPI-aware, so macOS renders the code at 1512px and
+    # smoothly upscales it to the 3024px panel, destroying the cells before
+    # any camera sees them. Fullscreen at the panel's native size maps 1:1.
     #
-    # A 1512x982 borderless window measures 58.9 fps with 0 drops, and on
-    # this 2x Retina panel it still covers the whole screen — each backing
-    # pixel is drawn as 2x2 physical, so cells keep their physical size.
-    # The 2:1 downscale is exact (uniform 14px cell blocks -> 7px), so no
-    # aliasing is introduced.
-    #
-    sw, sh = _screen_points()
+    # Fullscreen was abandoned earlier for running at 26.7fps. Re-measured on
+    # an idle machine it does 55.4fps: the original figure was taken while
+    # background encodes were saturating the CPU, and that one bad number is
+    # what sent playback into window mode in the first place.
+    pw, ph = _panel_pixels()
     vw, vh = _video_size(out)
-    # INTEGER downscale only. The largest scale that merely fits (e.g. 0.54)
-    # resamples a uniform N-px cell pattern onto a non-integer grid, which
-    # aliases exactly the high-frequency content the cells ARE. 1/n keeps
-    # every cell a whole number of pixels, so the downscale is lossless for
-    # block-constant images.
-    n = max(1, -(-max(vw / sw, vh / sh) // 1))          # ceil
-    n = int(n)
-    tw, th = vw // n, vh // n
-    play = out.with_name(out.stem + f"_play{sw}x{sh}.mp4")
+    play = out.with_name(out.stem + f"_fs{pw}x{ph}.mp4")
     if not play.exists() or play.stat().st_mtime < out.stat().st_mtime:
-        print(f"preparing playback copy at {tw}x{th} in a {sw}x{sh} window "
-              f"(one-time)…")
+        print(f"preparing native {pw}x{ph} playback copy (one-time)…")
+        vf = ""
+        if vw > pw or vh > ph:
+            n = int(max(1, -(-max(vw / pw, vh / ph) // 1)))
+            vf = f"scale={vw // n}:{vh // n}:flags=neighbor,"
         rc = run(f'ffmpeg -v error -y -i "{out}" '
-                 f'-vf "scale={tw}:{th}:flags=neighbor,'
-                 f'pad={sw}:{sh}:(ow-iw)/2:(oh-ih)/2:black" '
+                 f'-vf "{vf}pad={pw}:{ph}:(ow-iw)/2:(oh-ih)/2:black" '
                  f'-c:v libx264 -crf 8 -preset fast -tune stillimage '
                  f'-pix_fmt yuv420p "{play}"')
         if rc.returncode:
-            play = out          # fall back to the raw encode
+            play = out
+
     # PREFLIGHT. The failure this prevents: a take was filmed 43 seconds
     # before its own encode finished, against a stale playback copy, and
     # nothing in the tool said so. Verify every input is complete and newer
     # than its source, and refuse to roll if not.
     if not play.exists() or play.stat().st_size < 1_000_000:
         sys.exit(f"playback copy missing or truncated: {play}")
-    if play.stat().st_mtime < out.stat().st_mtime:
-        sys.exit("playback copy is OLDER than the encode - rerun to rebuild")
     pf = _video_frames(play)
     if pf < 10:
         sys.exit(f"playback copy unreadable ({pf} frames)")
-    print(f"playback  {play.name}  {pf} frames in a {sw}x{sh} window")
+    print(f"playback  {play.name}  {pf} frames, fullscreen {pw}x{ph}")
 
     cd_clip = out.parent / f"_countdown_{args.profile}_{args.countdown}.mp4"
     if not cd_clip.exists():
-        _make_countdown(cd_clip, play, args.countdown, (sw, sh))
+        _make_countdown(cd_clip, play, args.countdown, (pw, ph))
     if not cd_clip.exists() or _video_frames(cd_clip) < args.countdown * 30:
         sys.exit("countdown clip failed to build - refusing to roll without "
                  "the AE/AF lock target (it silently skipped once and cost a "
@@ -314,13 +352,25 @@ def cmd_send(args):
         if True:
             print(f"\ncountdown starts NOW — hit record on the phone when you "
                   f"see it on screen ({args.countdown}s).")
-            run(f'ffplay -alwaysontop -noborder -autoexit -left 0 -top 0 '
-                f'-x {sw} -y {sh} "{cd_clip}"')
+            import threading
+            chk = {}
+            def _probe():
+                time.sleep(2.5)
+                chk["r"] = _screen_decodes(args.profile)
+            t = threading.Thread(target=_probe, daemon=True); t.start()
+            run(f'ffplay -fs -alwaysontop -noborder -autoexit "{cd_clip}"')
+            t.join(timeout=5)
+            ok, why = chk.get("r", (None, "not run"))
+            if ok is False:
+                sys.exit(f"SCREEN SELF-CHECK FAILED ({why}). The display path "
+                         f"is destroying the code before any camera sees it; "
+                         f"filming would be wasted.")
+            print(f"screen self-check: {why}")
         print("playing… stops by itself, keep filming until the screen goes "
               "back to normal")
         t0 = time.time()
-        run(f'ffplay -alwaysontop -noborder -loop {args.loops} -autoexit '
-            f'-left 0 -top 0 -x {sw} -y {sh} "{play}"')
+        run(f'ffplay -fs -alwaysontop -noborder -loop {args.loops} '
+            f'-autoexit "{play}"')
         shown = time.time() - t0
     meta.write_text(json.dumps(dict(file=src.name, size=size,
                                     profile=args.profile, shown_seconds=round(shown, 2),
