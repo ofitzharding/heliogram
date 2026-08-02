@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from codec import grid
 import exp_turbo_frame as TB
 
-DENSITIES = ["200x111", "252x140", "302x168", "350x194", "400x222", "466x259"]
+DENSITIES = ["252x140", "350x194", "466x259"]
 
 
 def classify(gray):
@@ -79,7 +79,8 @@ def main():
 
     cap = cv2.VideoCapture(args.capture)
     total = min(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), args.max_frames)
-    fields, stripe, code = [], {}, {s: [] for s in DENSITIES}
+    fields, stripe = [], {}
+    code = {}          # (density, hold) -> rows
     straddle_reads = []
 
     n = 0
@@ -117,11 +118,18 @@ def main():
                                       0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
                 x = (y > th).astype(np.uint8)
                 nc = sub.try_certify(x[sub.cells[:, 0], sub.cells[:, 1]])[2]
-                pxc = None
                 c = np.array([[0, 0], [L.gw, 0]], np.float32).reshape(-1, 1, 2)
                 p = cv2.perspectiveTransform(c, H).reshape(-1, 2)
                 pxc = np.linalg.norm(p[1] - p[0]) / L.gw
-                code[spec].append((nc, n_sub, pxc))
+                # the frame states its own hold, so a dropped or duplicated
+                # camera frame cannot misattribute it to another condition
+                hold = int(hd.get("zone_w", 0)) or 1
+                # straddle measured on THIS frame, independently of decoding
+                pv = y[~(L.is_finder | L.is_sep | L.is_ring | L.is_header)]
+                lo, hi = np.percentile(pv, 3), np.percentile(pv, 97)
+                mid = float(((pv > lo + 0.30*(hi-lo)) &
+                             (pv < lo + 0.70*(hi-lo))).mean())
+                code.setdefault((spec, hold), []).append((nc, n_sub, pxc, mid))
                 break
     cap.release()
 
@@ -144,17 +152,27 @@ def main():
         sr = np.array(straddle_reads)
         print(f"\nSTRADDLE     mid-band fraction on 2-level fields: "
               f"median {100*np.median(sr):.1f}%  (0% = no straddle)")
-    print("\nDENSITY SWEEP")
-    print(f"   {'grid':>9s} {'px/cell':>8s} {'frames':>7s} {'codewords':>18s} {'yield':>7s}")
+    print("\nTWO-AXIS DECOUPLING   (optics identical across every row)")
+    print(f"   {'grid':>9s} {'px/cell':>8s} {'hold':>5s} {'frames':>7s} "
+          f"{'straddle':>9s} {'yield':>7s} {'KB/s':>8s}")
+    SUB = 255 - 48 - 4
     for spec in DENSITIES:
-        rows = code[spec]
-        if not rows:
-            print(f"   {spec:>9s} {'-':>8s} {0:7d} {'no frames decoded':>18s}")
-            continue
-        nc = np.array([r[0] for r in rows]); ns = rows[0][1]
-        pxc = np.mean([r[2] for r in rows])
-        print(f"   {spec:>9s} {pxc:8.1f} {len(rows):7d} "
-              f"{nc.mean():8.1f}/{ns:<9d} {100*nc.mean()/ns:6.1f}%")
+        for hold in (1, 2, 4):
+            rows = code.get((spec, hold))
+            if not rows:
+                print(f"   {spec:>9s} {'-':>8s} {hold:5d} {0:7d} "
+                      f"{'-':>9s} {'none decoded':>16s}")
+                continue
+            nc = np.array([r[0] for r in rows]); ns = rows[0][1]
+            pxc = np.mean([r[2] for r in rows]); mid = np.mean([r[3] for r in rows])
+            y_ = nc.mean() / ns
+            kbs = ns * SUB * (60.0 / hold) / 1000.0 * y_
+            print(f"   {spec:>9s} {pxc:8.1f} {hold:5d} {len(rows):7d} "
+                  f"{100*mid:8.1f}% {100*y_:6.1f}% {kbs:7.1f}K")
+    print("\n   The gap between hold=1 and hold=4 at fixed density IS the")
+    print("   exposure-sync contribution: optics are pinned across the whole")
+    print("   take, so nothing else can explain a difference between rows.")
+    print("   decimen reference: 128 KB/s handheld, 186 propped.")
 
 
 if __name__ == "__main__":

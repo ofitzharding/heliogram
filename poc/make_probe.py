@@ -70,6 +70,31 @@ def stripes(pitch, vertical=True):
     return c
 
 
+
+def tag_margin(c, density_idx, hold_n):
+    """Stamp the frame's CONDITION into the letterbox margin as plain blocks.
+
+    The analyser otherwise learns a frame's density and hold from its header
+    - and on the last real take 0 of 30 headers decoded. Since the dense
+    blocks failing to decode is precisely the hypothesis under test, a probe
+    that can only be interpreted when decoding succeeds is worthless exactly
+    when it matters. These blocks survive total decode failure: they are
+    large, high-contrast, and outside the code area, so they need nothing but
+    a threshold.
+
+    left group  = density index (1..3), right group = hold (1, 2 or 4).
+    """
+    h = 56
+    y0 = PH - 2 * h
+    def blocks(x0, n):
+        for i in range(n):
+            x = x0 + i * (h + 22)
+            c[y0:y0 + h, x:x + h] = 255
+    blocks(90, density_idx)
+    blocks(PW // 2 + 90, hold_n)
+    return c
+
+
 def main():
     out = Path(__file__).parent.parent / "demo" / "_tx_probe.mp4"
     data = (Path(__file__).parent.parent / "demo" / "payload_big.png").read_bytes()
@@ -123,14 +148,15 @@ def main():
     # and not the later ones. The analyser can therefore drop first-after-
     # transition frames and still have clean samples. On an LCD panel that
     # distinction is essential; on OLED it would be moot.
-    for spec, cell_px in (("252x140", 12), ("350x194", 8), ("466x259", 6)):
+    for d_idx, (spec, cell_px) in enumerate(
+            (("252x140", 12), ("350x194", 8), ("466x259", 6)), start=1):
         gw, gh = (int(v) for v in spec.split("x"))
         L = grid.Layout(gw, gh)
         n_sub = grid.sub_count(L, grid.MODE_MONO)
         enc = fountain.Encoder(data, SUB)
-        for hold_n in (1, 4):
+        for hold_n in (1, 2, 4):
             start = sum(x[2] for x in log)
-            NSEQ = 40 if hold_n == 1 else 12
+            NSEQ = {1: 36, 2: 20, 4: 12}[hold_n]
             for seq in range(NSEQ):
                 parts = []
                 for j in range(n_sub):
@@ -139,10 +165,10 @@ def main():
                     parts.append(struct.pack("<I", zlib.crc32(b) & 0xFFFFFFFF) + b)
                 hdr = grid.pack_header(seq, enc.k,
                                        L.payload_capacity_bytes(grid.MODE_MONO) - 4,
-                                       len(data), grid.MODE_MONO, 0, 0)
+                                       len(data), grid.MODE_MONO, hold_n, 0)
                 img = grid.render_frame(L, hdr, b"".join(parts), grid.MODE_MONO,
                                         cell_px=cell_px)
-                hold(canvas(img), hold_n)
+                hold(tag_margin(canvas(img), d_idx, hold_n), hold_n)
             log.append((f"code-{spec}-hold{hold_n}", start, NSEQ * hold_n))
             print(f"  {spec:9s} hold={hold_n}  {n_sub:2d} codewords/frame, "
                   f"{NSEQ} distinct frames")
