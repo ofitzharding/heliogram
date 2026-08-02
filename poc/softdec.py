@@ -157,7 +157,7 @@ class FrameDecoder:
             return None
         return payload
 
-    def decode_whole(self, y, header, allow_refit=True):
+    def decode_whole(self, y, header, allow_refit=True, resample=None):
         """One fountain block per frame. Returns block bytes or None.
 
         A whole-block transmit has a single CRC over the frame, so a frame
@@ -185,6 +185,24 @@ class FrameDecoder:
             p1 = self._whole_from_bits(x1[pc[:, 0], pc[:, 1]], bc, bs)
             if p1 is not None:
                 payload, x_used = p1, x1
+
+        # Same code-validated geometry search as the per-codeword path, at
+        # whole-frame granularity because that is the granularity the CRC
+        # covers here. A frame that certifies at ANY offset is correct.
+        if payload is None and resample is not None:
+            for (dx, dy) in self.geom_offsets:
+                y2 = resample(dx, dy)
+                l2 = y2[pc[:, 0], pc[:, 1]]
+                b2, c2 = grid._mono_decide(l2, self.L, pc)
+                bc2 = (c2[: nb * 8].reshape(nb, 8).min(axis=1)
+                       if self.erase else None)
+                p2 = self._whole_from_bits(b2, bc2, bs)
+                if p2 is not None:
+                    payload = p2
+                    x_used = np.zeros(y.shape, np.float32)
+                    x_used[pc[:, 0], pc[:, 1]] = b2
+                    y = y2
+                    break
 
         self.pending_whole = (y, header, payload) if payload is not None else None
         if payload is not None and allow_refit:

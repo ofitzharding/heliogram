@@ -229,11 +229,25 @@ def _worker(rng):
                 return grid.sample_cells(img, layout, H, allc).mean(
                     axis=1).reshape(layout.gh, layout.gw).astype(np.float32)
 
-            blk = _FD[0].decode_whole(_yw(_K1[0]), header)
+            def _rw(dx, dy, _H=H, _img=img, _L=layout, _a=allc):
+                ctr = np.stack([_a[:, 1] + 0.5 + dx, _a[:, 0] + 0.5 + dy],
+                               axis=1).astype(np.float32)
+                pts = cv2.perspectiveTransform(ctr[None], _H)[0]
+                pts = grid._apply_radial(pts, _img.shape)
+                hh, ww = _img.shape[:2]
+                xs = np.clip(pts[:, 0].round().astype(np.int32), 1, ww - 2)
+                yy = np.clip(pts[:, 1].round().astype(np.int32), 1, hh - 2)
+                g = cv2.cvtColor(_img, cv2.COLOR_BGR2GRAY)
+                return cv2.boxFilter(g, cv2.CV_32F, (3, 3))[yy, xs].reshape(
+                    _L.gh, _L.gw).astype(np.float32)
+
+            gs = _rw if _CFG.get("geom_search") else None
+            blk = _FD[0].decode_whole(_yw(_K1[0]), header, resample=gs)
             if blk is None and _CFG.get("track_k1"):
                 step = _CFG.get("k1_step", 0.0025)
                 for d in (step, -step, 2 * step, -2 * step):
-                    blk = _FD[0].decode_whole(_yw(_K1[0] + d), header)
+                    blk = _FD[0].decode_whole(_yw(_K1[0] + d), header,
+                                              resample=gs)
                     if blk is not None:
                         _K1[0] = round(_K1[0] + d, 5)
                         break
