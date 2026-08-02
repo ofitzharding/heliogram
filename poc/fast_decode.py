@@ -77,7 +77,7 @@ def _worker(rng):
         # which is a stricter test than any tracking residual: 68 bytes behind
         # RS(68,28) and a CRC16 do not pass by accident on a stale geometry.
         header = samples = None
-        if _H_PREV[0] is not None:
+        if _CFG.get("reuse_h") and _H_PREV[0] is not None:
             header, samples, _st = grid.sample_frame(img, layout, _H_PREV[0])
             if header is not None:
                 H = _H_PREV[0]
@@ -316,6 +316,11 @@ def main():
     ap.add_argument("--no-track-k1", action="store_true",
                     help="hold one radial coefficient for the whole clip")
     ap.add_argument("--k1-step", type=float, default=0.0025)
+    ap.add_argument("--reuse-homography", action="store_true",
+                    help="skip locate() when the previous frame's "
+                         "homography still reads the header. MEASURED NET LOSS on IMG_7872: 10%% fewer blocks for 5%% less wall time, "
+                         "because the header tolerates far more geometric drift than the payload does. Off until the gate keys on "
+                         "codeword yield instead.")
     ap.add_argument("--no-geom-search", action="store_true",
                     help="do not retry failed codewords at other sub-cell sampling offsets")
     ap.add_argument("--local-th", type=int, default=grid.LOCAL_TH,
@@ -459,7 +464,8 @@ def main():
                proto_full=proto_full, max_seq=max_seq,
                soft=args.soft, sweeps=args.sweeps, local_th=args.local_th,
                track_k1=not args.no_track_k1, k1_step=args.k1_step,
-               geom_search=not args.no_geom_search)
+               geom_search=not args.no_geom_search,
+               reuse_h=args.reuse_homography)
     # The rolling donor is stateful ACROSS CONSECUTIVE FRAMES: kernels transfer
     # for about a second before geometry drifts (Findings §13), so a worker
     # whose range is a short contiguous run spends most of it re-bootstrapping.
