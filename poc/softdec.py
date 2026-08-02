@@ -69,6 +69,10 @@ class FrameDecoder:
         self.tap = self.bias = None
         self.donors = 0
         self.pending = None
+        self.pending_whole = None
+        # vertical only: the measured horizontal drift is 0.0001 cells/band
+        self.geom_offsets = [(0.0, d) for d in
+                             (0.20, -0.20, 0.35, -0.35, 0.10, -0.10)]
         self._blank = np.zeros(layout.payload_capacity_bytes(grid.MODE_MONO),
                                np.uint8).tobytes()
 
@@ -82,12 +86,12 @@ class FrameDecoder:
         return (cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) > 127).astype(np.float32)
 
     # ---- certify every codeword in one set of hard decisions
-    def certify(self, bits, byteconf=None):
+    def certify(self, bits, byteconf=None, only=None):
         by = np.packbits(bits[: self.n_sub * 255 * 8].astype(np.uint8))
         blocks = []
         cmask = np.zeros(len(self.cells), bool)
         cbits = np.zeros(len(self.cells), np.float32)
-        for j in range(self.n_sub):
+        for j in (range(self.n_sub) if only is None else only):
             lo, hi = j * 255, (j + 1) * 255
             chunk = bytes(by[lo:hi])
             dec = None
@@ -115,6 +119,95 @@ class FrameDecoder:
             cbits[lo * 8:hi * 8] = np.unpackbits(np.frombuffer(coded, np.uint8))
         return blocks, cmask, cbits
 
+    # ---- whole-block transmits (one fountain block per frame, one CRC)
+    def _whole_from_bits(self, bits, byteconf, bs):
+        """RS+CRC a whole-frame block. Returns the payload bytes or None."""
+        coded_len = grid.rs_encoded_len(bs + 4)
+        raw = grid._bytes(np.asarray(bits).astype(np.uint8))[:coded_len]
+        if len(raw) < coded_len:
+            return None
+        out = bytearray()
+        pos = 0
+        while pos < coded_len:
+            n = min(255, coded_len - pos)
+            chunk = raw[pos:pos + n]
+            dec = None
+            try:
+                dec = bytes(self.rs.decode(chunk)[0])
+            except ReedSolomonError:
+                if self.erase and byteconf is not None:
+                    order = np.argsort(byteconf[pos:pos + n])
+                    for n_er in range(4, int(self.ecc * 0.7) + 1, 6):
+                        try:
+                            dec = bytes(self.rs.decode(
+                                chunk,
+                                erase_pos=[int(i) for i in order[:n_er]])[0])
+                            break
+                        except ReedSolomonError:
+                            continue
+            if dec is None:
+                return None
+            out += dec
+            pos += n
+        payload = bytes(out)
+        if len(payload) < 4 + bs:
+            return None
+        blk = payload[4:4 + bs]
+        if zlib.crc32(blk) & 0xFFFFFFFF != struct.unpack("<I", payload[:4])[0]:
+            return None
+        return payload
+
+    def decode_whole(self, y, header, allow_refit=True):
+        """One fountain block per frame. Returns block bytes or None.
+
+        A whole-block transmit has a single CRC over the frame, so a frame
+        either certifies ENTIRELY or not at all. That is worse for harvesting -
+        there is no partial credit - but strictly better for teaching: a frame
+        that passes hands the equalizer its complete transmitted bit pattern,
+        every payload cell of it, instead of the fraction that per-codeword
+        certification recovers. The donor this produces is exact.
+        """
+        pc = self.L.payload_cells
+        lum = y[pc[:, 0], pc[:, 1]]
+        bits1d, conf1d = grid._mono_decide(lum, self.L, pc)
+        bs = int(header["block_size"])
+        nb = grid.rs_encoded_len(bs + 4)
+        bc = conf1d[: nb * 8].reshape(nb, 8).min(axis=1) if self.erase else None
+
+        payload = self._whole_from_bits(bits1d, bc, bs)
+        x_used = np.zeros(y.shape, np.float32)
+        x_used[pc[:, 0], pc[:, 1]] = bits1d
+
+        if payload is None and self.prml and self.tap is not None:
+            xt = self.struct_truth(header)
+            x1 = T.prml_tiles(y, self.tap, self.bias, self.known, xt, x_used,
+                              sweeps=self.sweeps)
+            p1 = self._whole_from_bits(x1[pc[:, 0], pc[:, 1]], bc, bs)
+            if p1 is not None:
+                payload, x_used = p1, x1
+
+        self.pending_whole = (y, header, payload) if payload is not None else None
+        if payload is not None and allow_refit:
+            self.commit_whole()
+        return None if payload is None else payload[4:4 + bs]
+
+    def commit_whole(self):
+        if not self.prml or getattr(self, "pending_whole", None) is None:
+            return False
+        y, header, payload = self.pending_whole
+        coded = bytes(self.rs.encode(payload))
+        tb = np.unpackbits(np.frombuffer(coded, np.uint8)).astype(np.float32)
+        pc = self.L.payload_cells[: len(tb)]
+        xt = self.struct_truth(header)
+        lab = np.zeros(y.shape, np.float32)
+        lab[pc[:, 0], pc[:, 1]] = tb[: len(pc)]
+        lab[self.known] = xt[self.known]
+        sel = self.known.copy()
+        sel[pc[:, 0], pc[:, 1]] = True
+        self.tap, self.bias = TB.fit_tiles_sel(y, lab, sel, *self.tiles)
+        self.donors += 1
+        return True
+
     def quick_count(self, y):
         """How many codewords certify from hard decisions alone.
 
@@ -129,7 +222,7 @@ class FrameDecoder:
         return len(self.certify(bits1d, bc)[0])
 
     # ---- the whole per-frame path
-    def decode(self, y, header, allow_refit=True):
+    def decode(self, y, header, allow_refit=True, resample=None):
         """y: (gh, gw) raw cell luminance. Returns [(sub_index, block_bytes)].
 
         allow_refit=False evaluates the frame WITHOUT letting it become the
@@ -159,6 +252,46 @@ class FrameDecoder:
                 best = (len(blocks1), blocks1, cm1, cb1, x1)
 
         n, blocks, cmask, cbits, x = best
+
+        # ---- CODE-VALIDATED PER-CODEWORD GEOMETRY SEARCH
+        #
+        # One homography plus one radial coefficient is a single camera pose
+        # and a single lens model for the whole frame. Neither holds: measured
+        # on IMG_7870, giving each row band its own sub-cell VERTICAL offset
+        # (dx drift is nil, 0.0001 cells/band) lifts codewords-inside-budget
+        # from 45.3% to 57.0%, and letting the radial CENTRE move lifts it from
+        # 32.5% to 45.0% with the optimum landing outside the code entirely.
+        # There is a row-dependent residual of up to +-0.3 cells that no
+        # frame-global geometry can express.
+        #
+        # A codeword is a contiguous band of cells, so its geometry error is
+        # essentially one number - and RS+CRC32 is a free, exact accept test
+        # for it. So the receiver can SEARCH geometry per codeword and keep any
+        # hit: a codeword that certifies is correct by construction, whatever
+        # offset produced it, so no candidate can do harm and no ground truth
+        # is needed. The same structural argument that makes certified labels
+        # safe for the equalizer makes them safe here, applied to geometry.
+        if resample is not None and n < self.n_sub:
+            got = {j for j, _b in blocks}
+            for (dx, dy) in self.geom_offsets:
+                miss = [j for j in range(self.n_sub) if j not in got]
+                if not miss:
+                    break
+                y2 = resample(dx, dy)
+                lum2 = y2[pc[:, 0], pc[:, 1]]
+                b2, c2 = grid._mono_decide(lum2, self.L, pc)
+                bc2 = (c2[: nb * 8].reshape(nb, 8).min(axis=1)
+                       if self.erase else None)
+                blk2, cm2, cb2 = self.certify(b2, bc2, only=miss)
+                for j, blk in blk2:
+                    got.add(j)
+                    blocks.append((j, blk))
+                if blk2:
+                    sl = cm2
+                    cmask = cmask | sl
+                    cbits = np.where(sl, cb2, cbits)
+            n = len(blocks)
+
         self.pending = (y, header, n, cmask, cbits, x)
         if allow_refit:
             self.commit()

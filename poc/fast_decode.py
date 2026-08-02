@@ -164,7 +164,21 @@ def _worker(rng):
                             y = yc
                             break
                     grid.set_radial(_K1[0])
-                for j, blk in _FD[0].decode(y, header):
+
+                def _resample(dx, dy, _H=H, _img=img, _L=layout, _a=allc):
+                    ctr = np.stack([_a[:, 1] + 0.5 + dx, _a[:, 0] + 0.5 + dy],
+                                   axis=1).astype(np.float32)
+                    pts = cv2.perspectiveTransform(ctr[None], _H)[0]
+                    pts = grid._apply_radial(pts, _img.shape)
+                    hh, ww = _img.shape[:2]
+                    xs = np.clip(pts[:, 0].round().astype(np.int32), 1, ww - 2)
+                    ys_ = np.clip(pts[:, 1].round().astype(np.int32), 1, hh - 2)
+                    g = cv2.cvtColor(_img, cv2.COLOR_BGR2GRAY)
+                    return cv2.boxFilter(g, cv2.CV_32F, (3, 3))[ys_, xs].reshape(
+                        _L.gh, _L.gw).astype(np.float32)
+
+                rs_ = _resample if _CFG.get("geom_search") else None
+                for j, blk in _FD[0].decode(y, header, resample=rs_):
                     out.append((n, header["seq"] * n_sub + j, blk,
                                 dict(proto, block_size=sub_size)))
                 continue
@@ -194,6 +208,38 @@ def _worker(rng):
                     continue
                 out.append((n, header["seq"] * n_sub + j, blk,
                             dict(proto, block_size=sub_size)))
+            continue
+        if _CFG.get("soft") and header["mode"] == grid.MODE_MONO:
+            # WHOLE-BLOCK certified-label path. One CRC per frame, so a frame
+            # certifies entirely or not at all - no partial credit to harvest,
+            # but an exact donor when it passes: the equalizer gets every
+            # payload cell's transmitted value, not a certified fraction.
+            if _FD[0] is None:
+                import softdec
+                _FD[0] = softdec.FrameDecoder(
+                    layout, _CFG["ecc"], 1, sweeps=_CFG.get("sweeps", 3),
+                    refit=1, erase=True, prml=True)
+            allc = _ALLC[0]
+            if allc is None:
+                allc = _ALLC[0] = np.argwhere(
+                    np.ones((layout.gh, layout.gw), bool))
+
+            def _yw(k1):
+                grid.set_radial(k1)
+                return grid.sample_cells(img, layout, H, allc).mean(
+                    axis=1).reshape(layout.gh, layout.gw).astype(np.float32)
+
+            blk = _FD[0].decode_whole(_yw(_K1[0]), header)
+            if blk is None and _CFG.get("track_k1"):
+                step = _CFG.get("k1_step", 0.0025)
+                for d in (step, -step, 2 * step, -2 * step):
+                    blk = _FD[0].decode_whole(_yw(_K1[0] + d), header)
+                    if blk is not None:
+                        _K1[0] = round(_K1[0] + d, 5)
+                        break
+                grid.set_radial(_K1[0])
+            if blk is not None:
+                out.append((n, header["seq"], blk, proto))
             continue
         payload = grid.decide_payload(header, samples, layout)
         if payload is None:
@@ -232,6 +278,8 @@ def main():
     ap.add_argument("--no-track-k1", action="store_true",
                     help="hold one radial coefficient for the whole clip")
     ap.add_argument("--k1-step", type=float, default=0.0025)
+    ap.add_argument("--no-geom-search", action="store_true",
+                    help="do not retry failed codewords at other sub-cell sampling offsets")
     ap.add_argument("--local-th", type=int, default=grid.LOCAL_TH,
                     help="local decision-threshold window in cells (0 = the "
                          "old single global Otsu)")
@@ -372,7 +420,8 @@ def main():
                centered=not args.header_top, subblock=args.subblock,
                proto_full=proto_full, max_seq=max_seq,
                soft=args.soft, sweeps=args.sweeps, local_th=args.local_th,
-               track_k1=not args.no_track_k1, k1_step=args.k1_step)
+               track_k1=not args.no_track_k1, k1_step=args.k1_step,
+               geom_search=not args.no_geom_search)
     # The rolling donor is stateful ACROSS CONSECUTIVE FRAMES: kernels transfer
     # for about a second before geometry drifts (Findings §13), so a worker
     # whose range is a short contiguous run spends most of it re-bootstrapping.
