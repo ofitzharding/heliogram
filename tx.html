@@ -1,0 +1,75 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>optical tx</title><style>
+html,body{margin:0;background:#000;overflow:hidden;cursor:none}
+canvas{display:block;width:100vw;height:100vh}
+#hud{position:fixed;left:10px;top:8px;color:#0f0;font:14px monospace;z-index:9}
+</style></head><body>
+<div id="hud"></div>
+<video id="v" muted playsinline style="display:none"></video>
+<canvas id="c"></canvas>
+<script>
+// Browser canvas transmitter. Measured sharper than every alternative on this
+// machine, by screenshotting the panel and decoding the screenshot:
+//     1512-point ffplay window   981/1000 mid-band px, header FAIL
+//     ffplay fullscreen native    19/1000
+//     this canvas                  0/1000, header OK
+// The canvas backing store is sized in DEVICE pixels, so drawImage lands 1:1
+// on the panel with no compositor resampling. This is also how decimen does
+// it, which is a large part of why their numbers hold up.
+const q = new URLSearchParams(location.search);
+const SRC   = q.get('src')   || 'demo/tx.mp4';
+const LOOPS = +(q.get('loops') || 4);
+const CD    = +(q.get('cd')    || 12);
+
+const v = document.getElementById('v'), c = document.getElementById('c');
+const ctx = c.getContext('2d', {alpha:false});
+const hud = document.getElementById('hud');
+v.src = SRC;
+
+function size(){
+  c.width  = Math.round(innerWidth  * devicePixelRatio);
+  c.height = Math.round(innerHeight * devicePixelRatio);
+  ctx.imageSmoothingEnabled = false;
+}
+size(); addEventListener('resize', size);
+
+let phase = 'cd', t0 = performance.now(), loops = 0, n = 0, fpsT = performance.now();
+function blit(){
+  const s = Math.min(c.width / v.videoWidth, c.height / v.videoHeight);
+  const w = Math.round(v.videoWidth * s), h = Math.round(v.videoHeight * s);
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, c.width, c.height);
+  ctx.drawImage(v, (c.width - w) >> 1, (c.height - h) >> 1, w, h);
+  return h;
+}
+function frame(){
+  if (v.readyState >= 2){
+    const h = blit();
+    if (phase === 'cd'){
+      // countdown drawn over REAL code content so an AE/AF lock taken here
+      // carries over to the payload unchanged
+      const left = CD - (performance.now() - t0) / 1000;
+      if (left <= 0){ phase = 'tx'; v.currentTime = 0; v.play(); }
+      else {
+        const y = (c.height + h) / 2 + 46 * devicePixelRatio;
+        ctx.font = `${Math.round(34*devicePixelRatio)}px -apple-system,monospace`;
+        ctx.fillStyle = '#fff'; ctx.textAlign = 'center';
+        ctx.fillText(`HIT RECORD  +  LOCK AE/AF     ${Math.ceil(left)}`,
+                     c.width/2, Math.min(y, c.height - 20*devicePixelRatio));
+      }
+    }
+    n++;
+  }
+  const el = (performance.now() - fpsT)/1000;
+  if (el > 1){ hud.textContent = `${c.width}x${c.height} dpr${devicePixelRatio} ${(n/el).toFixed(1)}fps loop ${loops+1}/${LOOPS}`; n=0; fpsT=performance.now(); }
+  requestAnimationFrame(frame);
+}
+v.addEventListener('ended', () => {
+  if (++loops < LOOPS){ v.currentTime = 0; v.play(); }
+  else { phase='done'; ctx.fillStyle='#000'; ctx.fillRect(0,0,c.width,c.height);
+         ctx.fillStyle='#fff'; ctx.textAlign='center';
+         ctx.font = `${Math.round(40*devicePixelRatio)}px -apple-system,monospace`;
+         ctx.fillText('DONE - stop recording', c.width/2, c.height/2); }
+});
+v.addEventListener('loadeddata', () => { v.pause(); v.currentTime = 0;
+  t0 = performance.now(); requestAnimationFrame(frame); });
+</script></body></html>
