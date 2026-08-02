@@ -100,29 +100,61 @@ def main():
 
     calib("calib-start")
 
-    for spec, cell_px in (("200x111", 15), ("252x140", 12), ("302x168", 10),
-                          ("350x194", 8), ("400x222", 7), ("466x259", 6)):
+    # TWO-AXIS DECOUPLING.
+    #
+    # v1 of this probe varied density while holding the temporal regime at
+    # 60fps, which measures the LUMPED ceiling - precisely the conflation the
+    # experiment is supposed to expose. Optics are pinned by construction
+    # here (one take, one lens, one focus, one distance), so the only way to
+    # separate the axes is to vary the TEMPORAL regime at each density.
+    #
+    #   hold=1  : a new frame every camera frame. Exposure straddles refresh
+    #             boundaries; this is the regime every take so far used.
+    #   hold=4  : each frame held ~4 camera frames. Captures land wholly
+    #             inside one displayed frame - the FROZEN-FRAME ceiling.
+    #
+    # Frozen-frame BER at a given density is the optical limit at that
+    # density. The gap between the two holds, with optics identical, is the
+    # exposure-sync contribution. Neither number alone can show it.
+    #
+    # hold=4 also separates LCD pixel response from exposure straddle, which
+    # a single-hold experiment cannot: response-time ghosting decays within a
+    # few refreshes, so it contaminates the FIRST capture after a transition
+    # and not the later ones. The analyser can therefore drop first-after-
+    # transition frames and still have clean samples. On an LCD panel that
+    # distinction is essential; on OLED it would be moot.
+    for spec, cell_px in (("252x140", 12), ("350x194", 8), ("466x259", 6)):
         gw, gh = (int(v) for v in spec.split("x"))
         L = grid.Layout(gw, gh)
         n_sub = grid.sub_count(L, grid.MODE_MONO)
         enc = fountain.Encoder(data, SUB)
-        start = sum(x[2] for x in log)
-        NF = 60
-        for seq in range(NF):
-            parts = []
-            for j in range(n_sub):
-                b = enc.block(seq * n_sub + j)
-                b = b + b"\x00" * (SUB - len(b))
-                parts.append(struct.pack("<I", zlib.crc32(b) & 0xFFFFFFFF) + b)
-            hdr = grid.pack_header(seq, enc.k,
-                                   L.payload_capacity_bytes(grid.MODE_MONO) - 4,
-                                   len(data), grid.MODE_MONO, 0, 0)
-            img = grid.render_frame(L, hdr, b"".join(parts), grid.MODE_MONO,
-                                    cell_px=cell_px)
-            vw.write(canvas(img))
-        log.append((f"code-{spec}", start, NF))
-        print(f"  {spec:9s} cell_px={cell_px:2d}  {n_sub:2d} codewords/frame, "
-              f"{n_sub*SUB:5d} B/frame")
+        for hold_n in (1, 4):
+            start = sum(x[2] for x in log)
+            NSEQ = 40 if hold_n == 1 else 12
+            for seq in range(NSEQ):
+                parts = []
+                for j in range(n_sub):
+                    b = enc.block(seq * n_sub + j)
+                    b = b + b"\x00" * (SUB - len(b))
+                    parts.append(struct.pack("<I", zlib.crc32(b) & 0xFFFFFFFF) + b)
+                hdr = grid.pack_header(seq, enc.k,
+                                       L.payload_capacity_bytes(grid.MODE_MONO) - 4,
+                                       len(data), grid.MODE_MONO, 0, 0)
+                img = grid.render_frame(L, hdr, b"".join(parts), grid.MODE_MONO,
+                                        cell_px=cell_px)
+                hold(canvas(img), hold_n)
+            log.append((f"code-{spec}-hold{hold_n}", start, NSEQ * hold_n))
+            print(f"  {spec:9s} hold={hold_n}  {n_sub:2d} codewords/frame, "
+                  f"{NSEQ} distinct frames")
+
+    # ROLLING-SHUTTER PROBE: full-field flips every refresh. A rolling shutter
+    # reads rows at different times, so a single capture shows a row-dependent
+    # mixture. Row-dependence is the signature; its absence would mean the
+    # straddle is global (exposure) rather than per-row (readout).
+    start = sum(x[2] for x in log)
+    for i in range(40):
+        hold(canvas(fill=255 if i % 2 == 0 else 0), 1)
+    log.append(("rolling-shutter", start, 40))
 
     calib("calib-end")
     vw.release()
