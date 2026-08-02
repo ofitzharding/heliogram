@@ -255,6 +255,74 @@ def pack_header(seq: int, k: int, block_size: int, file_size: int, mode: int,
     return _hdr_xor(bytes(RSCodec(HEADER_ECC).encode(body)), seq % HDR_PHASES)
 
 
+LOCAL_TH = 15    # cells. Window for the local decision threshold; 0 = the v1
+                 # global-Otsu behaviour.
+                 #
+                 # Measured on IMG_7870 (record take, 252x140, 734 frames whose
+                 # header decoded): ONE global Otsu over all 35,280 cells
+                 # certified 19.8% of codewords. A box mean over a 15x15 cell
+                 # neighbourhood certified 42.4% — 2.1x, on identical samples,
+                 # for one box filter.
+                 #
+                 # Why it works: the payload is RS+fountain output, so it is
+                 # pseudorandom, so over a few hundred cells its mean converges
+                 # on the midpoint between the black and white levels AT THAT
+                 # POINT ON THE SCREEN. That makes a local mean a direct
+                 # estimate of the local decision threshold, and it tracks
+                 # vignetting, backlight non-uniformity, glare and off-axis
+                 # roll-off. A global threshold has to be wrong somewhere on any
+                 # screen that is not uniformly lit, and no screen filmed by a
+                 # hand-held camera is.
+                 #
+                 # The window is a compromise: too small and the mean starts
+                 # tracking the DATA rather than the illumination (local9 scored
+                 # 39.0%), too large and it stops tracking the gradient
+                 # (local61 scored 22.8%).
+
+
+def set_local_threshold(k: int) -> None:
+    global LOCAL_TH
+    LOCAL_TH = int(k)
+
+
+def local_levels(values: np.ndarray, layout: 'Layout', cells: np.ndarray,
+                 k: int):
+    """Local (threshold, spread) per cell, estimated in CELL space.
+
+    `cells` may cover only part of the grid (payload cells skip finders, ring,
+    separators and the header), so the box filter is normalised by an
+    occupancy count rather than by window area — otherwise every cell near a
+    hole is biased toward zero.
+    """
+    g = np.zeros((layout.gh, layout.gw), np.float32)
+    m = np.zeros((layout.gh, layout.gw), np.float32)
+    g2 = np.zeros((layout.gh, layout.gw), np.float32)
+    v = values.astype(np.float32)
+    g[cells[:, 0], cells[:, 1]] = v
+    g2[cells[:, 0], cells[:, 1]] = v * v
+    m[cells[:, 0], cells[:, 1]] = 1.0
+    kk = (k, k)
+    br = cv2.BORDER_REFLECT
+    num = cv2.boxFilter(g, -1, kk, normalize=False, borderType=br)
+    num2 = cv2.boxFilter(g2, -1, kk, normalize=False, borderType=br)
+    den = np.maximum(cv2.boxFilter(m, -1, kk, normalize=False, borderType=br), 1.0)
+    mean = num / den
+    var = np.maximum(num2 / den - mean * mean, 1e-6)
+    return (mean[cells[:, 0], cells[:, 1]],
+            np.sqrt(var)[cells[:, 0], cells[:, 1]])
+
+
+def _mono_decide(lum: np.ndarray, layout: 'Layout', cells: np.ndarray):
+    """Hard bits + per-cell confidence for a two-level alphabet."""
+    if LOCAL_TH and layout is not None and cells is not None:
+        th, sd = local_levels(lum, layout, cells[: len(lum)], LOCAL_TH)
+        return (lum > th).astype(np.uint8), np.abs(lum - th) / np.maximum(sd, 1e-3)
+    t, _ = cv2.threshold(np.clip(lum, 0, 255).astype(np.uint8), 0, 255,
+                         cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    spread = max(1e-3, np.percentile(lum, 90) - np.percentile(lum, 10))
+    return (lum > t).astype(np.uint8), np.abs(lum - t) / spread
+
+
 HEADER_CENTERED = True   # v3 layout. Older captures have it at the top edge.
 
 
@@ -912,8 +980,27 @@ def sample_frame(img: np.ndarray, layout: Layout, H: np.ndarray | None = None):
 
     n_hdr_bits = (HEADER_LEN + HEADER_ECC) * 8
     header = None
-    for t in (hdr_th, th):
-        header = unpack_header(_bytes((hdr_lum[:n_hdr_bits] > t).astype(np.uint8)))
+    # Local thresholds FIRST, then the two global ones. The header strip spans
+    # the full width of the grid, which is the worst possible shape for a
+    # global threshold — it eats the entire left-to-right illumination
+    # gradient. Measured over 400 located frames of the record take: global
+    # over everything 36.5%, global over the strip 41.8%, local-31 50.0%,
+    # union of all rules 51.5%, with ZERO disagreement on the recovered `seq`
+    # between any two rules that both parsed. Header yield multiplies codeword
+    # yield, so this factor was costing more than the payload demodulator.
+    cand = []
+    if LOCAL_TH:
+        allc = np.concatenate([layout.header_cells, layout.payload_cells])
+        alllum = np.concatenate([hdr_lum, pay_lum])
+        nh = len(hdr_lum)
+        for k in (31, 15):
+            lt, _sd = local_levels(alllum, layout, allc, k)
+            cand.append(lt[:nh])
+    cand += [hdr_th, th]
+    for t in cand:
+        header = unpack_header(_bytes((hdr_lum[:n_hdr_bits] >
+                                       (t[:n_hdr_bits] if np.ndim(t) else t)
+                                       ).astype(np.uint8)))
         if header is not None:
             break
     stats["header_ok"] = header is not None
@@ -992,11 +1079,8 @@ def raw_bits_and_conf(header: dict, pay_samples: np.ndarray,
         dist = np.min(np.abs(pay_lum[:, None] - bounds[None]), axis=1)
         conf = np.repeat(dist / max(1e-3, c[-1] - c[0]), 2)
     else:
-        th, _ = cv2.threshold(np.clip(pay_lum, 0, 255).astype(np.uint8), 0, 255,
-                              cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        bits = (pay_lum > th).astype(np.uint8)
-        spread = max(1e-3, np.percentile(pay_lum, 90) - np.percentile(pay_lum, 10))
-        conf = np.abs(pay_lum - th) / spread
+        bits, conf = _mono_decide(pay_lum, layout,
+                                  None if layout is None else layout.payload_cells)
     raw = _bytes(bits)
     nb = min(len(raw), len(conf) // 8)
     byte_conf = conf[: nb * 8].reshape(nb, 8).min(axis=1)
@@ -1081,12 +1165,9 @@ def decide_payload(header: dict, pay_samples: np.ndarray,
         cm = dist / spread
         margins = np.repeat(cm, 2)   # each cell contributes 2 bits
     elif header["mode"] == MODE_MONO:
-        th, _ = cv2.threshold(np.clip(pay_lum, 0, 255).astype(np.uint8), 0, 255,
-                              cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        bits = (pay_lum > th).astype(np.uint8)
+        bits, margins = _mono_decide(
+            pay_lum, layout, None if layout is None else layout.payload_cells)
         raw = _bytes(bits)
-        spread = max(1e-3, np.percentile(pay_lum, 90) - np.percentile(pay_lum, 10))
-        margins = np.abs(pay_lum - th) / spread   # per-cell confidence
     else:
         # normalize channels against sampled extremes, then nearest palette color
         lo = np.percentile(pay_samples, 3, axis=0)

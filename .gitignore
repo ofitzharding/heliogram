@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 demo/_tx_*
 demo/_countdown*
+*.dat.npy
