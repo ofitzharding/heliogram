@@ -52,13 +52,19 @@ class FrameDecoder:
     """Stateful across frames: holds the rolling kernel donor."""
 
     def __init__(self, layout, ecc, n_sub, tiles=(8, 14), sweeps=3,
-                 refit=None, erase=True, prml=True):
+                 refit=None, erase=True, prml=True, bits_per_cell=1):
         self.L = layout
         self.ecc = ecc
         self.rs = RSCodec(ecc)
         self.n_sub = n_sub
         self.sub_size = (255 - ecc) - 4
-        self.cells = layout.payload_cells[: n_sub * 255 * 8]
+        # Cells per byte follows the ALPHABET, not the byte: mono spends 8
+        # cells on a byte, gray4 spends 4. Hardcoding 8 sized every cell-index
+        # array for mono, so a gray4 frame indexed past the end of its own
+        # payload region and raised on the first codeword past halfway.
+        self.bpc = bits_per_cell
+        self.cells_per_byte = 8 // bits_per_cell
+        self.cells = layout.payload_cells[: n_sub * 255 * self.cells_per_byte]
         self.known = (layout.is_finder | layout.is_sep | layout.is_ring |
                       layout.is_header)
         self.tiles = tiles
@@ -114,9 +120,16 @@ class FrameDecoder:
             if zlib.crc32(blk) & 0xFFFFFFFF != struct.unpack("<I", dec[:4])[0]:
                 continue
             blocks.append((j, blk))
-            coded = bytes(self.rs.encode(dec))
-            cmask[lo * 8:hi * 8] = True
-            cbits[lo * 8:hi * 8] = np.unpackbits(np.frombuffer(coded, np.uint8))
+            if self.bpc == 1:
+                # Certified LABELS are per-cell binary, so they only mean
+                # anything for a two-level alphabet. gray4 cells carry a
+                # 4-level symbol; teaching the binary tile-PRML from them would
+                # need a 4-level Viterbi, which does not exist yet. Codeword
+                # counting (what the probe measures) is unaffected.
+                coded = bytes(self.rs.encode(dec))
+                cmask[lo * 8:hi * 8] = True
+                cbits[lo * 8:hi * 8] = np.unpackbits(
+                    np.frombuffer(coded, np.uint8))
         return blocks, cmask, cbits
 
     # ---- whole-block transmits (one fountain block per frame, one CRC)
