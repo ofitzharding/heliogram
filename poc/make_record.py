@@ -41,6 +41,28 @@ from codec import fountain, grid
 PW, PH = 3024, 1964
 
 
+def _placement(gw, gh, cell_px, bottom_margin=0.0):
+    """Grid cell size and panel position, optionally with headroom below.
+
+    A full-bleed 252x163 grid ends at ~98% of panel height, which lands the
+    bottom band at 97.9-98.4% down the camera sensor - the optically worst
+    strip of the field and the first thing framing drift clips (756f9de:
+    cw18's 94% failure is framing, not code). bottom_margin>0 shrinks cells
+    to the largest integer px that reserves that fraction of the panel as
+    margin and puts 3/4 of the slack below the grid, so ordinary edge-to-edge
+    filming lifts the bottom band off the sensor edge. Costs camera-px/cell
+    everywhere (~8% at 0.06); default 0.0 is the original full-bleed layout.
+    """
+    if bottom_margin > 0:
+        cell_px = min(cell_px, int((1.0 - bottom_margin) * PH) // gh)
+    W, H = gw * cell_px, gh * cell_px
+    if W > PW or H > PH:
+        sys.exit(f"{W}x{H} does not fit the {PW}x{PH} panel")
+    slack = PH - H
+    y0 = slack // 4 if bottom_margin > 0 else slack // 2
+    return cell_px, (PW - W) // 2, y0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--payload", default=str(Path(__file__).parent.parent /
@@ -58,19 +80,27 @@ def main():
     ap.add_argument("--lead-seconds", type=float, default=22.0,
                     help="lock-in lead: this transmit's own frames "
                          "with a countdown drawn over them")
+    ap.add_argument("--bottom-margin", type=float, default=0.0,
+                    help="fraction of panel height to reserve below the grid "
+                         "(cw18 rescue; see _placement). Try 0.06.")
     args = ap.parse_args()
     build(Path(args.payload).read_bytes(), args.out, args.grid, args.cell_px,
           args.ecc, args.fps, args.frames, args.crf, args.lead_seconds,
-          Path(args.payload).name)
+          Path(args.payload).name, args.bottom_margin)
 
 
 def build(data, out, grid_spec="252x163", cell_px=12, ecc=48, fps=60,
-          frames=0, crf=10, lead_seconds=22.0, label="payload"):
+          frames=0, crf=10, lead_seconds=22.0, label="payload",
+          bottom_margin=0.0):
     """Render `data` to a transmit video plus its lock-in lead.
 
     frames=0 sizes the loop from the payload: enough distinct frames to carry
     the file several times over, so a receiver that starts anywhere in the loop
     still collects a full set without waiting for a wrap.
+
+    bottom_margin>0 shrinks the cells to lift the bottom band off the sensor
+    edge; see _placement. 0.0 is the measured full-bleed layout every figure in
+    this repo was taken with.
     """
     class A:
         pass
@@ -89,9 +119,8 @@ def build(data, out, grid_spec="252x163", cell_px=12, ecc=48, fps=60,
     # Enough distinct frames to carry the file ~4x over, so a receiver that
     # starts anywhere in the loop still gets a full set before it wraps.
     args.frames = frames or max(600, int(np.ceil(4.0 * enc.k / n_sub)))
+    args.cell_px, x0, y0 = _placement(gw, gh, args.cell_px, bottom_margin)
     W, H = gw * args.cell_px, gh * args.cell_px
-    if W > PW or H > PH:
-        sys.exit(f"{W}x{H} does not fit the {PW}x{PH} panel")
 
     rate = n_sub * SUB * args.fps / 1024
     need = 1.05 * enc.k / n_sub
@@ -107,7 +136,8 @@ def build(data, out, grid_spec="252x163", cell_px=12, ecc=48, fps=60,
           f"({args.frames/args.fps:.1f}s per loop, "
           f"{args.frames*n_sub/enc.k:.1f}x fountain overhead)\n")
 
-    x0, y0 = (PW - W) // 2, (PH - H) // 2
+    # x0, y0 come from _placement above so bottom_margin can bias the grid
+    # upward; with bottom_margin=0 they are the original centred values.
     cmd = ["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24",
            "-s", f"{PW}x{PH}", "-r", str(args.fps), "-i", "-",
            "-c:v", "libx264", "-preset", "fast", "-crf", str(args.crf),
