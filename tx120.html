@@ -1,0 +1,132 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>heliogram tx 120</title><style>
+html,body{margin:0;background:#000;overflow:hidden;cursor:none}
+canvas{display:block;width:100vw;height:100vh}
+#hud{position:fixed;left:10px;top:8px;color:#0f0;font:13px monospace;z-index:9}
+#msg{position:fixed;left:0;right:0;top:45%;color:#fff;text-align:center;
+     font:28px -apple-system,monospace;z-index:9}
+</style></head><body>
+<div id="hud"></div><div id="msg">loading…</div>
+<canvas id="c"></canvas>
+<script>
+// 120Hz transmitter. One code frame per requestAnimationFrame tick.
+//
+// Every previous transmit went through a video file, and no player on this
+// machine presents 120 distinct fps: ffplay fullscreen measured 58.4 fps on a
+// 15.00s 120fps clip (it took 30.84s). The panel is 120Hz, so half the
+// refreshes have always been wasted.
+//
+// Here the cells arrive as raw bits and are drawn with putImageData onto a
+// gw x gh offscreen canvas, then scaled by an INTEGER factor with smoothing
+// off. The backing store is in DEVICE pixels, so the result lands 1:1 on the
+// panel with no compositor resampling and no video codec anywhere in the path.
+// tx.html already measured this canvas route as the sharpest available here
+// (0/1000 mid-band px, vs 19/1000 for ffplay fullscreen).
+const q = new URLSearchParams(location.search);
+const DIR   = q.get('dir')   || 'demo/webtx';
+const LOOPS = +(q.get('loops') || 6);
+const CD    = +(q.get('cd')    || 22);
+
+const c = document.getElementById('c'), hud = document.getElementById('hud');
+const msg = document.getElementById('msg');
+const ctx = c.getContext('2d', {alpha:false});
+let meta = null, bits = null, off = null, offctx = null, img = null;
+let scale = 1, x0 = 0, y0 = 0;
+
+function size(){
+  c.width  = Math.round(innerWidth  * devicePixelRatio);
+  c.height = Math.round(innerHeight * devicePixelRatio);
+  ctx.imageSmoothingEnabled = false;
+  if (meta){
+    // integer scale only: a fractional factor resamples the cell grid, which
+    // is what destroyed the code in the windowed-ffplay take
+    scale = Math.max(1, Math.floor(Math.min(c.width/meta.gw, c.height/meta.gh)));
+    x0 = (c.width  - meta.gw*scale) >> 1;
+    y0 = (c.height - meta.gh*scale) >> 1;
+  }
+}
+
+async function boot(){
+  meta = await (await fetch(DIR + '/meta.json')).json();
+  const buf = await (await fetch(DIR + '/frames.bin')).arrayBuffer();
+  bits = new Uint8Array(buf);
+  off = document.createElement('canvas');
+  off.width = meta.gw; off.height = meta.gh;
+  offctx = off.getContext('2d', {alpha:false});
+  img = offctx.createImageData(meta.gw, meta.gh);
+  size(); addEventListener('resize', size);
+  msg.textContent = 'click / press F for fullscreen, then hit record';
+  addEventListener('keydown', e => {
+    if (e.key === 'f' || e.key === 'F') document.documentElement.requestFullscreen();
+    if (e.key === ' ') start();
+  });
+  addEventListener('click', () => document.documentElement.requestFullscreen());
+  document.addEventListener('fullscreenchange', () => {
+    size(); if (document.fullscreenElement) start();
+  });
+}
+
+function drawFrame(idx){
+  const bpf = meta.bytes_per_frame, base = idx * bpf, d = img.data;
+  const n = meta.gw * meta.gh;
+  for (let i = 0; i < n; i++){
+    // bit i of this frame, MSB-first (numpy packbits order)
+    const v = (bits[base + (i >> 3)] >> (7 - (i & 7))) & 1 ? 255 : 0;
+    const p = i << 2;
+    d[p] = d[p+1] = d[p+2] = v; d[p+3] = 255;
+  }
+  offctx.putImageData(img, 0, 0);
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, c.width, c.height);
+  ctx.drawImage(off, 0, 0, meta.gw, meta.gh,
+                x0, y0, meta.gw*scale, meta.gh*scale);
+}
+
+let running = false, t0 = 0, shown = 0, loops = 0, fpsT = 0, fpsN = 0;
+function start(){
+  if (running) return;
+  running = true; msg.style.display = 'none';
+  t0 = performance.now(); fpsT = t0; shown = 0; loops = 0;
+  requestAnimationFrame(tick);
+}
+
+function tick(){
+  const now = performance.now();
+  const cd = CD - (now - t0)/1000;
+  if (cd > 0){
+    // Countdown over REAL code frames, so an AE/AF lock taken during it
+    // carries over to the payload unchanged, and every lead frame still
+    // advertises the correct file.
+    drawFrame(shown % meta.frames);
+    shown++;
+    ctx.textAlign = 'center'; ctx.fillStyle = '#fff';
+    ctx.font = `${Math.round(150*devicePixelRatio)}px -apple-system,monospace`;
+    ctx.fillText(cd > 3 ? Math.ceil(cd) : 'HOLD STILL',
+                 c.width/2, c.height/2);
+    ctx.font = `${Math.round(26*devicePixelRatio)}px -apple-system,monospace`;
+    ctx.fillText('TAP-HOLD TO LOCK AE/AF  -  do NOT touch the exposure slider',
+                 c.width/2, c.height - 60*devicePixelRatio);
+  } else {
+    const i = shown % meta.frames;
+    drawFrame(i);
+    shown++;
+    if (i === meta.frames - 1 && ++loops >= LOOPS){
+      ctx.fillStyle='#000'; ctx.fillRect(0,0,c.width,c.height);
+      ctx.fillStyle='#fff'; ctx.textAlign='center';
+      ctx.font = `${Math.round(40*devicePixelRatio)}px -apple-system,monospace`;
+      ctx.fillText('DONE - stop recording', c.width/2, c.height/2);
+      hud.textContent += '  FINISHED';
+      return;
+    }
+  }
+  fpsN++;
+  if (now - fpsT > 1000){
+    const f = fpsN*1000/(now-fpsT);
+    hud.textContent = `${c.width}x${c.height} dpr${devicePixelRatio} `
+      + `x${scale} ${f.toFixed(1)}fps loop ${loops+1}/${LOOPS}`
+      + (f < 100 ? '  <-- BELOW 120, take will be half rate' : '');
+    fpsN = 0; fpsT = now;
+  }
+  requestAnimationFrame(tick);
+}
+boot();
+</script></body></html>
