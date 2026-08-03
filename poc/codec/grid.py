@@ -78,6 +78,34 @@ GRAY4_LEVELS = np.array([0.0, 85.0, 170.0, 255.0])
 GRAY4_BITS = {0: (0, 0), 1: (0, 1), 2: (1, 1), 3: (1, 0)}
 GRAY4_SYM = {v: k for k, v in GRAY4_BITS.items()}
 
+GRAY4_PEAK = 255.0   # transmit-side peak white for gray4, in panel counts.
+                     #
+                     # A TRANSMITTER control on how much light the link puts
+                     # into the sensor. Measured on IMG_7879: with the camera's
+                     # AE locked, the panel at full white drove the sensor to
+                     # p5=32 (black lifted by bloom) and p50=189 against an eye
+                     # midpoint of 135 - saturating, and mono's own yield fell
+                     # to 23.6% from the 93.4% the same rig gives on a good
+                     # take. gray4 dies first in that regime because its two
+                     # middle levels are the first thing a compressed transfer
+                     # curve merges.
+                     #
+                     # Lowering the peak is free on the receiver: the gray4
+                     # demodulator learns its four levels by k-means on the
+                     # frame's own data, so it adapts to whatever range is
+                     # transmitted. Nothing about the code changes; only the
+                     # optical operating point moves.
+
+
+def set_gray4_peak(v: float) -> None:
+    global GRAY4_PEAK
+    GRAY4_PEAK = float(v)
+
+
+def gray4_levels() -> np.ndarray:
+    """The four transmit levels, evenly spaced up to the current peak."""
+    return GRAY4_LEVELS * (GRAY4_PEAK / 255.0)
+
 # 8-color constellation for color8 mode: corners of the RGB cube.
 PALETTE = np.array([
     [0, 0, 0], [255, 0, 0], [0, 255, 0], [0, 0, 255],
@@ -530,7 +558,7 @@ def render_frame(layout: Layout, header: bytes, payload: bytes,
         syms = np.array([GRAY4_SYM[(int(a), int(b))] for a, b in pairs])
         n = min(len(syms), len(layout.payload_cells))
         pc = layout.payload_cells[:n]
-        cells[pc[:, 0], pc[:, 1]] = GRAY4_LEVELS[syms[:n]][:, None]
+        cells[pc[:, 0], pc[:, 1]] = gray4_levels()[syms[:n]][:, None]
     else:  # color8: 3 bits per cell
         pb = _bits(coded)
         pb = np.concatenate([pb, np.zeros((-len(pb)) % 3, dtype=np.uint8)])
