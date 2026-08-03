@@ -51,6 +51,64 @@ _K1 = [0.0]         # per-worker tracked radial coefficient
 _H_PREV = [None]    # last accepted homography (see HOMOGRAPHY REUSE)
 
 
+def prime_donor(path, layout, ecc, n_sub, radial, total, proto_full,
+                n_probe=36, sweeps=3):
+    """Fit equalizer kernels from the best frame in the WHOLE capture, before
+    any decoding starts.
+
+    A cold FrameDecoder has tap=None, so tile-PRML does nothing until some
+    frame certifies enough of itself on hard decisions alone to become a donor.
+    Every worker therefore spends the start of its range un-equalized, and the
+    start of the CAPTURE is what full-span goodput is measured from - which is
+    most of why best-window read 208.2 KB/s against a full-span 131.0 on the
+    same take.
+
+    Nothing about this is cherry-picking. The receiver has the whole video
+    buffered; a certified codeword is correct by construction wherever it came
+    from, so a frame near the middle of a take is as valid a teacher as a frame
+    near the start. It is the same certified-label mechanism, just not
+    restricted to causal order.
+
+    Returns (tap, bias) or (None, None) if no frame in the sample was good
+    enough to teach from - in which case the workers bootstrap as before.
+    """
+    import softdec
+    fd = softdec.FrameDecoder(layout, ecc, n_sub, sweeps=sweeps,
+                              erase=True, prml=True)
+    allc = np.argwhere(np.ones((layout.gh, layout.gw), bool))
+    cap = cv2.VideoCapture(path)
+    grid.set_radial(radial)
+    best_n, best_state = -1, None
+    for fi in np.linspace(total * 0.10, total * 0.95, n_probe).astype(int):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(fi))
+        ok, img = cap.read()
+        if not ok:
+            continue
+        H = grid.locate(img, layout)
+        if H is None:
+            continue
+        hd, _s, _t = grid.sample_frame(img, layout, H)
+        if hd is None:
+            continue
+        if proto_full is not None and (hd["k"], hd["file_size"]) != (
+                proto_full["k"], proto_full["file_size"]):
+            continue        # a frame from a different transmission
+        y = grid.sample_cells(img, layout, H, allc).mean(axis=1).reshape(
+            layout.gh, layout.gw).astype(np.float32)
+        blocks = fd.decode(y, hd, allow_refit=False)
+        if len(blocks) > best_n:
+            best_n, best_state = len(blocks), fd.pending
+    cap.release()
+    if best_state is None or best_n < fd.refit:
+        print(f"donor pre-pass: best frame certified {max(best_n,0)}/{n_sub}, "
+              f"below the {fd.refit} needed to teach; workers will bootstrap")
+        return None, None
+    fd.pending = best_state
+    fd.commit()
+    print(f"donor pre-pass: primed from a frame certifying {best_n}/{n_sub}")
+    return fd.tap, fd.bias
+
+
 def _worker(rng):
     """Decode a contiguous frame range; return (frame_no, seq, block) hits."""
     start, end = rng
@@ -158,6 +216,15 @@ def _worker(rng):
                     _FD[0] = softdec.FrameDecoder(
                         layout, ecc, n_sub, sweeps=_CFG.get("sweeps", 3),
                         erase=True, prml=True)
+                    # PRIMED DONOR. Cold, the equalizer cannot arm until some
+                    # frame certifies 17/19 on hard decisions alone, so the
+                    # FIRST stretch of every worker's range decodes without it.
+                    # That stretch is exactly what full-span goodput measures
+                    # from, which is why best-window sat 1.6x above it. The
+                    # kernels come from a pre-pass over the whole capture.
+                    pt = _CFG.get("primed_tap")
+                    if pt is not None:
+                        _FD[0].tap, _FD[0].bias = pt, _CFG["primed_bias"]
                 allc = _ALLC[0]
                 if allc is None:
                     allc = _ALLC[0] = np.argwhere(
@@ -202,6 +269,7 @@ def _worker(rng):
                         _L.gh, _L.gw).astype(np.float32)
 
                 rs_ = _resample if _CFG.get("geom_search") else None
+                _FD[0].donor_frame = n
                 for j, blk in _FD[0].decode(y, header, resample=rs_):
                     out.append((n, header["seq"] * n_sub + j, blk,
                                 dict(proto, block_size=sub_size)))
@@ -288,6 +356,58 @@ def _worker(rng):
             continue
         out.append((n, header["seq"], blk, proto))
     cap.release()
+    # BACKFILL THE COLD PREFIX. The equalizer cannot arm until some frame
+    # certifies enough of itself, so every worker decodes the start of its
+    # range unequalized - and the start of the CAPTURE is precisely what
+    # full-span goodput is measured from. Measured on IMG_7872: 6.6% of
+    # codewords at frame 45 and 11.8% at frame 227, against 92.6% at frame 910.
+    #
+    # Priming from a distant frame does not work: kernels transfer for about a
+    # second before geometry drifts (Findings section 13). So re-run only the
+    # cold prefix, with the FIRST kernel the forward pass produced - the
+    # nearest donor in time that exists at all. Every recovered codeword is
+    # CRC-certified, so the union can only add.
+    fd0 = _FD[0]
+    first_donor = getattr(fd0, "first_donor", None) if fd0 else None
+    if first_donor is not None and _CFG.get("backfill", True):
+        tap0, bias0, fdone = first_donor
+        if fdone > start + 1:
+            seen = {(h[0], h[1]) for h in out}
+            fd0.tap, fd0.bias = tap0, bias0
+            cap = cv2.VideoCapture(_CFG["path"])
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start)
+            _H_PREV[0] = None
+            grid.set_phase_hint(None)
+            n = start
+            while n < fdone:
+                ok, img = cap.read()
+                if not ok:
+                    break
+                n += 1
+                Hb = grid.locate(img, layout)
+                if Hb is None:
+                    continue
+                hb, _sb, _tb = grid.sample_frame(img, layout, Hb)
+                if hb is None:
+                    continue
+                if proto_full is not None and (
+                        hb["k"], hb["file_size"]) != (proto_full["k"],
+                                                      proto_full["file_size"]):
+                    continue
+                allc = _ALLC[0]
+                if allc is None:
+                    allc = _ALLC[0] = np.argwhere(
+                        np.ones((layout.gh, layout.gw), bool))
+                yb = grid.sample_cells(img, layout, Hb, allc).mean(
+                    axis=1).reshape(layout.gh, layout.gw).astype(np.float32)
+                ns_b = grid.sub_count(layout, hb["mode"])
+                for j, blk in fd0.decode(yb, hb, allow_refit=False):
+                    key = (n, hb["seq"] * ns_b + j)
+                    if key not in seen:
+                        seen.add(key)
+                        out.append((n, hb["seq"] * ns_b + j, blk,
+                                    dict(proto, block_size=(255 - _CFG["ecc"]) - 4)))
+            cap.release()
     return out
 
 
@@ -316,6 +436,9 @@ def main():
     ap.add_argument("--no-track-k1", action="store_true",
                     help="hold one radial coefficient for the whole clip")
     ap.add_argument("--k1-step", type=float, default=0.0025)
+    ap.add_argument("--no-prime", action="store_true",
+                    help="skip the donor pre-pass; workers bootstrap "
+                         "the equalizer cold, as before")
     ap.add_argument("--full", action="store_true",
                     help="decode every frame instead of stopping "
                          "when the file completes. Needed when the "
@@ -471,6 +594,11 @@ def main():
                track_k1=not args.no_track_k1, k1_step=args.k1_step,
                geom_search=not args.no_geom_search,
                reuse_h=args.reuse_homography)
+    if args.soft and args.subblock and not args.no_prime:
+        _ns = grid.sub_count(layout, grid.MODE_MONO)
+        _tap, _bias = prime_donor(args.input, layout, args.ecc, _ns, radial,
+                                  total, proto_full, sweeps=args.sweeps)
+        cfg["primed_tap"], cfg["primed_bias"] = _tap, _bias
     # The rolling donor is stateful ACROSS CONSECUTIVE FRAMES: kernels transfer
     # for about a second before geometry drifts (Findings §13), so a worker
     # whose range is a short contiguous run spends most of it re-bootstrapping.

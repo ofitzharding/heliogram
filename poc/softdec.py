@@ -76,6 +76,8 @@ class FrameDecoder:
         self.donors = 0
         self.pending = None
         self.pending_whole = None
+        self.first_donor = None   # (tap, bias, frame) of the first arm
+        self.donor_frame = 0      # caller stamps the frame number
         # vertical only: the measured horizontal drift is 0.0001 cells/band
         self.geom_offsets = [(0.0, d) for d in
                              (0.20, -0.20, 0.35, -0.35, 0.10, -0.10)]
@@ -237,6 +239,12 @@ class FrameDecoder:
         sel[pc[:, 0], pc[:, 1]] = True
         self.tap, self.bias = TB.fit_tiles_sel(y, lab, sel, *self.tiles)
         self.donors += 1
+        # Remember the FIRST kernel that ever armed, so a caller can go back
+        # and re-decode the stretch that ran before it existed. Kernels only
+        # transfer for about a second, so the earliest one is the only useful
+        # teacher for the frames just before it.
+        if getattr(self, "first_donor", None) is None:
+            self.first_donor = (self.tap, self.bias, self.donor_frame)
         return True
 
     def quick_count(self, y):
