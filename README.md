@@ -1,26 +1,95 @@
 # heliogram
 
-Move a file from a laptop screen to a phone camera, as light, with nothing in
-between. **208.2 KB/s, hand-held, bit-exact.**
+Send a file from your laptop to your phone as light, no network involved.
+**208.2 KB/s, hand-held, bit-exact**, verified against decimen-optical-transfer
+(128 KB/s hand-held, 186 KB/s propped).
 
 A heliograph is the instrument that sent messages across air gaps by flashing
 sunlight off a mirror. A heliogram is the message. This is the same idea with a
-retina display and a CMOS sensor.
+retina display and a CMOS sensor: the file is rendered as an animated 2-D
+barcode, played fullscreen, filmed with a phone, and decoded back from the
+video.
+
+## Requirements
+
+- Python 3.9+
+- [ffmpeg](https://ffmpeg.org/) on your `PATH` (`brew install ffmpeg` / `apt
+  install ffmpeg`)
+- A laptop with a screen and a phone with a camera
+
+## Install
 
 ```bash
-python3 send.py notes.pdf              # encode, play fullscreen; film it
-python3 recv.py ~/Downloads/IMG_X.MOV  # decode, verify, write the file out
+git clone https://github.com/ofitzharding/heliogram.git
+cd heliogram
+python3 -m pip install -r requirements.txt
 ```
 
-`recv` writes the file under its original name and prints `sha256 VERIFIED`, or
-tells you it did not match. Nothing here asks you to trust it.
+## Usage
 
-## What it does
+**1. Encode and display the file.** Run this on the machine that has the file:
+
+```bash
+python3 send.py path/to/your/file
+```
+
+This renders the file into an animated grid code and plays it fullscreen: a
+~22 second lock-in countdown, then five loops of the code (~10s per loop for a
+small file, longer for a bigger one). Pass `--no-play` to just build the video
+without opening it, if you want to film it later or transfer it to another
+machine.
+
+**2. Film it.** On your phone: stock Camera app, 4K at 60fps, landscape, 1x
+zoom, fill the frame with the screen. Hit record, then during the countdown
+tap-and-hold on the screen to lock autoexposure/autofocus. **Don't touch the
+exposure slider** — it cuts exposure without raising ISO, which underexposes
+the shot. Then hold the phone still until the code stops playing.
+
+**3. Get the video back onto your laptop** (AirDrop, cable, whatever) and
+decode it:
+
+```bash
+python3 recv.py ~/Downloads/IMG_XXXX.MOV
+```
+
+This writes the file under its original name in the current directory (use
+`--out DIR` to choose where) and prints whether the recovered bytes' sha256
+matched the original:
+
+```
+file      your_file.pdf
+size      1,121,502 bytes
+sha256    VERIFIED - byte-identical to the original
+written   ./your_file.pdf
+```
+
+If the take was rough, `poc/quickcheck.py` gives a pass/fail verdict on a
+capture in about a minute instead of running the full decode (which can take
+several minutes on a long take):
+
+```bash
+python3 poc/quickcheck.py ~/Downloads/IMG_XXXX.MOV --grid 252x163
+```
+
+### Try it without filming anything
+
+`demo/kitten.png` is a ready-made test payload. Encode it, decode the video
+you just rendered directly (no camera involved), and confirm the round trip:
+
+```bash
+python3 send.py demo/kitten.png --no-play
+python3 recv.py demo/_send.mp4 --out /tmp
+diff demo/kitten.png /tmp/kitten.png && echo "byte-identical"
+```
+
+## How it works
 
 3024x1964 laptop panel at 60 Hz, 252x163 mono cells at 12 px/cell (99.6% of the
 panel). Each frame carries 19 RS(255,207) codewords; each codeword is its own
 CRC32-protected fountain symbol, so a frame damaged in one band still
-contributes the others. Channel ceiling 226.0 KB/s.
+contributes the others. Channel ceiling 226.0 KB/s. The file's name and sha256
+travel inside the payload (`poc/container.py`), so the receiver can write it
+back under its own name and verify it without any side channel.
 
 Measured end to end on real hand-held footage, every figure sha256-verified
 against the source:
@@ -35,8 +104,25 @@ against the source:
 symbol to the frame that completed the file. *Best window* is the shortest
 contiguous window from which the whole file decodes, verified by decoding from
 that window alone and comparing bytes; it is selected after the fact, so both
-numbers are quoted. The reference point being chased is
-decimen-optical-transfer at 128 KB/s hand-held and 186 KB/s propped.
+numbers are quoted.
+
+### Receiver pipeline
+
+1. Finder detection, best 4-subset by parallelogram/aspect score, homography.
+2. Radial coefficient, hill-climbed per frame on certified-codeword count.
+3. 3x3 box mean at each cell centre.
+4. **Local decision threshold**: occupancy-normalised box mean over a 15x15
+   *cell* neighbourhood. RS+fountain output is pseudorandom, so its local mean
+   converges on the midpoint of the eye at that point on the screen. Replacing
+   one global Otsu with this doubled codeword yield (19.8% -> 39.2%).
+5. Per-codeword RS, then soft-erasure RS with erasures placed by confidence,
+   then the CRC32 gate. Erasures are the bootstrap, not an optimisation:
+   without them no frame ever certifies enough to become a kernel donor and the
+   equalizer contributes nothing at all.
+6. **CAG** (below) on codewords still missing.
+7. Tile-PRML with a rolling kernel donor refitted on certified cells only,
+   skipped on frames that already certify in full.
+8. Fountain assembly; stop as soon as the file closes.
 
 ## The interesting part
 
@@ -97,24 +183,6 @@ Kept because the negative results cost more to find than the positive ones.
   10% fewer blocks for 5% less wall time — the header tolerates far more
   geometric drift than the payload does. Off by default.
 
-## Receiver, in order
-
-1. Finder detection, best 4-subset by parallelogram/aspect score, homography.
-2. Radial coefficient, hill-climbed per frame on certified-codeword count.
-3. 3x3 box mean at each cell centre.
-4. **Local decision threshold**: occupancy-normalised box mean over a 15x15
-   *cell* neighbourhood. RS+fountain output is pseudorandom, so its local mean
-   converges on the midpoint of the eye at that point on the screen. Replacing
-   one global Otsu with this doubled codeword yield (19.8% -> 39.2%).
-5. Per-codeword RS, then soft-erasure RS with erasures placed by confidence,
-   then the CRC32 gate. Erasures are the bootstrap, not an optimisation:
-   without them no frame ever certifies enough to become a kernel donor and the
-   equalizer contributes nothing at all.
-6. **CAG** on codewords still missing.
-7. Tile-PRML with a rolling kernel donor refitted on certified cells only,
-   skipped on frames that already certify in full.
-8. Fountain assembly; stop as soon as the file closes.
-
 ## Limits
 
 - Decoding runs at ~3 fps on 4K, so the file is reconstructed on the laptop
@@ -125,7 +193,7 @@ Kept because the negative results cost more to find than the positive ones.
 - Best-window figures are selected after the fact; full-span is quoted beside
   them.
 
-## Layout
+## Project layout
 
 ```
 send.py  recv.py        the demo
@@ -139,4 +207,6 @@ poc/exp_*.py            the experiments behind every claim above
 demo/CREDITS.md         payload image licences
 ```
 
-Requires Python 3, OpenCV, numpy, reedsolo, ffmpeg.
+## License
+
+[MIT](LICENSE).
