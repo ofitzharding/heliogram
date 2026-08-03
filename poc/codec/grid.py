@@ -949,12 +949,15 @@ def sample_cells(img: np.ndarray, layout: Layout, H: np.ndarray, cells: np.ndarr
         xs = np.clip(pts[:, 0].round().astype(np.int32), 1, w_ - 2)
         ys = np.clip(pts[:, 1].round().astype(np.int32), 1, h_ - 2)
         blurred = _BOX_CACHE.get("img")
-        if blurred is None or _BOX_CACHE.get("id") is not id(img):
+        # Validity must be a strong reference, never id(): CPython recycles
+        # ids once VideoCapture frees a frame, so an id match can validate a
+        # blur computed from the PREVIOUS frame's pixels.
+        if blurred is None or _BOX_CACHE.get("source") is not img:
             g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
             blurred = cv2.boxFilter(g, cv2.CV_32F, (3, 3))
             _BOX_CACHE.clear()
             _BOX_CACHE["img"] = blurred
-            _BOX_CACHE["id"] = id(img)
+            _BOX_CACHE["source"] = img
         v = blurred[ys, xs]
         return np.repeat(v[:, None], 3, axis=1)
     h, w = img.shape[:2]
