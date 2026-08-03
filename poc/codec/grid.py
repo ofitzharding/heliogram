@@ -97,6 +97,15 @@ GRAY4_PEAK = 255.0   # transmit-side peak white for gray4, in panel counts.
                      # optical operating point moves.
 
 
+GRAY4_LOCAL = False  # localise the gray4 level fit; see _gray4_decide for the
+                     # measurement that says it does not currently pay.
+
+
+def set_gray4_local(on: bool) -> None:
+    global GRAY4_LOCAL
+    GRAY4_LOCAL = bool(on)
+
+
 def set_gray4_peak(v: float) -> None:
     global GRAY4_PEAK
     GRAY4_PEAK = float(v)
@@ -1111,6 +1120,58 @@ def _learn_color4(X: np.ndarray) -> np.ndarray:
     return out
 
 
+def _gray4_decide(lum: np.ndarray, layout: 'Layout' = None, cells=None):
+    """Four-level decisions, with the illumination field removed FIRST.
+
+    The original version ran one global k-means over the raw luminances of the
+    whole frame. That is the same estimator that cost mono a factor of 2.1
+    before local thresholding replaced it, and it is worse here, not better: a
+    two-level alphabet only needs one boundary in the right place, while gray4
+    needs three, and an illumination gradient across the panel slides all three
+    at once. The two middle levels collide first, which is precisely the
+    signature that made gray4 read 0% on IMG_7879.
+
+    So normalise per cell against its own neighbourhood, exactly as
+    _mono_decide does, and cluster in that space. The payload is RS+fountain
+    output, hence pseudorandom, so over a few hundred cells every level is
+    represented and the local mean and spread estimate the local transfer
+    curve rather than the data. k-means then only has to separate four
+    populations that no longer move across the frame.
+
+    Falls back to the global fit when there is no layout to localise against.
+
+    MEASURED, and it did NOT pay, so it is off by default. On the clean file it
+    costs 100% -> 97.4% (the synthetic levels are exact, so the global fit is
+    already optimal and localising only adds variance), and on the real
+    overexposed take IMG_7879 it moved gray4 from 0.0% to 0.0%. The reason is
+    that take's failure is not a gradient: per-boundary d' measures 3.2-4.8 in
+    locally-normalised space, so the levels are separated in the MEAN and
+    swamped by per-cell spread, which no re-centring fixes. Kept because it is
+    the right estimator whenever a gradient IS the problem, and enabled with
+    set_gray4_local(True) once a take exists that shows one.
+    """
+    v = lum.astype(np.float32)
+    if GRAY4_LOCAL and LOCAL_TH and layout is not None and cells is not None:
+        m, s = local_levels(v, layout, cells[: len(v)], LOCAL_TH)
+        z = (v - m) / np.maximum(s, 1e-3)
+    else:
+        z = v
+    crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 40, 0.2)
+    _r, lab, cent = cv2.kmeans(z.reshape(-1, 1), 4, None, crit, 6,
+                               cv2.KMEANS_PP_CENTERS)
+    order = np.argsort(cent.ravel())
+    rank = np.empty(4, np.int64)
+    rank[order] = np.arange(4)
+    syms = rank[lab.ravel()]
+    bits = np.array([GRAY4_BITS[int(x)] for x in syms],
+                    dtype=np.uint8).reshape(-1)
+    c = np.sort(cent.ravel())
+    bounds = (c[:-1] + c[1:]) / 2.0
+    dist = np.min(np.abs(z[:, None] - bounds[None]), axis=1)
+    conf = np.repeat(dist / max(1e-3, c[-1] - c[0]), 2)
+    return bits, conf
+
+
 def raw_bits_and_conf(header: dict, pay_samples: np.ndarray,
                       layout: 'Layout' = None):
     """Demodulate to raw bytes plus per-byte confidence, WITHOUT running RS.
@@ -1123,18 +1184,9 @@ def raw_bits_and_conf(header: dict, pay_samples: np.ndarray,
     pay_lum = pay_samples.mean(axis=1)
     mode = header["mode"]
     if mode == MODE_GRAY4:
-        v = pay_lum.astype(np.float32).reshape(-1, 1)
-        crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 40, 0.2)
-        _r, lab, cent = cv2.kmeans(v, 4, None, crit, 6, cv2.KMEANS_PP_CENTERS)
-        order = np.argsort(cent.ravel())
-        rank = np.empty(4, np.int64)
-        rank[order] = np.arange(4)
-        syms = rank[lab.ravel()]
-        bits = np.array([GRAY4_BITS[int(x)] for x in syms], dtype=np.uint8).reshape(-1)
-        c = np.sort(cent.ravel())
-        bounds = (c[:-1] + c[1:]) / 2.0
-        dist = np.min(np.abs(pay_lum[:, None] - bounds[None]), axis=1)
-        conf = np.repeat(dist / max(1e-3, c[-1] - c[0]), 2)
+        bits, conf = _gray4_decide(
+            pay_lum, layout,
+            None if layout is None else layout.payload_cells)
     else:
         bits, conf = _mono_decide(pay_lum, layout,
                                   None if layout is None else layout.payload_cells)
