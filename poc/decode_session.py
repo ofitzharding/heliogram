@@ -47,25 +47,35 @@ def probe_grid(img):
     return None
 
 
-def segments(path, step_s=5):
-    """Probe every step_s seconds; return [(gw, gh, name, f0, f1)]."""
+def _probe_at(args_):
+    """Pool worker: probe one frame position for its grid."""
+    path, f = args_
     grid.set_ecc(48); grid.set_header_len(28); grid.set_header_centered(True)
+    cap = cv2.VideoCapture(path)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, f)
+    ok, img = cap.read()
+    cap.release()
+    if not ok:
+        return (f, None)
+    for k1 in (0.0, 0.020):
+        grid.set_radial(k1)
+        g = probe_grid(img)
+        if g is not None:
+            return (f, g)
+    return (f, None)
+
+
+def segments(path, step_s=5, workers=10):
+    """Probe every step_s seconds (parallel), bisect the boundaries;
+    return [(gw, gh, name, f0, f1)]."""
+    from multiprocessing import Pool
     cap = cv2.VideoCapture(path)
     tot = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS) or 60.0
-    marks = []
-    for f in range(0, tot, int(step_s * fps)):
-        cap.set(cv2.CAP_PROP_POS_FRAMES, f)
-        ok, img = cap.read()
-        if not ok:
-            break
-        for k1 in (0.0, 0.020):
-            grid.set_radial(k1)
-            g = probe_grid(img)
-            if g is not None:
-                break
-        marks.append((f, g))
     cap.release()
+    pos = list(range(0, tot, int(step_s * fps)))
+    with Pool(workers) as pool:
+        marks = pool.map(_probe_at, [(path, f) for f in pos])
     segs = []
     cur = None
     for f, g in marks:
@@ -77,6 +87,20 @@ def segments(path, step_s=5):
         else:
             cur = (cur[0], cur[1], cur[2], cur[3], f)
             segs[-1] = cur
+    # bisect each boundary: the coarse probe leaves up to step_s of slop
+    # that the decoder would otherwise chew through as locate() misses
+    for i in range(1, len(segs)):
+        lo = segs[i - 1][4]              # last frame KNOWN to be prev grid
+        hi = segs[i][3]                  # first frame KNOWN to be this grid
+        want = segs[i][2]
+        while hi - lo > 30:
+            mid = (lo + hi) // 2
+            _f, g = _probe_at((path, mid))
+            if g is not None and g[2] == want:
+                hi = mid
+            else:
+                lo = mid
+        segs[i] = (segs[i][0], segs[i][1], segs[i][2], hi, segs[i][4])
     # extend each segment to the next segment's start (or EOF)
     out = []
     for i, s in enumerate(segs):
