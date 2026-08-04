@@ -132,6 +132,31 @@ EOF
   read -r; pkill -f "http.server 8000"; dock false
   echo "AirDrop it, then:  python3 poc/fast_decode.py ~/Downloads/IMG_XXXX.MOV /tmp/out.bin --grid 274x178 --ecc 48 --subblock --soft --scan --from-start"
   ;;
+strobe10)
+  cat <<'EOF'
+------------------------------------------------------------------
+  10PX STROBE - the no-hardware knockout. 302x196 cells at 10 px,
+  27 codewords/frame, CEILING 321.2 KB/s at plain 4K60.
+
+  FRAMING DECIDES THIS TAKE. At the usual distance the grid lands
+  ~11.1 cam-px/cell: BELOW the density cliff, dead. Get CLOSER than
+  feels natural: the grid must span the full sensor width
+  (12.7 cam-px/cell). analyze_strobe.py prints the number first.
+
+  Camera: 4K at 60 fps.  SCREEN BRIGHTNESS: MAXIMUM (strobe halves
+  the light AND smaller cells need the short exposure even more).
+------------------------------------------------------------------
+EOF
+  quiet_start; sleep 6
+  pkill -f "http.server 8000" 2>/dev/null
+  (python3 -m http.server 8000 >/tmp/heliogram_httpd.log 2>&1 &)
+  sleep 1; dock true
+  open -a Safari "http://localhost:8000/tx120.html?dir=demo/webtx10&strobe=1&loops=5"
+  echo "server up; press enter here when the take is done to stop it"
+  read -r; pkill -f "http.server 8000"; dock false
+  echo "AirDrop it, then gate with:  python3 poc/analyze_strobe.py ~/Downloads/IMG_XXXX.MOV --grid 302x196"
+  echo "if framing+exposure pass:    python3 poc/fast_decode.py ~/Downloads/IMG_XXXX.MOV /tmp/out.bin --grid 302x196 --ecc 48 --subblock --soft --scan --from-start"
+  ;;
 *)
-  echo "usage: ./film.sh density | strobe | 120 | 11 | strobe11"; exit 1 ;;
+  echo "usage: ./film.sh density | strobe | 120 | 11 | strobe11 | strobe10"; exit 1 ;;
 esac

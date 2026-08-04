@@ -111,6 +111,13 @@ def main():
         s = int(hd["seq"])
         if s < 1:
             continue
+        if not rows:
+            # cam-px/cell decides the take before any decode: the density
+            # cliff sits between 12.3 (works) and 11.2 (dead). H's linear
+            # part maps cells to sensor px; sqrt|det| is the mean pitch.
+            pitch = float(np.sqrt(abs(np.linalg.det(H[:2, :2]))))
+            print(f"  framing: {pitch:.1f} cam-px/cell "
+                  f"(cliff: 12.3 works, 11.2 dead)")
         y = grid.sample_cells(img, L, H, allc).mean(axis=1).reshape(
             gh, gw).astype(np.float32)
         lum = y[pc[:, 0], pc[:, 1]]

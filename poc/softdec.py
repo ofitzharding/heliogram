@@ -90,6 +90,9 @@ class FrameDecoder:
         self._blank = np.zeros(layout.payload_capacity_bytes(grid.MODE_MONO),
                                np.uint8).tobytes()
         self._st_cache = {}
+        # CERTIFIED-INTERFERER CANCELLATION state: the previous frame's
+        # certified cell labels (seq, cmask, cbits). See cancel_prev().
+        self.prev_labels = None
 
     # ---- structure the receiver knows before decoding anything
     def struct_truth(self, header):
@@ -265,6 +268,49 @@ class FrameDecoder:
             self.first_donor = (self.tap, self.bias, self.donor_frame)
         return True
 
+    # ---- CERTIFIED-INTERFERER CANCELLATION (oracle 2026-08-04: mixed
+    # strobe frames 14.1 -> 17.1 of 19, worst frames +10/+11; clean frames
+    # exact no-op, zero losses on 48 real probes)
+    #
+    # NOT the refuted SIC: that subtracted the strong component to chase the
+    # weak one under the noise floor. Here the interferer is the PREVIOUS
+    # code frame, whose cells the receiver certified through RS+CRC32 one
+    # camera frame earlier; re-encoding certified codewords reproduces the
+    # transmitted cells exactly (the donor/CAG structural argument). We fit
+    # its amplitude on the covered cells and subtract, then re-certify what
+    # the plain pass missed. The decoded component is the STRONG one.
+    def cancel_prev(self, lum, header, byteconf_shape_nb):
+        if self.prev_labels is None:
+            return None
+        pseq, pmask, pbits = self.prev_labels
+        if int(header["seq"]) != pseq + 1 or pmask.sum() < 2000:
+            return None
+        n_cells = len(self.cells)
+        idx = np.flatnonzero(pmask)
+        # amplitude of the interferer, fitted only on its certified cells
+        cy = lum[:n_cells][idx]
+        cx = pbits[idx]
+        A = np.stack([cx, np.ones_like(cx)], axis=1)
+        try:
+            coef, *_ = np.linalg.lstsq(A, cy, rcond=None)
+        except np.linalg.LinAlgError:
+            return None
+        a = float(coef[0])
+        # a is the mixing amplitude of the PREVIOUS frame inside this
+        # exposure. Near zero means no straddle: nothing to cancel.
+        if a < 8.0:
+            return None
+        out = lum.copy()
+        out[:n_cells][idx] = lum[:n_cells][idx] - a * pbits[idx]
+        return out
+
+    def note_labels(self, header, cmask, cbits):
+        """Remember this frame's certified cells for the next frame."""
+        if cmask is not None and cmask.any():
+            self.prev_labels = (int(header["seq"]), cmask, cbits)
+        else:
+            self.prev_labels = None
+
     def quick_count(self, y):
         """How many codewords certify from hard decisions alone.
 
@@ -306,6 +352,7 @@ class FrameDecoder:
             self.pending = (y, header, len(blocks), cmask, cbits, x0)
             if allow_refit:
                 self.commit()
+                self.note_labels(header, cmask, cbits)
             return blocks
 
         if self.prml and self.tap is not None:
@@ -358,9 +405,37 @@ class FrameDecoder:
                     cbits = np.where(sl, cb2, cbits)
             n = len(blocks)
 
-        self.pending = (y, header, n, cmask, cbits, x)
+        # certified-interferer cancellation: last rescue stage, fires only
+        # when codewords are still missing AND the previous camera frame
+        # certified cells of seq-1 AND the fitted interferer amplitude is
+        # material. Clean captures skip it entirely (a ~ 0).
+        #
+        # Rescued cells go to the fountain and to next-frame cancellation
+        # labels, but NOT into the donor fit: their labels are proven, but
+        # the raw y they would be fitted against still contains the
+        # interference, and correct-label-vs-polluted-observation teaches a
+        # wrong kernel (measured: broke strict-superset vs the off path).
+        lab_mask, lab_bits = cmask, cbits
+        n_donor = n                     # pre-cancel count gates the refit
+        if n < self.n_sub:
+            lc = self.cancel_prev(lum, header, nb)
+            if lc is not None:
+                got = {j for j, _b in blocks}
+                miss = [j for j in range(self.n_sub) if j not in got]
+                b3, c3 = grid._mono_decide(lc, self.L, pc)
+                bc3 = (c3[: nb * 8].reshape(nb, 8).min(axis=1)
+                       if self.erase else None)
+                blk3, cm3, cb3 = self.certify(b3, bc3, only=miss)
+                for j, blk in blk3:
+                    blocks.append((j, blk))
+                if blk3:
+                    lab_mask = cmask | cm3
+                    lab_bits = np.where(cm3, cb3, cbits)
+
+        self.pending = (y, header, n_donor, cmask, cbits, x)
         if allow_refit:
             self.commit()
+            self.note_labels(header, lab_mask, lab_bits)
         return blocks
 
     def commit(self):
