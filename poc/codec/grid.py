@@ -992,10 +992,24 @@ def blurred_gray(img: np.ndarray) -> np.ndarray:
     return blurred
 
 
+_PT_CACHE = {}
+
+
 def sample_cells(img: np.ndarray, layout: Layout, H: np.ndarray, cells: np.ndarray):
     """Sample given (r,c) cells; returns float32 (n, 3) BGR means of 3x3 patches."""
-    centers = np.stack([cells[:, 1] + 0.5, cells[:, 0] + 0.5], axis=1).astype(np.float32)
-    pts = cv2.perspectiveTransform(centers[None], H)[0]
+    # The perspective transform of the cell centers depends only on (H,
+    # cells), not on the radial coefficient, so per-frame k1 tracking was
+    # recomputing an identical 80k-point transform three times. Cache the
+    # pre-radial points on exact key bytes; identical arithmetic either way.
+    key = (H.tobytes(), len(cells))
+    hit = _PT_CACHE.get("k")
+    if hit == key:
+        pts = _PT_CACHE["v"].copy()
+    else:
+        centers = np.stack([cells[:, 1] + 0.5, cells[:, 0] + 0.5],
+                           axis=1).astype(np.float32)
+        pts = cv2.perspectiveTransform(centers[None], H)[0]
+        _PT_CACHE["k"], _PT_CACHE["v"] = key, pts.copy()
     pts = _apply_radial(pts, img.shape)
     if _FAST_SAMPLE:
         # ONE box-filter over the image then ONE gather, instead of nine
