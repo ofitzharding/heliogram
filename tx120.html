@@ -103,11 +103,10 @@ async function boot(){
   document.addEventListener('fullscreenchange', () => {
     size();
     if (document.fullscreenElement){
-      // Pointer lock is the only thing that reliably parks the cursor in
-      // Safari fullscreen; cursor:none still flashes it on mouse movement,
-      // and a flashed cursor is opaque pixels landing on payload cells.
-      const el = document.documentElement;
-      if (el.requestPointerLock) { try { el.requestPointerLock(); } catch(e){} }
+      // NO pointer lock: engaging it WARPS the cursor to center screen,
+      // and a denied lock leaves it visible there - on top of the code.
+      // The cursor is parked in a corner externally (cliclick) and the
+      // operator enters fullscreen with the F key so the mouse never moves.
       start();
     }
   });
@@ -140,10 +139,16 @@ let phase = 0;   // strobe phase: even = code, odd = black
 function tick(){
   const now = performance.now();
   const cd = CD - (now - t0)/1000;
-  if (STROBE && (phase++ & 1)){
-    // dark half of the strobe cycle. Full black, no text: the countdown text
-    // must strobe too, or the AE lock is taken against brighter frames than
-    // the payload and the exposure comes out wrong for the code.
+  // The countdown does NOT strobe. Metering a 50%-duty surface halves the
+  // scene the AE sees, so a lock taken against it lands at DOUBLE the
+  // exposure - measured as the mixing that kept killing strobe takes
+  // (side share p90 0.196 at max brightness). Locking against the solid
+  // countdown buys a ~2x shorter exposure; the payload then runs ~1 stop
+  // darker than metered, which the local-threshold demod absorbs (clean
+  // frames certified 19/19 across mean luminance 95-215).
+  if (STROBE && cd <= 0 && (phase++ & 1)){
+    // dark half of the strobe cycle: full black, payload only (the
+    // countdown is solid by design; see the exposure note above)
     ctx.fillStyle = '#000'; ctx.fillRect(0, 0, c.width, c.height);
     fpsN++;
     if (now - fpsT > 1000){
