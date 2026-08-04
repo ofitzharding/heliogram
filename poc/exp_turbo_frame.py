@@ -31,7 +31,10 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from reedsolo import RSCodec, ReedSolomonError
+try:
+    from creedsolo import RSCodec, ReedSolomonError
+except ImportError:
+    from reedsolo import RSCodec, ReedSolomonError
 
 sys.path.insert(0, str(Path(__file__).parent))
 from codec import grid

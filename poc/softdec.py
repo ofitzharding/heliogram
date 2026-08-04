@@ -40,7 +40,13 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from reedsolo import RSCodec, ReedSolomonError
+try:
+    # creedsolo is the cythonized build of the same library: bit-identical
+    # (verified on randomized errors+erasures), ~5x per decode call, and RS
+    # decode is 79% of this decoder's wall clock.
+    from creedsolo import RSCodec, ReedSolomonError
+except ImportError:
+    from reedsolo import RSCodec, ReedSolomonError
 
 sys.path.insert(0, str(Path(__file__).parent))
 from codec import grid
@@ -83,15 +89,27 @@ class FrameDecoder:
                              (0.20, -0.20, 0.35, -0.35, 0.10, -0.10)]
         self._blank = np.zeros(layout.payload_capacity_bytes(grid.MODE_MONO),
                                np.uint8).tobytes()
+        self._st_cache = {}
 
     # ---- structure the receiver knows before decoding anything
     def struct_truth(self, header):
-        raw = grid.pack_header(int(header["seq"]), int(header["k"]),
-                               int(header["block_size"]),
-                               int(header["file_size"]), grid.MODE_MONO, 0, 0)
+        # Pure function of these four ints; render_frame+pack_header cost
+        # ~105 ms and were 36% of decode wall time, called twice per frame
+        # (PRML pass + commit) on headers that recur every transmit loop.
+        key = (int(header["seq"]), int(header["k"]),
+               int(header["block_size"]), int(header["file_size"]))
+        hit = self._st_cache.get(key)
+        if hit is not None:
+            return hit
+        raw = grid.pack_header(key[0], key[1], key[2], key[3],
+                               grid.MODE_MONO, 0, 0)
         img = grid.render_frame(self.L, raw, self._blank, grid.MODE_MONO,
                                 cell_px=1)
-        return (cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) > 127).astype(np.float32)
+        out = (cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) > 127).astype(np.float32)
+        if len(self._st_cache) > 4096:
+            self._st_cache.clear()
+        self._st_cache[key] = out
+        return out
 
     # ---- certify every codeword in one set of hard decisions
     def certify(self, bits, byteconf=None, only=None):

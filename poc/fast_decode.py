@@ -33,6 +33,9 @@ _CFG = {}
 
 
 def _init(cfg):
+    # Workers each spawn cv2's internal thread pool; with 8-10 processes that
+    # oversubscribes the machine. One thread per worker is faster in aggregate.
+    cv2.setNumThreads(1)
     _CFG.update(cfg)
     grid.set_ecc(cfg["ecc"])
     grid.set_header_len(cfg["header_len"])
@@ -264,8 +267,7 @@ def _worker(rng):
                     hh, ww = _img.shape[:2]
                     xs = np.clip(pts[:, 0].round().astype(np.int32), 1, ww - 2)
                     ys_ = np.clip(pts[:, 1].round().astype(np.int32), 1, hh - 2)
-                    g = cv2.cvtColor(_img, cv2.COLOR_BGR2GRAY)
-                    return cv2.boxFilter(g, cv2.CV_32F, (3, 3))[ys_, xs].reshape(
+                    return grid.blurred_gray(_img)[ys_, xs].reshape(
                         _L.gh, _L.gw).astype(np.float32)
 
                 rs_ = _resample if _CFG.get("geom_search") else None
@@ -274,7 +276,10 @@ def _worker(rng):
                     out.append((n, header["seq"] * n_sub + j, blk,
                                 dict(proto, block_size=sub_size)))
                 continue
-            from reedsolo import RSCodec, ReedSolomonError
+            try:
+                from creedsolo import RSCodec, ReedSolomonError
+            except ImportError:
+                from reedsolo import RSCodec, ReedSolomonError
             raw, bconf = grid.raw_bits_and_conf(header, samples, layout)
             rs = RSCodec(ecc)
             for j in range(min(n_sub, len(raw) // 255)):
@@ -329,8 +334,7 @@ def _worker(rng):
                 hh, ww = _img.shape[:2]
                 xs = np.clip(pts[:, 0].round().astype(np.int32), 1, ww - 2)
                 yy = np.clip(pts[:, 1].round().astype(np.int32), 1, hh - 2)
-                g = cv2.cvtColor(_img, cv2.COLOR_BGR2GRAY)
-                return cv2.boxFilter(g, cv2.CV_32F, (3, 3))[yy, xs].reshape(
+                return grid.blurred_gray(_img)[yy, xs].reshape(
                     _L.gh, _L.gw).astype(np.float32)
 
             gs = _rw if _CFG.get("geom_search") else None
@@ -444,6 +448,14 @@ def main():
                          "when the file completes. Needed when the "
                          "reported RATE is the point, since the "
                          "best-window search wants all the frames.")
+    ap.add_argument("--from-start", action="store_true",
+                    help="grow the incremental window from frame 0 instead of "
+                         "the middle of the capture, and stop at the first "
+                         "fountain closure. Per-frame decoding is unchanged, "
+                         "so the full-span GOODPUT (first contributing frame "
+                         "-> completion, in capture order) is the same number "
+                         "--full reports, for a fraction of the work. Only "
+                         "the post-hoc best-window search loses frames.")
     ap.add_argument("--reuse-homography", action="store_true",
                     help="skip locate() when the previous frame's "
                          "homography still reads the header. MEASURED NET LOSS on IMG_7872: 10%% fewer blocks for 5%% less wall time, "
@@ -498,7 +510,10 @@ def main():
                     # scan scored 0 hits at every k1 - then defaulted to
                     # k1=0.0 and overrode the correct value _detect had
                     # already found. Count certified codewords instead.
-                    from reedsolo import RSCodec, ReedSolomonError
+                    try:
+                        from creedsolo import RSCodec, ReedSolomonError
+                    except ImportError:
+                        from reedsolo import RSCodec, ReedSolomonError
                     raw, _bc = grid.raw_bits_and_conf(hd, s, layout)
                     rs_ = RSCodec(args.ecc)
                     ssz = (255 - args.ecc) - 4
@@ -652,8 +667,15 @@ def main():
         seen_lo, seen_hi = None, None
         for frac in (0.10, 0.25, 0.55, 1.0):
             w = max(240, int(total * frac))
-            lo = max(0, total // 2 - w // 2)
-            hi = min(total, lo + w)
+            if args.from_start:
+                # Honest full-span wants the capture's natural transfer: the
+                # AE/AF settling transient included, exactly as --full charges
+                # it. Growing forward from 0 keeps that while stopping as soon
+                # as the file first completes.
+                lo, hi = 0, min(total, w)
+            else:
+                lo = max(0, total // 2 - w // 2)
+                hi = min(total, lo + w)
             if seen_lo is None:
                 hits = _decode_span(lo, hi)
             else:

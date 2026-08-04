@@ -19,7 +19,10 @@ import zlib
 
 import cv2
 import numpy as np
-from reedsolo import RSCodec, ReedSolomonError
+try:
+    from creedsolo import RSCodec, ReedSolomonError
+except ImportError:
+    from reedsolo import RSCodec, ReedSolomonError
 
 MAGIC = b"SCPC"
 HEADER_LEN = 28          # bytes, pre-RS (v2: +zone_w, +zone_modes, +2 spare)
@@ -972,6 +975,23 @@ def refine_homography(img: np.ndarray, layout: Layout, H: np.ndarray,
     return cv2.getPerspectiveTransform(src, dst.astype(np.float32))
 
 
+def blurred_gray(img: np.ndarray) -> np.ndarray:
+    """3x3 box-filtered grayscale of img, cached by source identity.
+
+    Validity must be a strong reference, never id(): CPython recycles ids
+    once VideoCapture frees a frame, so an id match can validate a blur
+    computed from the PREVIOUS frame's pixels.
+    """
+    blurred = _BOX_CACHE.get("img")
+    if blurred is None or _BOX_CACHE.get("source") is not img:
+        g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+        blurred = cv2.boxFilter(g, cv2.CV_32F, (3, 3))
+        _BOX_CACHE.clear()
+        _BOX_CACHE["img"] = blurred
+        _BOX_CACHE["source"] = img
+    return blurred
+
+
 def sample_cells(img: np.ndarray, layout: Layout, H: np.ndarray, cells: np.ndarray):
     """Sample given (r,c) cells; returns float32 (n, 3) BGR means of 3x3 patches."""
     centers = np.stack([cells[:, 1] + 0.5, cells[:, 0] + 0.5], axis=1).astype(np.float32)
@@ -985,17 +1005,7 @@ def sample_cells(img: np.ndarray, layout: Layout, H: np.ndarray, cells: np.ndarr
         h_, w_ = img.shape[:2]
         xs = np.clip(pts[:, 0].round().astype(np.int32), 1, w_ - 2)
         ys = np.clip(pts[:, 1].round().astype(np.int32), 1, h_ - 2)
-        blurred = _BOX_CACHE.get("img")
-        # Validity must be a strong reference, never id(): CPython recycles
-        # ids once VideoCapture frees a frame, so an id match can validate a
-        # blur computed from the PREVIOUS frame's pixels.
-        if blurred is None or _BOX_CACHE.get("source") is not img:
-            g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
-            blurred = cv2.boxFilter(g, cv2.CV_32F, (3, 3))
-            _BOX_CACHE.clear()
-            _BOX_CACHE["img"] = blurred
-            _BOX_CACHE["source"] = img
-        v = blurred[ys, xs]
+        v = blurred_gray(img)[ys, xs]
         return np.repeat(v[:, None], 3, axis=1)
     h, w = img.shape[:2]
     xs = np.clip(pts[:, 0].round().astype(int), 1, w - 2)
