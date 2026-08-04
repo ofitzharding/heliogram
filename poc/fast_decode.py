@@ -45,6 +45,7 @@ def _init(cfg):
     grid.set_local_threshold(cfg.get("local_th", grid.LOCAL_TH))
     _H_PREV[0] = None
     _LAST_HARD[0] = None
+    _PREV_CW[0] = _PREV_CW[1] = None
     grid.set_phase_hint(None)
 
 
@@ -54,6 +55,13 @@ _ALLC = [None]
 _K1 = [0.0]         # per-worker tracked radial coefficient
 _H_PREV = [None]    # last accepted homography (see HOMOGRAPHY REUSE)
 _LAST_HARD = [None] # (seq, frame) of the last HARD header: anchors ML rescue
+_CW_ROWS = [None, None]  # codeword row bands + header rows, per layout
+_PREV_CW = [None, None]  # previous frame's (seq, {j: block bytes}): the
+                         # straddle-ghost detector. A codeword certifying
+                         # with the PREVIOUS frame's exact content is that
+                         # frame's codeword re-exposed through the rolling
+                         # seam, and filing it under this header's seq is
+                         # the poison that closed three corrupt fountains.
 
 
 def prime_donor(path, layout, ecc, n_sub, radial, total, proto_full,
@@ -196,13 +204,52 @@ def _prepass_task(t):
     return (kind, pos, (len(blocks), fd.pending))
 
 
+class _VTSource:
+    """Frame source via ffmpeg + VideoToolbox hardware decode.
+
+    Streams bgr24 frames for a contiguous range through a pipe: no per-frame
+    software HEVC cost in the worker. Seek is by exact timestamp at the
+    container frame rate. Adopted only behind cfg['vt'] after an
+    instrument-equivalence A/B (same sha, same span) on real footage.
+    """
+
+    def __init__(self, path, start, count, w, h, fps):
+        import subprocess
+        self.w, self.h = w, h
+        self.p = subprocess.Popen(
+            ["ffmpeg", "-v", "error", "-hwaccel", "videotoolbox",
+             "-ss", f"{start / fps:.6f}", "-i", path,
+             "-frames:v", str(count), "-f", "rawvideo",
+             "-pix_fmt", "bgr24", "-"],
+            stdout=subprocess.PIPE, bufsize=10 ** 8)
+
+    def read(self):
+        n = self.w * self.h * 3
+        buf = self.p.stdout.read(n)
+        if buf is None or len(buf) < n:
+            return False, None
+        return True, np.frombuffer(buf, np.uint8).reshape(
+            self.h, self.w, 3).copy()
+
+    def release(self):
+        try:
+            self.p.stdout.close()
+            self.p.terminate()
+        except Exception:
+            pass
+
+
 def _worker(rng):
     """Decode a contiguous frame range; return (frame_no, seq, block) hits."""
     start, end = rng
     gw, gh = _CFG["gw"], _CFG["gh"]
     layout = grid.Layout(gw, gh)
-    cap = cv2.VideoCapture(_CFG["path"])
-    cap.set(cv2.CAP_PROP_POS_FRAMES, start)
+    if _CFG.get("vt"):
+        cap = _VTSource(_CFG["path"], start, end - start,
+                        _CFG["vt_w"], _CFG["vt_h"], _CFG["vt_fps"])
+    else:
+        cap = cv2.VideoCapture(_CFG["path"])
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start)
     out = []
     proto = None
     proto_full = _CFG.get("proto_full")
@@ -371,9 +418,67 @@ def _worker(rng):
 
                 rs_ = _resample if _CFG.get("geom_search") else None
                 _FD[0].donor_frame = n
-                for j, blk in _FD[0].decode(y, header, resample=rs_):
-                    out.append((n, header["seq"] * n_sub + j, blk,
+                got = list(_FD[0].decode(y, header, resample=rs_))
+                # SEAM QUARANTINE (receiver-legal). On a long-exposure frame
+                # the rows on the far side of the rolling seam expose in the
+                # NEIGHBOURING refresh: their codewords certify with that
+                # frame's content and, submitted under this header's seq,
+                # poison the fountain invisibly (IMG_7920's 12px rung closed
+                # corrupt three times exactly this way). The seam is the
+                # demodulator's own evidence: the per-row fraction of cells
+                # at the decision threshold spikes in the mixed band. When
+                # the spike is material, certified codewords whose rows sit
+                # across the seam from the HEADER band are quarantined:
+                # dropped, not reassigned (reassignment is the dual-seq
+                # upgrade; dropping can only remove poison, never add it).
+                if got and _CFG.get("seam_th", 0) > 0:
+                    pcq = layout.payload_cells
+                    lumq = y[pcq[:, 0], pcq[:, 1]]
+                    _bq, cq = grid._mono_decide(lumq, layout, pcq)
+                    tau = 0.25 * float(np.median(np.abs(cq)))
+                    midq = (np.abs(cq) < tau).astype(np.float32)
+                    prof = np.zeros(layout.gh, np.float32)
+                    cntq = np.zeros(layout.gh, np.float32)
+                    np.add.at(prof, pcq[:, 0], midq)
+                    np.add.at(cntq, pcq[:, 0], 1)
+                    prof = prof / np.maximum(cntq, 1)
+                    smq = np.convolve(prof, np.ones(7, np.float32) / 7,
+                                      "same")
+                    seam_r = int(np.argmax(smq))
+                    if float(smq[seam_r]) >= _CFG["seam_th"]:
+                        if _CW_ROWS[0] is None:
+                            cells_q = layout.payload_cells[: n_sub * 255 * 8]
+                            _CW_ROWS[0] = [
+                                (int(cells_q[j*255*8:(j+1)*255*8, 0].min()),
+                                 int(cells_q[j*255*8:(j+1)*255*8, 0].max()))
+                                for j in range(n_sub)]
+                            hr = layout.header_cells[:, 0]
+                            _CW_ROWS[1] = (int(hr.min()), int(hr.max()))
+                        hdr_top = _CW_ROWS[1][1] < seam_r
+                        kept = []
+                        for j, blk in got:
+                            lo_r, hi_r = _CW_ROWS[0][j]
+                            same_side = (hi_r < seam_r) if hdr_top else                                         (lo_r >= seam_r)
+                            if same_side:
+                                kept.append((j, blk))
+                        got = kept
+                sq = int(header["seq"])
+                pseq, pblocks = _PREV_CW
+                cur_blocks = {}
+                for j, blk in got:
+                    b = bytes(blk)
+                    cur_blocks[j] = b
+                    # STRADDLE-GHOST CHECK. Content identical to the previous
+                    # frame's codeword j (previous seq) means these rows were
+                    # exposed in the PREVIOUS refresh: the symbol is already
+                    # pooled under its true seq, and filing it under sq would
+                    # poison the fountain. Chance collision is 2^-1600.
+                    if (pblocks is not None and pseq is not None
+                            and sq == pseq + 1 and pblocks.get(j) == b):
+                        continue
+                    out.append((n, sq * n_sub + j, blk,
                                 dict(proto, block_size=sub_size)))
+                _PREV_CW[0], _PREV_CW[1] = sq, cur_blocks
                 continue
             try:
                 from creedsolo import RSCodec, ReedSolomonError
@@ -569,6 +674,16 @@ def main():
                          "codeword yield instead.")
     ap.add_argument("--no-geom-search", action="store_true",
                     help="do not retry failed codewords at other sub-cell sampling offsets")
+    ap.add_argument("--vt", action="store_true",
+                    help="VideoToolbox hardware frame ingestion in workers "
+                         "(instrument change: adopt only after an A/B shows "
+                         "identical sha and span on the same footage)")
+    ap.add_argument("--seam-th", type=float, default=0.0,
+                    help="seam-quarantine threshold on the smoothed per-row "
+                         "mid-fraction peak (0 = off). Certified codewords "
+                         "across the seam from the header band are dropped "
+                         "when the peak exceeds this; calibrate on the clean "
+                         "transmit before use.")
     ap.add_argument("--local-th", type=int, default=grid.LOCAL_TH,
                     help="local decision-threshold window in cells (0 = the "
                          "old single global Otsu)")
@@ -679,7 +794,15 @@ def main():
                soft=args.soft, sweeps=args.sweeps, local_th=args.local_th,
                track_k1=not args.no_track_k1, k1_step=args.k1_step,
                geom_search=not args.no_geom_search,
-               reuse_h=args.reuse_homography)
+               reuse_h=args.reuse_homography,
+               seam_th=args.seam_th)
+    if args.vt:
+        c0 = cv2.VideoCapture(args.input)
+        cfg["vt"], cfg["vt_w"], cfg["vt_h"], cfg["vt_fps"] = (
+            True, int(c0.get(cv2.CAP_PROP_FRAME_WIDTH)),
+            int(c0.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+            c0.get(cv2.CAP_PROP_FPS) or 60.0)
+        c0.release()
     if args.soft and args.subblock and not args.no_prime:
         _ns = grid.sub_count(layout, grid.MODE_MONO)
         # parallel donor pre-pass: same probe positions and winner rule as
@@ -727,7 +850,35 @@ def main():
             res = pool.map(_worker, rs)
         return sorted([h for r in res for h in r], key=lambda x: x[0])
 
+    def _conflict_filter(hs):
+        """Drop every fountain index certified with CONFLICTING content.
+
+        Forensics on IMG_7920's 12px rung: 6 of 6582 symbols carried wrong
+        content (top row bands of two straddled frames, certified with the
+        neighbouring refresh's bytes under this header's seq) and every
+        fountain closure came out corrupt. A take spans multiple transmit
+        loops, so indices recur; same index with two distinct contents means
+        at least one sighting lies, and the index is excluded outright. No
+        thresholds, no geometry, receiver-legal, and it catches ANY poison
+        source whose index also appears cleanly elsewhere."""
+        seen = {}
+        bad = set()
+        for _n, sq, bl, _p in hs:
+            b = bytes(bl)
+            if sq in seen:
+                if seen[sq] != b:
+                    bad.add(sq)
+            else:
+                seen[sq] = b
+        if bad:
+            print(f"  conflict filter: {len(bad)} poisoned indices dropped "
+                  f"({len(hs)} hits)")
+        return [h for h in hs if h[1] not in bad]
+
     def _try_assemble(hs):
+        if not hs:
+            return None, None
+        hs = _conflict_filter(hs)
         if not hs:
             return None, None
         pr = hs[0][3]
@@ -805,6 +956,9 @@ def main():
           f"in {wall:.1f}s wall ({scanned/max(wall,1e-6):.0f} frames/s)")
     if not hits:
         sys.exit("FAILED: no blocks")
+    hits = _conflict_filter(hits)
+    if not hits:
+        sys.exit("FAILED: every index conflicted")
     proto = hits[0][3]
     k = proto["k"]
     if args.subblock:

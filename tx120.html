@@ -49,6 +49,12 @@ const CD    = +(q.get('cd')    || 22);
 // settings as every comparable take. Costs half the light; raise screen
 // brightness. The panel holds 120Hz alternation (smear test: 0.3-1.8px).
 const STROBE = q.get('strobe') === '1';
+// WHITE-FLASH AE LOCK: countdown renders a pure white field so the camera
+// meters the brightest possible scene and locks its SHORTEST exposure.
+// Payload then runs ~1 stop darker than metered; the local-threshold demod
+// absorbs that (measured 19/19 across mean luminance 95-215). This is the
+// exposure fix for the rolling leg and extra margin for strobe legs.
+const FLASHLOCK = q.get('flashlock') === '1';
 
 const c = document.getElementById('c'), hud = document.getElementById('hud');
 const msg = document.getElementById('msg');
@@ -168,12 +174,17 @@ function tick(){
     if (want !== seg){ activate(want); shown = 0; }
   }
   if (cd > 0){
-    // Countdown over REAL code frames, so an AE/AF lock taken during it
-    // carries over to the payload unchanged, and every lead frame still
-    // advertises the correct file.
-    drawFrame(shown % meta.frames);
-    shown++;
-    ctx.textAlign = 'center'; ctx.fillStyle = '#fff';
+    if (FLASHLOCK){
+      ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
+    } else {
+      // Countdown over REAL code frames, so an AE/AF lock taken during it
+      // carries over to the payload unchanged, and every lead frame still
+      // advertises the correct file.
+      drawFrame(shown % meta.frames);
+      shown++;
+    }
+    ctx.textAlign = 'center';
+    ctx.fillStyle = FLASHLOCK ? '#000' : '#fff';
     ctx.font = `${Math.round(150*devicePixelRatio)}px -apple-system,monospace`;
     // 30% height, NOT center: the header band lives in the middle rows,
     // and numerals over the header force ML rescue on every countdown

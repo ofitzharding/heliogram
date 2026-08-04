@@ -50,6 +50,20 @@ except ImportError:
 
 sys.path.insert(0, str(Path(__file__).parent))
 from codec import grid
+
+# crs2: line-by-line C port of reedsolo's decoder plus the certify ladder.
+# 10,000/10,000 differential-identical, 17x on ladder-heavy codewords.
+# Loaded when present; the Python path below stays as the exact fallback.
+import ctypes as _ct
+_CRS2 = None
+try:
+    _CRS2 = _ct.CDLL(str(Path(__file__).parent / "crs2.dylib"))
+    _CRS2.certify_codeword.restype = _ct.c_int
+    _CRS2.certify_codeword.argtypes = [
+        _ct.c_char_p, _ct.POINTER(_ct.c_int32), _ct.c_int, _ct.c_int,
+        _ct.c_int, _ct.c_char_p, _ct.c_char_p]
+except OSError:
+    _CRS2 = None
 import exp_tile_prml as T
 import exp_turbo_frame as TB
 
@@ -113,9 +127,16 @@ class FrameDecoder:
         self.pending_whole = None
         self.first_donor = None   # (tap, bias, frame) of the first arm
         self.donor_frame = 0      # caller stamps the frame number
-        # vertical only: the measured horizontal drift is 0.0001 cells/band
+        # Vertical offsets from the 12px-era measurement ("dx drift nil"),
+        # PLUS horizontal and diagonal ones: at the vertical centre the
+        # radial residual points HORIZONTALLY, invisible to a vertical-only
+        # search, and at 9px margins that kills the middle bands (measured:
+        # 38-55% mid-frame vs 100% top/bottom at 9.9 cam-px/cell, while
+        # 11px shows no dip). CRC-gated hypotheses can only add.
         self.geom_offsets = [(0.0, d) for d in
-                             (0.20, -0.20, 0.35, -0.35, 0.10, -0.10)]
+                             (0.20, -0.20, 0.35, -0.35, 0.10, -0.10)] +                             [(d, 0.0) for d in
+                             (0.20, -0.20, 0.35, -0.35)] +                             [(dx, dy) for dx in (0.25, -0.25)
+                             for dy in (0.25, -0.25)]
         self._blank = np.zeros(layout.payload_capacity_bytes(grid.MODE_MONO),
                                np.uint8).tobytes()
         self._st_cache = {}
@@ -150,6 +171,30 @@ class FrameDecoder:
         cmask = np.zeros(len(self.cells), bool)
         cbits = np.zeros(len(self.cells), np.float32)
         js = list(range(self.n_sub) if only is None else only)
+        if _CRS2 is not None:
+            blk_buf = _ct.create_string_buffer(self.sub_size)
+            cod_buf = _ct.create_string_buffer(255)
+            for j in js:
+                lo, hi = j * 255, (j + 1) * 255
+                chunk = bytes(by[lo:hi])
+                use_ladder = 1 if (self.erase and byteconf is not None) else 0
+                if use_ladder:
+                    order = np.ascontiguousarray(
+                        np.argsort(byteconf[lo:hi]), dtype=np.int32)
+                    optr = order.ctypes.data_as(_ct.POINTER(_ct.c_int32))
+                else:
+                    optr = None
+                ok = _CRS2.certify_codeword(chunk, optr, self.ecc,
+                                            self.sub_size, use_ladder,
+                                            blk_buf, cod_buf)
+                if not ok:
+                    continue
+                blocks.append((j, blk_buf.raw))
+                if self.bpc == 1:
+                    cmask[lo * 8:hi * 8] = True
+                    cbits[lo * 8:hi * 8] = np.unpackbits(
+                        np.frombuffer(cod_buf.raw, np.uint8))
+            return blocks, cmask, cbits
         clean = syndromes_zero(by[: self.n_sub * 255].reshape(
             self.n_sub, 255)[js], self.ecc) if js else []
         for ci, j in enumerate(js):

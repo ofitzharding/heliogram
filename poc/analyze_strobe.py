@@ -98,11 +98,11 @@ def main():
         ok, img = cap.read()
         if not ok:
             continue
-        sm = (cv2.resize(img, None, fx=0.5, fy=0.5)
-              if img.shape[1] >= 3000 else img)
+        big = img.shape[1] >= 3000
+        sm = cv2.resize(img, None, fx=0.5, fy=0.5) if big else img
         Hs = grid.locate(sm, L)
-        H = ((np.diag([2., 2., 1.]) @ Hs) if Hs is not None
-             else grid.locate(img, L))
+        H = (((np.diag([2., 2., 1.]) @ Hs) if big else Hs)
+             if Hs is not None else grid.locate(img, L))
         if H is None:
             continue
         hd, _s, _t = grid.sample_frame(img, L, H)
