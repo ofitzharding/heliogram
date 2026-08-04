@@ -26,6 +26,17 @@ const q = new URLSearchParams(location.search);
 const DIR   = q.get('dir')   || 'demo/webtx';
 const LOOPS = +(q.get('loops') || 6);
 const CD    = +(q.get('cd')    || 22);
+// STROBE: draw code on even refreshes, full black on odd ones. The display
+// becomes the shutter. Measured basis: straddle share predicts yield (frames
+// at share 0.00-0.01 certify 89-100%, at 0.15-0.22 only 58-84%), and the SIC
+// oracle showed a two-frame blend is unrecoverable (residual d' 0.04-1.20).
+// With black insertion a boundary-straddling exposure integrates code+black
+// instead of code_s + code_s+1. Black is not an interferer: it scales the
+// photometry, and the local threshold adapts per cell. One-signal channel by
+// transmit construction, at 60 distinct frames/s and the same 4K60 camera
+// settings as every comparable take. Costs half the light; raise screen
+// brightness. The panel holds 120Hz alternation (smear test: 0.3-1.8px).
+const STROBE = q.get('strobe') === '1';
 
 const c = document.getElementById('c'), hud = document.getElementById('hud');
 const msg = document.getElementById('msg');
@@ -89,9 +100,26 @@ function start(){
   requestAnimationFrame(tick);
 }
 
+let phase = 0;   // strobe phase: even = code, odd = black
 function tick(){
   const now = performance.now();
   const cd = CD - (now - t0)/1000;
+  if (STROBE && (phase++ & 1)){
+    // dark half of the strobe cycle. Full black, no text: the countdown text
+    // must strobe too, or the AE lock is taken against brighter frames than
+    // the payload and the exposure comes out wrong for the code.
+    ctx.fillStyle = '#000'; ctx.fillRect(0, 0, c.width, c.height);
+    fpsN++;
+    if (now - fpsT > 1000){
+      const f = fpsN*1000/(now-fpsT);
+      hud.textContent = `${c.width}x${c.height} strobe ${f.toFixed(1)}fps `
+        + `loop ${loops+1}/${LOOPS}`
+        + (f < 100 ? '  <-- BELOW 120, strobe is broken at this rate' : '');
+      fpsN = 0; fpsT = now;
+    }
+    requestAnimationFrame(tick);
+    return;
+  }
   if (cd > 0){
     // Countdown over REAL code frames, so an AE/AF lock taken during it
     // carries over to the payload unchanged, and every lead frame still
