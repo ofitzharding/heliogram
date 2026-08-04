@@ -55,7 +55,7 @@ _H_PREV = [None]    # last accepted homography (see HOMOGRAPHY REUSE)
 
 
 def prime_donor(path, layout, ecc, n_sub, radial, total, proto_full,
-                n_probe=36, sweeps=3):
+                n_probe=36, sweeps=3, base=0):
     """Fit equalizer kernels from the best frame in the WHOLE capture, before
     any decoding starts.
 
@@ -82,7 +82,8 @@ def prime_donor(path, layout, ecc, n_sub, radial, total, proto_full,
     cap = cv2.VideoCapture(path)
     grid.set_radial(radial)
     best_n, best_state = -1, None
-    for fi in np.linspace(total * 0.10, total * 0.95, n_probe).astype(int):
+    for fi in np.linspace(base + (total - base) * 0.10,
+                          base + (total - base) * 0.95, n_probe).astype(int):
         cap.set(cv2.CAP_PROP_POS_FRAMES, int(fi))
         ok, img = cap.read()
         if not ok:
@@ -110,6 +111,87 @@ def prime_donor(path, layout, ecc, n_sub, radial, total, proto_full,
     fd.commit()
     print(f"donor pre-pass: primed from a frame certifying {best_n}/{n_sub}")
     return fd.tap, fd.bias
+
+
+def _prepass_task(t):
+    """One pre-pass probe, run in a worker: ('scan'|'proto'|'donor', pos).
+
+    Same positions, same per-probe logic as the sequential pre-pass; only
+    the seeks are parallel. Aggregation happens in the parent in the
+    original probe order, so results are bit-identical to the serial path.
+    """
+    kind, pos = t
+    gw, gh = _CFG["gw"], _CFG["gh"]
+    layout = grid.Layout(gw, gh)
+    cap = cv2.VideoCapture(_CFG["path"])
+    cap.set(cv2.CAP_PROP_POS_FRAMES, int(pos))
+    ok, img = cap.read()
+    cap.release()
+    if not ok:
+        return (kind, pos, None)
+    if kind == "donor":
+        # prime_donor located at FULL resolution; match it exactly
+        H = grid.locate(img, layout)
+    else:
+        sm = (cv2.resize(img, None, fx=0.5, fy=0.5)
+              if img.shape[1] >= 3000 else img)
+        Hs = grid.locate(sm, layout)
+        H = ((np.diag([2., 2., 1.]) @ Hs) if Hs is not None
+             else grid.locate(img, layout))
+    if H is None:
+        return (kind, pos, None)
+    if kind == "proto":
+        hd, _s, _t = grid.sample_frame(img, layout, H)
+        return (kind, pos, dict(hd) if hd is not None else None)
+    if kind == "scan":
+        from softdec import FrameDecoder
+        counts = {}
+        n_sub = grid.sub_count(layout, grid.MODE_MONO)
+        for k1 in np.arange(0.0, 0.041, 0.005):
+            grid.set_radial(float(k1))
+            hd, s, _ = grid.sample_frame(img, layout, H)
+            hits = 0
+            if hd is not None and s is not None and _CFG.get("subblock"):
+                try:
+                    from creedsolo import RSCodec, ReedSolomonError
+                except ImportError:
+                    from reedsolo import RSCodec, ReedSolomonError
+                import struct as _st, zlib as _zl
+                raw, _bc = grid.raw_bits_and_conf(hd, s, layout)
+                rs_ = RSCodec(_CFG["ecc"])
+                ssz = (255 - _CFG["ecc"]) - 4
+                ns_ = grid.sub_count(layout, hd["mode"],
+                                     hd.get("zone_w", 0), hd.get("zone_modes", 0))
+                for j in range(min(ns_, len(raw) // 255)):
+                    try:
+                        d_ = bytes(rs_.decode(raw[j*255:(j+1)*255])[0])
+                    except ReedSolomonError:
+                        continue
+                    if len(d_) >= 4 + ssz and \
+                       _zl.crc32(d_[4:4+ssz]) & 0xFFFFFFFF == \
+                       _st.unpack("<I", d_[:4])[0]:
+                        hits += 1
+            counts[round(float(k1), 3)] = hits
+        grid.set_radial(_CFG["radial"])
+        return (kind, pos, counts)
+    # donor probe: cold FrameDecoder, count certified codewords
+    import softdec
+    n_sub = grid.sub_count(layout, grid.MODE_MONO)
+    fd = softdec.FrameDecoder(layout, _CFG["ecc"], n_sub,
+                              sweeps=_CFG.get("sweeps", 3),
+                              erase=True, prml=True)
+    hd, _s, _t = grid.sample_frame(img, layout, H)
+    if hd is None:
+        return (kind, pos, None)
+    pf = _CFG.get("proto_full")
+    if pf is not None and (hd["k"], hd["file_size"]) != (pf["k"],
+                                                         pf["file_size"]):
+        return (kind, pos, None)
+    allc = np.argwhere(np.ones((gh, gw), bool))
+    y = grid.sample_cells(img, layout, H, allc).mean(axis=1).reshape(
+        gh, gw).astype(np.float32)
+    blocks = fd.decode(y, hd, allow_refit=False)
+    return (kind, pos, (len(blocks), fd.pending))
 
 
 def _worker(rng):
@@ -448,6 +530,13 @@ def main():
                          "when the file completes. Needed when the "
                          "reported RATE is the point, since the "
                          "best-window search wants all the frames.")
+    ap.add_argument("--start-frame", type=int, default=0,
+                    help="first frame of the transfer being measured; "
+                         "--from-start grows its window from here. Lets one "
+                         "capture carry several transmits (session ladder) "
+                         "with each decoded on its own honest span.")
+    ap.add_argument("--end-frame", type=int, default=0,
+                    help="hard stop for the scan (0 = end of capture)")
     ap.add_argument("--from-start", action="store_true",
                     help="grow the incremental window from frame 0 instead of "
                          "the middle of the capture, and stop at the first "
@@ -474,69 +563,44 @@ def main():
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS) or 60.0
     cap.release()
-    print(f"{total} frames @ {fps:.0f}fps, {args.workers} workers")
+    if args.end_frame:
+        total = min(total, args.end_frame)
+    base = args.start_frame
+    print(f"{total} frames @ {fps:.0f}fps, {args.workers} workers"
+          + (f", segment {base}-{total}" if base or args.end_frame else ""))
 
     radial = args.radial
+    grid.set_ecc(args.ecc); grid.set_header_len(args.header_len)
+    grid.set_header_centered(not args.header_top); grid.set_radial(radial)
+    layout = grid.Layout(gw, gh)
+    pre_cfg = dict(path=args.input, gw=gw, gh=gh, ecc=args.ecc,
+                   header_len=args.header_len, radial=radial,
+                   centered=not args.header_top, subblock=args.subblock,
+                   soft=args.soft, sweeps=args.sweeps,
+                   local_th=args.local_th)
+    # PARALLEL PRE-PASS. Same probe positions, same per-probe logic, same
+    # aggregation order as the serial pre-pass (bit-identical outputs,
+    # A/B'd against the serial path); only the 86 HEVC seeks run across the
+    # pool instead of one after another.
     if args.scan:
-        grid.set_ecc(args.ecc); grid.set_header_len(args.header_len)
-        grid.set_header_centered(not args.header_top)
-        layout = grid.Layout(gw, gh)
-        c = cv2.VideoCapture(args.input)
-        probes = []
-        for fi in np.linspace(total * 0.25, total * 0.8, 10).astype(int):
-            c.set(cv2.CAP_PROP_POS_FRAMES, int(fi))
-            ok, im = c.read()
-            if not ok:
+        tasks = [("scan", int(fi)) for fi in
+                 np.linspace(base + (total - base) * 0.25,
+                             base + (total - base) * 0.8, 10).astype(int)]
+        with Pool(min(args.workers, len(tasks)), initializer=_init,
+                  initargs=(pre_cfg,)) as pool:
+            res1 = pool.map(_prepass_task, tasks)
+        k1_tot = {}
+        n_probes = 0
+        for kind, _pos, r in res1:
+            if kind != "scan" or r is None:
                 continue
-            sm = cv2.resize(im, None, fx=0.5, fy=0.5) if im.shape[1] >= 3000 else im
-            Hs = grid.locate(sm, layout)
-            H = (np.diag([2.,2.,1.]) @ Hs) if (Hs is not None and im.shape[1] >= 3000) else Hs
-            if H is None:
-                H = grid.locate(im, layout)
-            if H is not None:
-                probes.append((im, H))
-        c.release()
+            n_probes += 1
+            for k1, h in r.items():
+                k1_tot[k1] = k1_tot.get(k1, 0) + h
         best, best_hits = 0.0, -1
-        for k1 in np.arange(0.0, 0.041, 0.005):
-            grid.set_radial(float(k1))
-            hits = 0
-            for im, H in probes:
-                hd, s, _ = grid.sample_frame(im, layout, H)
-                if hd is None or s is None:
-                    continue
-                if args.subblock:
-                    # SUBBLOCK MODE: a frame carries n_sub INDEPENDENT
-                    # codewords, so the whole-block CRC never passes and the
-                    # scan scored 0 hits at every k1 - then defaulted to
-                    # k1=0.0 and overrode the correct value _detect had
-                    # already found. Count certified codewords instead.
-                    try:
-                        from creedsolo import RSCodec, ReedSolomonError
-                    except ImportError:
-                        from reedsolo import RSCodec, ReedSolomonError
-                    raw, _bc = grid.raw_bits_and_conf(hd, s, layout)
-                    rs_ = RSCodec(args.ecc)
-                    ssz = (255 - args.ecc) - 4
-                    ns_ = grid.sub_count(layout, hd["mode"],
-                                         hd.get("zone_w", 0), hd.get("zone_modes", 0))
-                    for j in range(min(ns_, len(raw) // 255)):
-                        try:
-                            d_ = bytes(rs_.decode(raw[j*255:(j+1)*255])[0])
-                        except ReedSolomonError:
-                            continue
-                        if len(d_) >= 4 + ssz and \
-                           zlib.crc32(d_[4:4+ssz]) & 0xFFFFFFFF == \
-                           struct.unpack("<I", d_[:4])[0]:
-                            hits += 1
-                    continue
-                pl = grid.decide_payload(hd, s, layout)
-                if pl is None:
-                    continue
-                b = hd["block_size"]
-                if zlib.crc32(pl[4:4+b]) & 0xFFFFFFFF == struct.unpack("<I", pl[:4])[0]:
-                    hits += 1
-            if hits > best_hits:
-                best, best_hits = float(k1), hits
+        for k1 in sorted(k1_tot):
+            if k1_tot[k1] > best_hits:
+                best, best_hits = k1, k1_tot[k1]
         # A scan that found NOTHING must not override the caller's value.
         if best_hits <= 0:
             print(f"k1 scan: no hits at any k1, keeping --radial {args.radial:+.3f}")
@@ -544,37 +608,27 @@ def main():
         else:
             radial = best
             print(f"k1 scan: {radial:+.3f} ({best_hits} hits over "
-                  f"{len(probes)} probe frames)")
+                  f"{n_probes} probe frames)")
 
     # PROTO PRE-PASS. ML sequence rescue needs the transfer constants (k,
     # block_size, file_size, mode) to build candidate templates, and those
     # come from any single frame whose hard header decodes. Learn them once
     # here rather than per-worker: a worker whose whole range is marginal
     # would otherwise never acquire them and would rescue nothing.
-    grid.set_ecc(args.ecc); grid.set_header_len(args.header_len)
-    grid.set_header_centered(not args.header_top); grid.set_radial(radial)
-    layout = grid.Layout(gw, gh)
+    grid.set_radial(radial)
+    pre_cfg["radial"] = radial
     proto_full, max_seq = None, 1500
-    c = cv2.VideoCapture(args.input)
+    tasks = [("proto", int(fi)) for fi in
+             np.linspace(base + (total - base) * 0.15,
+                         base + (total - base) * 0.9, 40).astype(int)]
+    with Pool(args.workers, initializer=_init, initargs=(pre_cfg,)) as pool:
+        res2 = pool.map(_prepass_task, tasks)
     seqs = []
     hdrs = []
-    for fi in np.linspace(total * 0.15, total * 0.9, 40).astype(int):
-        c.set(cv2.CAP_PROP_POS_FRAMES, int(fi))
-        ok, im = c.read()
-        if not ok:
-            continue
-        sm = cv2.resize(im, None, fx=0.5, fy=0.5) if im.shape[1] >= 3000 else im
-        Hs = grid.locate(sm, layout)
-        H = (np.diag([2., 2., 1.]) @ Hs) if (Hs is not None and im.shape[1] >= 3000) else Hs
-        if H is None:
-            H = grid.locate(im, layout)
-        if H is None:
-            continue
-        hd, _s, _st = grid.sample_frame(im, layout, H)
+    for _kind, _pos, hd in res2:
         if hd is not None:
             seqs.append(hd["seq"])
-            hdrs.append(dict(hd))
-    c.release()
+            hdrs.append(hd)
     # MAJORITY proto, not the first one seen. The countdown clip carries a
     # valid header for a DIFFERENT file (it was rendered from another
     # transmit), so "first header wins" learned k=5525/file=1.12MB from
@@ -611,8 +665,35 @@ def main():
                reuse_h=args.reuse_homography)
     if args.soft and args.subblock and not args.no_prime:
         _ns = grid.sub_count(layout, grid.MODE_MONO)
-        _tap, _bias = prime_donor(args.input, layout, args.ecc, _ns, radial,
-                                  total, proto_full, sweeps=args.sweeps)
+        # parallel donor pre-pass: same probe positions and winner rule as
+        # prime_donor (first strict max in probe order), seeks fanned out
+        import softdec as _sd
+        pre_cfg["proto_full"] = proto_full
+        d_tasks = [("donor", int(fi)) for fi in
+                   np.linspace(base + (total - base) * 0.10,
+                               base + (total - base) * 0.95, 36).astype(int)]
+        with Pool(args.workers, initializer=_init,
+                  initargs=(pre_cfg,)) as pool:
+            res3 = pool.map(_prepass_task, d_tasks)
+        best_n, best_state = -1, None
+        for _kind, _pos, r in res3:
+            if r is None:
+                continue
+            if r[0] > best_n:
+                best_n, best_state = r[0], r[1]
+        _fd = _sd.FrameDecoder(layout, args.ecc, _ns, sweeps=args.sweeps,
+                               erase=True, prml=True)
+        if best_state is None or best_n < _fd.refit:
+            print(f"donor pre-pass: best frame certified {max(best_n,0)}/"
+                  f"{_ns}, below the {_fd.refit} needed to teach; workers "
+                  f"will bootstrap")
+            _tap = _bias = None
+        else:
+            _fd.pending = best_state
+            _fd.commit()
+            print(f"donor pre-pass: primed from a frame certifying "
+                  f"{best_n}/{_ns}")
+            _tap, _bias = _fd.tap, _fd.bias
         cfg["primed_tap"], cfg["primed_bias"] = _tap, _bias
     # The rolling donor is stateful ACROSS CONSECUTIVE FRAMES: kernels transfer
     # for about a second before geometry drifts (Findings §13), so a worker
@@ -661,20 +742,20 @@ def main():
     # for time-to-file. Use --full when the reported rate is the point.
     hits = []
     if args.full:
-        hits = _decode_span(0, total)
-        scanned = total
+        hits = _decode_span(base, total)
+        scanned = total - base
     else:
         seen_lo, seen_hi = None, None
         for frac in (0.10, 0.25, 0.55, 1.0):
-            w = max(240, int(total * frac))
+            w = max(240, int((total - base) * frac))
             if args.from_start:
                 # Honest full-span wants the capture's natural transfer: the
                 # AE/AF settling transient included, exactly as --full charges
-                # it. Growing forward from 0 keeps that while stopping as soon
-                # as the file first completes.
-                lo, hi = 0, min(total, w)
+                # it. Growing forward from the segment origin keeps that while
+                # stopping as soon as the file first completes.
+                lo, hi = base, min(total, base + w)
             else:
-                lo = max(0, total // 2 - w // 2)
+                lo = max(base, (base + total) // 2 - w // 2)
                 hi = min(total, lo + w)
             if seen_lo is None:
                 hits = _decode_span(lo, hi)

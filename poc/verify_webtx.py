@@ -20,7 +20,39 @@ from codec import fountain, grid
 from analyze_strobe import truth_cells
 
 
-def verify(d):
+def _verify_chunk(t):
+    """Worker: bit-compare frames [a, b) of one dir. Returns bad count."""
+    d, a, b = t
+    d = Path(d)
+    meta = json.load(open(d / "meta.json"))
+    gw, gh, nf = meta["gw"], meta["gh"], meta["frames"]
+    grid.set_ecc(meta["ecc"]); grid.set_header_len(28)
+    grid.set_header_centered(True)
+    L = grid.Layout(gw, gh)
+    n_sub = grid.sub_count(L, grid.MODE_MONO)
+    payload = Path(__file__).parent.parent / "demo" / meta["name"]
+    data = payload.read_bytes()
+    enc = fountain.Encoder(data, meta["sub"])
+    bpf = meta["bytes_per_frame"]
+    scratch = {}
+    bad = 0
+    with open(d / "frames.bin", "rb") as f:
+        f.seek(a * bpf)
+        for seq in range(a, b):
+            chunk = np.frombuffer(f.read(bpf), np.uint8)
+            if len(chunk) < bpf:
+                return b - a
+            want = truth_cells(L, enc, n_sub, meta["sub"], len(data), seq,
+                               cache=scratch)
+            got = np.unpackbits(chunk)[:gw * gh].reshape(gh, gw)
+            if not np.array_equal(got, want.astype(np.uint8)):
+                bad += 1
+            scratch.clear()
+    return bad
+
+
+def verify(d, workers=10):
+    from multiprocessing import Pool
     meta = json.load(open(d / "meta.json"))
     gw, gh, nf = meta["gw"], meta["gh"], meta["frames"]
     grid.set_ecc(meta["ecc"]); grid.set_header_len(28)
@@ -33,20 +65,10 @@ def verify(d):
     if (n_sub, enc.k, len(data)) != (meta["n_sub"], meta["k"],
                                      meta["file_size"]):
         return f"META MISMATCH n_sub/k/size"
-    bpf = meta["bytes_per_frame"]
-    scratch = {}
-    bad = 0
-    with open(d / "frames.bin", "rb") as f:
-        for seq in range(nf):
-            chunk = np.frombuffer(f.read(bpf), np.uint8)
-            if len(chunk) < bpf:
-                return f"TRUNCATED at frame {seq}"
-            want = truth_cells(L, enc, n_sub, meta["sub"], len(data), seq,
-                               cache=scratch)
-            got = np.unpackbits(chunk)[:gw * gh].reshape(gh, gw)
-            if not np.array_equal(got, want.astype(np.uint8)):
-                bad += 1
-            scratch.clear()
+    step = max(50, nf // workers)
+    tasks = [(str(d), a, min(a + step, nf)) for a in range(0, nf, step)]
+    with Pool(workers) as pool:
+        bad = sum(pool.map(_verify_chunk, tasks))
     return "CLEAN" if bad == 0 else f"{bad}/{nf} frames MISMATCH"
 
 
