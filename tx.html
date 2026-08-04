@@ -14,7 +14,7 @@ canvas{display:block;width:100vw;height:100vh}
 //     ffplay fullscreen native    19/1000
 //     this canvas                  0/1000, header OK
 // The canvas backing store is sized in DEVICE pixels, so drawImage lands 1:1
-// on the panel with no compositor resampling. This is also how decimen does
+// on the panel with no compositor resampling. This is also how the reference tool does
 // it, which is a large part of why their numbers hold up.
 const q = new URLSearchParams(location.search);
 const SRC   = q.get('src')   || 'demo/tx.mp4';

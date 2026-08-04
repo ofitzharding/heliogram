@@ -4,7 +4,7 @@ soft_decode.py — partial-frame recovery via sub-block granularity + soft erasu
 
 THE PROBLEM THIS ATTACKS
 ------------------------
-Measured: only ~38% of captured frames yield anything, while decimen's
+Measured: only ~38% of captured frames yield anything, while the reference tool's
 QR-based receiver gets near 100%. That 2.6x is larger than every density or
 constellation gain in this project combined, so it is the real bottleneck.
 

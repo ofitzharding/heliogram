@@ -1075,8 +1075,8 @@ def main():
               f"window alone and bit-identical")
         print(f"LINK RATE {gw_:.1f} KB/s")
         g = max(g, gw_)
-    print(f"  vs decimen handheld 128 KB/s : {g/128:.2f}x")
-    print(f"  vs decimen propped  186 KB/s : {g/186:.2f}x")
+    print(f"  vs reference handheld 128 KB/s : {g/128:.2f}x")
+    print(f"  vs reference propped  186 KB/s : {g/186:.2f}x")
 
 
 if __name__ == "__main__":

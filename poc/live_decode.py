@@ -165,8 +165,8 @@ def main():
     print(f"\nrecovered {len(data):,} bytes  "
           f"sha256 {hashlib.sha256(data).hexdigest()}")
     print(f"transfer span {span:.2f}s")
-    print(f"GOODPUT {g:.1f} KB/s   ({g/129.2:.2f}x decimen-handheld, "
-          f"{g/186.0:.2f}x decimen-propped)")
+    print(f"GOODPUT {g:.1f} KB/s   ({g/129.2:.2f}x reference-handheld, "
+          f"{g/186.0:.2f}x reference-propped)")
 
 
 if __name__ == "__main__":

@@ -338,7 +338,7 @@ def main():
     goodput = len(data) / span / 1024
     print(f"recovered          {len(data):,} bytes  sha256 {hashlib.sha256(data).hexdigest()[:16]}")
     print(f"transfer span      {span:.2f}s (frame {first_useful} -> {frames_at_done} @ {fps:.0f}fps)")
-    print(f"GOODPUT            {goodput:.1f} KB/s   ({goodput/129.2:.2f}x decimen)")
+    print(f"GOODPUT            {goodput:.1f} KB/s   ({goodput/129.2:.2f}x reference)")
     print(f"decode wall time   {wall:.1f}s "
           f"({'faster' if wall < seconds_of_video else 'SLOWER'} than realtime)")
 

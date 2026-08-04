@@ -1,7 +1,7 @@
 #!/bin/bash
 # 120 fps TAKE. The panel is ProMotion and reports 1512x982 @ 120.00Hz, but
 # every transmit in this project has been rendered at 60 fps - so half the
-# channel has never been used. decimen's own README says its 128 KB/s headline
+# channel has never been used. the reference tool reports its 128 KB/s headline
 # figure comes from "a 120 fps ProMotion sender"; we have been comparing a
 # half-rate link against a full-rate one.
 #
@@ -67,5 +67,5 @@ stop recording, AirDrop it, then:
       --grid 252x163 --ecc 48 --subblock --soft --scan --full
 
 Read GOODPUT (full span), not BEST WINDOW. Full span is the honest
-time-to-file number and the only one comparable to decimen's.
+time-to-file number and the only one comparable to the reference tool's.
 EOF

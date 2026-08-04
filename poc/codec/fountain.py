@@ -2,7 +2,7 @@
 
 Deterministic: block seq number seeds the PRNG, so transmitter and receiver
 agree on each block's composition with no back-channel. This is the same
-scheme decimen/RaptorQR use; ours additionally exposes a path for
+scheme prior tools use; ours additionally exposes a path for
 soft-decision decoding later (see decode notes in ../decode.py).
 """
 from __future__ import annotations

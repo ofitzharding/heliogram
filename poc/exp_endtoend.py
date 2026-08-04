@@ -11,7 +11,7 @@ MANY frames of a real capture and multiplies out:
   -> calibrated LLR -> LDPC (rate 0.625) -> codewords recovered
 
 and reports KB/s of decoded information over WALL CLOCK, which is the only
-figure comparable to decimen's 128 KB/s handheld.
+figure comparable to the reference tool's 128 KB/s handheld.
 
 Every certified-frame role is production-honest: kernels come from a frame
 the fountain layer certifies, calibration from another, evaluation on a
@@ -146,7 +146,7 @@ def main():
     hdr_yield = len(frames) / len(idxs)
     print(f"header yield measured: {100*hdr_yield:.0f}%  -> realistic "
           f"{tot_info/n_eval*60*hdr_yield:.1f} KB/s")
-    print(f"\ndecimen: 128 KB/s handheld, 186 propped")
+    print(f"\nreference baseline: 128 KB/s handheld, 186 propped")
 
 
 if __name__ == "__main__":

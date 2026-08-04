@@ -1,7 +1,7 @@
 # heliogram
 
 Send a file from your laptop to your phone as light, no network involved.
-**208.2 KB/s, hand-held, bit-exact**, verified against decimen-optical-transfer
+**208.2 KB/s, hand-held, bit-exact**, verified against a prior published optical-transfer tool
 (128 KB/s hand-held, 186 KB/s propped).
 
 A heliograph is the instrument that sent messages across air gaps by flashing

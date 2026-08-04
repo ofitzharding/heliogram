@@ -37,7 +37,7 @@ PROFILES = {
     "fast": dict(grid="203x112", mode="gray4", cell_px=14, ecc=48,
                  raw_kbs=252.7, subblock=True,
                  note="4 grey levels + per-codeword fountain symbols; "
-                      "174.3 KB/s bit-exact in validation = 1.36x decimen"),
+                      "174.3 KB/s bit-exact in validation = 1.36x reference"),
     "safe": dict(grid="252x140", mode="mono", cell_px=12, ecc=48,
                  raw_kbs=197.8, subblock=True,
                  note="binary at 13.1 camera-px/cell; the profile proven bit-exact"),

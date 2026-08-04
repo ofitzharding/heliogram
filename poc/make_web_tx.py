@@ -10,7 +10,7 @@ says. Raising the file's frame rate does not help if the player cannot keep up.
 A browser canvas can: requestAnimationFrame fires once per refresh, and this
 project already measured the canvas path as the SHARPEST transmitter available
 here - 0/1000 mid-band pixels against ffplay fullscreen's 19/1000 and a
-1512-point ffplay window's 981/1000 (see tx.html). decimen presents in a
+1512-point ffplay window's 981/1000 (see tx.html). the reference tool presents in a
 browser for the same reason.
 
 But drawing from a <video> element re-imposes the codec's clock. So this dumps

@@ -204,7 +204,7 @@ def main():
     print("\n   The gap between hold=1 and hold=4 at fixed density IS the")
     print("   exposure-sync contribution: optics are pinned across the whole")
     print("   take, so nothing else can explain a difference between rows.")
-    print("   decimen reference: 128 KB/s handheld, 186 propped.")
+    print("   reference baseline: 128 KB/s handheld, 186 propped.")
 
 
 if __name__ == "__main__":

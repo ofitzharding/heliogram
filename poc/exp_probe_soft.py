@@ -7,7 +7,7 @@ The 110.0 KB/s headline from the probe take was produced by
 analyze_probe.py: plain threshold + hard RS. None of the machinery this
 project exists to test was involved. At 252x140 the density carries 194.9
 KB/s at full yield and the conventional path harvested 56.4% of it, so
-beating decimen's 128 KB/s needs 66% yield - a 10-point gap, not a
+beating the reference tool's 128 KB/s needs 66% yield - a 10-point gap, not a
 different order of magnitude.
 
 This measures what tile-PRML with certified-label kernels does to that gap,
@@ -164,7 +164,7 @@ def main():
           f"{rate*y0:.1f} KB/s")
     print(f"certified-label, ROLLING donor       : {100*y1:.1f}% yield -> "
           f"{rate*y1:.1f} KB/s")
-    print(f"\ndecimen handheld: 128 KB/s   "
+    print(f"\nreference baseline handheld: 128 KB/s   "
           f"({'PASSED' if rate*y1 > 128 else 'short by %.1f' % (128 - rate*y1)})")
 
 
