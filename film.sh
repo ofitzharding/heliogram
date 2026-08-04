@@ -93,6 +93,45 @@ EOF
   read -r; pkill -f "http.server 8000"; dock false
   echo "AirDrop it, then:  python3 poc/fast_decode.py ~/Downloads/IMG_XXXX.MOV /tmp/out.bin --grid 252x163 --ecc 48 --subblock --soft --scan --full"
   ;;
+11)
+  cat <<'EOF'
+------------------------------------------------------------------
+  11PX AT 120 FPS - the composition take. 274x178 cells, 11 px each,
+  22 codewords/frame, CEILING 523.4 KB/s. 200 KB/s needs 38.2% yield.
+  Camera: 4K at ONE HUNDRED TWENTY fps (Settings > Camera > Record
+  Video > 4K/120). Screen brightness HIGH.
+
+  Safari opens at the transmitter. Click for fullscreen; watch the
+  HUD: it must say ~120fps. Record countdown + ~6 loops.
+------------------------------------------------------------------
+EOF
+  quiet_start; sleep 6
+  pkill -f "http.server 8000" 2>/dev/null
+  (python3 -m http.server 8000 >/tmp/heliogram_httpd.log 2>&1 &)
+  sleep 1; dock true
+  open -a Safari "http://localhost:8000/tx120.html?dir=demo/webtx11&loops=6"
+  echo "server up; press enter here when the take is done to stop it"
+  read -r; pkill -f "http.server 8000"; dock false
+  echo "AirDrop it, then:  python3 poc/fast_decode.py ~/Downloads/IMG_XXXX.MOV /tmp/out.bin --grid 274x178 --ecc 48 --subblock --soft --scan --from-start"
+  ;;
+strobe11)
+  cat <<'EOF'
+------------------------------------------------------------------
+  11PX STROBE.  274x178 at 11 px, code on even refreshes, black on
+  odd.  Camera: 4K at 60 fps.  SCREEN BRIGHTNESS: MAXIMUM - the AE
+  lock must land at <= 1/120 s or mixing returns; the capture
+  self-reports it (poc/analyze_strobe.py --grid 274x178).
+------------------------------------------------------------------
+EOF
+  quiet_start; sleep 6
+  pkill -f "http.server 8000" 2>/dev/null
+  (python3 -m http.server 8000 >/tmp/heliogram_httpd.log 2>&1 &)
+  sleep 1; dock true
+  open -a Safari "http://localhost:8000/tx120.html?dir=demo/webtx11&strobe=1&loops=5"
+  echo "server up; press enter here when the take is done to stop it"
+  read -r; pkill -f "http.server 8000"; dock false
+  echo "AirDrop it, then:  python3 poc/fast_decode.py ~/Downloads/IMG_XXXX.MOV /tmp/out.bin --grid 274x178 --ecc 48 --subblock --soft --scan --from-start"
+  ;;
 *)
-  echo "usage: ./film.sh density | strobe | 120"; exit 1 ;;
+  echo "usage: ./film.sh density | strobe | 120 | 11 | strobe11"; exit 1 ;;
 esac
