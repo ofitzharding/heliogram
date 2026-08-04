@@ -44,6 +44,7 @@ def _init(cfg):
     _K1[0] = cfg["radial"]
     grid.set_local_threshold(cfg.get("local_th", grid.LOCAL_TH))
     _H_PREV[0] = None
+    _LAST_HARD[0] = None
     grid.set_phase_hint(None)
 
 
@@ -52,6 +53,7 @@ _FD = [None]        # per-process FrameDecoder, holds the rolling kernel donor
 _ALLC = [None]
 _K1 = [0.0]         # per-worker tracked radial coefficient
 _H_PREV = [None]    # last accepted homography (see HOMOGRAPHY REUSE)
+_LAST_HARD = [None] # (seq, frame) of the last HARD header: anchors ML rescue
 
 
 def prime_donor(path, layout, ecc, n_sub, radial, total, proto_full,
@@ -243,6 +245,7 @@ def _worker(rng):
             continue
         if header is not None:
             _H_PREV[0] = H
+            _LAST_HARD[0] = (int(header["seq"]), n)
             # only one whitening phase can match a given seq, so predicting the
             # next seq collapses ten doomed RS decodes into one
             grid.set_phase_hint(int(header["seq"]) + 1)
@@ -265,6 +268,20 @@ def _worker(rng):
             seq, margin = grid.ml_header_seq(hl, _TEMPLATES[0])
             if margin < _CFG.get("ml_margin", 3.0):
                 continue
+            # SEQ-CONSISTENCY GATE. A rescued seq that certifies blocks under
+            # a WRONG index poisons the fountain invisibly (the ladder take's
+            # 12px rung closed to a corrupt file exactly this way: text/blur
+            # frames failed hard headers, the correlation guessed, and
+            # CRC-valid content landed on wrong indices). seq advances by
+            # exactly the frame delta on this channel (measured, wraps aside),
+            # so a rescue that disagrees with the last hard header's
+            # prediction is a guess, not a rescue: drop the frame.
+            if _LAST_HARD[0] is not None:
+                ls, ln = _LAST_HARD[0]
+                if n - ln <= 50 and seq != ls + (n - ln):
+                    continue
+            else:
+                continue          # no hard anchor in this chunk yet: too risky
             header = dict(proto_full, seq=seq)
         elif proto_full is not None and (
                 header["k"], header["file_size"]) != (
@@ -753,6 +770,16 @@ def main():
                 # AE/AF settling transient included, exactly as --full charges
                 # it. Growing forward from the segment origin keeps that while
                 # stopping as soon as the file first completes.
+                #
+                # Window floor: closure needs ~k/n_sub frames at full yield,
+                # so a first window below 1.25x that arithmetic minimum is a
+                # guaranteed miss and a wasted pool cycle. Scanning more
+                # frames changes nothing about the result: per-frame decoding
+                # and the first-closure span are identical either way.
+                if proto_full is not None:
+                    _ns_f = grid.sub_count(layout, grid.MODE_MONO)
+                    _kk = -(-proto_full["file_size"] // proto_full["block_size"])
+                    w = max(w, int(1.25 * _kk / _ns_f))
                 lo, hi = base, min(total, base + w)
             else:
                 lo = max(base, (base + total) // 2 - w // 2)

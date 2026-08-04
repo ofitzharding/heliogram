@@ -170,8 +170,11 @@ function tick(){
     shown++;
     ctx.textAlign = 'center'; ctx.fillStyle = '#fff';
     ctx.font = `${Math.round(150*devicePixelRatio)}px -apple-system,monospace`;
+    // 30% height, NOT center: the header band lives in the middle rows,
+    // and numerals over the header force ML rescue on every countdown
+    // frame (the 12px corrupt-closure incident)
     ctx.fillText(cd > 3 ? Math.ceil(cd) : 'HOLD STILL',
-                 c.width/2, c.height/2);
+                 c.width/2, c.height*0.30);
     ctx.font = `${Math.round(26*devicePixelRatio)}px -apple-system,monospace`;
     ctx.fillText('TAP-HOLD TO LOCK AE/AF  -  do NOT touch the exposure slider',
                  c.width/2, c.height - 60*devicePixelRatio);
