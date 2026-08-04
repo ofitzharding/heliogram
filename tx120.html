@@ -1,8 +1,14 @@
 <!doctype html>
 <html><head><meta charset="utf-8"><title>heliogram tx 120</title><style>
-html,body{margin:0;background:#000;overflow:hidden;cursor:none}
+/* cursor:none on html/body alone does not cover the canvas in Safari, and a
+   cursor parked over the code is opaque pixels sitting on payload cells. */
+html,body,canvas,*{cursor:none !important}
+html,body{margin:0;background:#000;overflow:hidden}
 canvas{display:block;width:100vw;height:100vh}
+/* HUD is bright green over the code. Fine before the take, pollution during
+   it, so it is hidden once the payload starts (press h to peek). */
 #hud{position:fixed;left:10px;top:8px;color:#0f0;font:13px monospace;z-index:9}
+#hud.mid{display:none}
 #msg{position:fixed;left:0;right:0;top:45%;color:#fff;text-align:center;
      font:28px -apple-system,monospace;z-index:9}
 </style></head><body>
@@ -70,10 +76,20 @@ async function boot(){
   addEventListener('keydown', e => {
     if (e.key === 'f' || e.key === 'F') document.documentElement.requestFullscreen();
     if (e.key === ' ') start();
+    // peek at the rate mid-take without stopping; h toggles it back off
+    if (e.key === 'h' || e.key === 'H') hud.classList.toggle('mid');
   });
   addEventListener('click', () => document.documentElement.requestFullscreen());
   document.addEventListener('fullscreenchange', () => {
-    size(); if (document.fullscreenElement) start();
+    size();
+    if (document.fullscreenElement){
+      // Pointer lock is the only thing that reliably parks the cursor in
+      // Safari fullscreen; cursor:none still flashes it on mouse movement,
+      // and a flashed cursor is opaque pixels landing on payload cells.
+      const el = document.documentElement;
+      if (el.requestPointerLock) { try { el.requestPointerLock(); } catch(e){} }
+      start();
+    }
   });
 }
 
@@ -134,6 +150,7 @@ function tick(){
     ctx.fillText('TAP-HOLD TO LOCK AE/AF  -  do NOT touch the exposure slider',
                  c.width/2, c.height - 60*devicePixelRatio);
   } else {
+    if (!hud.classList.contains('mid')) hud.classList.add('mid');
     const i = shown % meta.frames;
     drawFrame(i);
     shown++;

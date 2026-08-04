@@ -16,6 +16,21 @@ dock() {
             -e "tell application \"System Events\" to tell dock preferences to set autohide menu bar to $1" 2>/dev/null
 }
 
+quiet_start() {
+  # A notification banner landing on the panel mid-take is opaque pixels on
+  # payload cells, and it steals focus from the transmitter. The background
+  # decodes/renders THIS project spawns are the usual source, so stop them for
+  # the duration rather than hoping they stay silent.
+  pkill -f "poc/fast_decode.py"     2>/dev/null
+  pkill -f "poc/analyze_"           2>/dev/null
+  pkill -f "poc/make_"              2>/dev/null
+  cat <<'QEOF'
+  >> Turn on Focus / Do Not Disturb now (Control Centre > Focus).
+  >> macOS 15 has no scriptable switch for it without a user shortcut, so
+  >> this is the one manual step. A banner over the code voids the take.
+QEOF
+}
+
 case "$MODE" in
 density)
   cat <<'EOF'
@@ -26,7 +41,7 @@ density)
   22s countdown, then 3 loops x 28s (~106s).
 ------------------------------------------------------------------
 EOF
-  sleep 4; dock true
+  quiet_start; sleep 6; dock true
   ffplay -v error -fs -alwaysontop -noborder -autoexit demo/_tx_density_lead.mp4
   ffplay -v error -fs -alwaysontop -noborder -loop 3 -autoexit demo/_tx_density.mp4
   dock false
@@ -48,7 +63,7 @@ strobe)
   ~120fps. Record through the countdown + ~5 loops, stop when DONE.
 ------------------------------------------------------------------
 EOF
-  sleep 4
+  quiet_start; sleep 6
   pkill -f "http.server 8000" 2>/dev/null
   (python3 -m http.server 8000 >/tmp/heliogram_httpd.log 2>&1 &)
   sleep 1; dock true
@@ -69,7 +84,7 @@ EOF
   HUD: it must say ~120fps. Record countdown + ~6 loops.
 ------------------------------------------------------------------
 EOF
-  sleep 4
+  quiet_start; sleep 6
   pkill -f "http.server 8000" 2>/dev/null
   (python3 -m http.server 8000 >/tmp/heliogram_httpd.log 2>&1 &)
   sleep 1; dock true
