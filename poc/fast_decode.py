@@ -46,6 +46,7 @@ def _init(cfg):
     _H_PREV[0] = None
     _LAST_HARD[0] = None
     _PREV_CW[0] = _PREV_CW[1] = None
+    _SEAM_PREV[0] = None
     grid.set_phase_hint(None)
 
 
@@ -56,6 +57,7 @@ _K1 = [0.0]         # per-worker tracked radial coefficient
 _H_PREV = [None]    # last accepted homography (see HOMOGRAPHY REUSE)
 _LAST_HARD = [None] # (seq, frame) of the last HARD header: anchors ML rescue
 _CW_ROWS = [None, None]  # codeword row bands + header rows, per layout
+_SEAM_PREV = [None]  # previous half-res gray-ish frame for seam locate
 _PREV_CW = [None, None]  # previous frame's (seq, {j: block bytes}): the
                          # straddle-ghost detector. A codeword certifying
                          # with the PREVIOUS frame's exact content is that
@@ -284,6 +286,20 @@ def _worker(rng):
                 H = Hs
             else:
                 H = (np.diag([2.0, 2.0, 1.0]) @ Hs) if img.shape[1] >= 3000 else Hs
+            if H is None and _SEAM_PREV[0] is not None:
+                # STROBE-SEAM LOCATE. At a short locked exposure the rolling
+                # seam splits each frame into a lit half and a black half:
+                # two finders dark, locate dies, though the lit half is pure
+                # clean code. The seam alternates sides at the clock beat, so
+                # the MAX of two consecutive frames shows all four finders.
+                # The composite is used ONLY to find geometry; sampling stays
+                # on the real frame. Handheld drift over 16 ms is sub-cell.
+                comp = np.maximum(small, _SEAM_PREV[0])
+                Hs = grid.locate(comp, layout)
+                if Hs is not None:
+                    H = ((np.diag([2.0, 2.0, 1.0]) @ Hs)
+                         if img.shape[1] >= 3000 else Hs)
+            _SEAM_PREV[0] = small
             if H is None:
                 _H_PREV[0] = None
                 continue
@@ -396,14 +412,21 @@ def _worker(rng):
                 if _CFG.get("track_k1"):
                     step = _CFG.get("k1_step", 0.0025)
                     base = _FD[0].quick_count(y)
-                    for d in (step, -step):
+                    # A perfect frame cannot be improved: quick_count is
+                    # bounded by n_sub and the hill-climb moves only on
+                    # STRICTLY greater, so skipping the neighbour samples
+                    # is exactly equivalent and saves two full resamples.
+                    if base >= n_sub:
+                        pass
+                    else:
+                     for d in (step, -step):
                         yc = _y(_K1[0] + d)
                         if _FD[0].quick_count(yc) > base:
                             base = _FD[0].quick_count(yc)
                             _K1[0] = round(_K1[0] + d, 5)
                             y = yc
                             break
-                    grid.set_radial(_K1[0])
+                     grid.set_radial(_K1[0])
 
                 def _resample(dx, dy, _H=H, _img=img, _L=layout, _a=allc):
                     ctr = np.stack([_a[:, 1] + 0.5 + dx, _a[:, 0] + 0.5 + dy],
@@ -850,6 +873,8 @@ def main():
             res = pool.map(_worker, rs)
         return sorted([h for r in res for h in r], key=lambda x: x[0])
 
+    ns_pool = grid.sub_count(layout, grid.MODE_MONO)
+
     def _conflict_filter(hs):
         """Drop every fountain index certified with CONFLICTING content.
 
@@ -870,6 +895,14 @@ def main():
                     bad.add(sq)
             else:
                 seen[sq] = b
+        # POOL-LEVEL GHOST SWEEP. The worker's detector only compares
+        # adjacent frames; here any index whose content equals the SAME
+        # position one seq earlier is a straddle ghost wherever its clean
+        # sighting came from (collision odds 2^-1600). The later index is
+        # the one carrying the earlier frame's rows: drop it.
+        for idx, b in list(seen.items()):
+            if seen.get(idx - ns_pool) == b:
+                bad.add(idx)
         if bad:
             print(f"  conflict filter: {len(bad)} poisoned indices dropped "
                   f"({len(hs)} hits)")

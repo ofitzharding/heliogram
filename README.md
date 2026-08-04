@@ -96,7 +96,7 @@ against the source:
 
 | capture | full span | best window |
 |---|---|---|
-| IMG_7924, 378x245 strobe rung, hand-held | **170.4 KB/s** | 170.4 KB/s |
+| IMG_7924, 378x245 strobe rung, hand-held | **229.7 KB/s** | 229.7 KB/s |
 | IMG_7920, 336x218 strobe rung, hand-held | 142.5 KB/s | 142.5 KB/s |
 | IMG_7872, 252x163, hand-held | 131.0 KB/s | **208.2 KB/s** |
 | earlier baseline take, 252x140 | 153.2 KB/s | 180.4 KB/s |
