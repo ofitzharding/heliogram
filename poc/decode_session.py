@@ -72,8 +72,6 @@ def segments(path, step_s=5):
         if g is None:
             continue
         if cur is None or cur[2] != g[2]:
-            if cur is not None:
-                segs.append((*cur[:1][0:0], *cur))   # noop guard
             cur = (g[0], g[1], g[2], f, f)
             segs.append(cur)
         else:
@@ -84,7 +82,7 @@ def segments(path, step_s=5):
     for i, s in enumerate(segs):
         f1 = segs[i + 1][3] if i + 1 < len(segs) else tot
         out.append((s[0], s[1], s[2], s[3], f1))
-    return out, fps
+    return out, fps, tot
 
 
 def main():
@@ -96,7 +94,7 @@ def main():
     results = []
     for cap_path in args.captures:
         print(f"\n===== {cap_path} =====")
-        segs, fps = segments(cap_path)
+        segs, fps, tot = segments(cap_path)
         for gw, gh, name, f0, f1 in segs:
             print(f"\n--- segment {name} ({gw}x{gh}) frames {f0}-{f1} ---")
             if not args.skip_gate:
@@ -105,8 +103,8 @@ def main():
                                     "analyze_strobe.py"), cap_path,
                      "--grid", f"{gw}x{gh}", "--payload", str(PAYLOAD),
                      "--frames", "12",
-                     "--lo", f"{f0 / (f1 + 1e-9):.3f}" if f1 else "0.05",
-                     "--hi", f"{min(0.99, (f1 - 1) / (f1 + 1e-9)):.3f}"])
+                     "--lo", f"{f0 / tot:.3f}",
+                     "--hi", f"{min(0.99, (f1 - 1) / tot):.3f}"])
             out = f"/tmp/session_{name}.bin"
             r = subprocess.run(
                 ["python3", str(Path(__file__).parent / "fast_decode.py"),

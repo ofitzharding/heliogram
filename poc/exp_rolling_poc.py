@@ -99,26 +99,79 @@ def main():
     pc = L.payload_cells
     nb = n_sub * 255
 
+    # RECEIVER-LEGAL SEAM ESTIMATION. The mixed band's cells sit near the
+    # decision threshold, so the demodulator's own per-row confidence dips
+    # there - no transmitter knowledge involved. Per frame: seam = argmin of
+    # the smoothed per-row confidence profile. The estimates are then
+    # phase-fitted (r = r0 + dr*f mod gh) and PREDICTION replaces per-frame
+    # estimation, like the header phase hint collapses RS attempts.
+    conf_rows = np.zeros(gh, np.float32)
+
+    def seam_from_conf(lum, conf):
+        """Seam row + signal strength from the MID-LEVEL FRACTION per row.
+
+        Mixed-band cells sit at the decision threshold, so the fraction of
+        low-|conf| cells per row spikes inside the band (~50%) and is ~0
+        elsewhere - a far sharper statistic than mean |conf|, which
+        high-confidence cells swamp. Receiver-legal: uses only the
+        demodulator's own confidences.
+        """
+        tau = 0.25 * np.median(np.abs(conf))
+        mid = (np.abs(conf) < tau).astype(np.float32)
+        prof = np.zeros(gh, np.float32)
+        cnt = np.zeros(gh, np.float32)
+        np.add.at(prof, pc[:, 0], mid)
+        np.add.at(cnt, pc[:, 0], 1)
+        prof = prof / np.maximum(cnt, 1)
+        k = np.ones(7, np.float32) / 7
+        sm_ = np.convolve(prof, k, "same")
+        r = int(np.argmax(sm_))
+        return r, float(sm_[r])
+
+    est = []                      # (f, estimated seam row)
     got_roll, got_base = {}, {}
+    frames_cache = {}
     for f in range(N_CAM):
-        seam = int(r0 + f * dr) % gh
+        seam_true = int(r0 + f * dr) % gh
         s_bot, s_top = 2 * f, 2 * f + 1
-        img = synth_camera_frame(frame(s_top), frame(s_bot), seam, mix)
+        img = synth_camera_frame(frame(s_top), frame(s_bot), seam_true, mix)
         H = grid.locate(img, L)
         if H is None:
             continue
         hd, _s, _t = grid.sample_frame(img, L, H)
         if hd is None:
             continue
-        s_hdr = int(hd["seq"])
-        # which side does the header band sit on this frame?
-        hdr_on_top = hdr_rows[1] < seam
-        exp_top, exp_bot = (s_hdr, s_hdr - 1) if hdr_on_top else \
-                           (s_hdr + 1, s_hdr)
         y = grid.sample_cells(img, L, H, allc).mean(axis=1).reshape(
             gh, gw).astype(np.float32)
         lum = y[pc[:, 0], pc[:, 1]]
         bits1d, conf = grid._mono_decide(lum, L, pc)
+        frames_cache[f] = (int(hd["seq"]), bits1d, conf)
+        r_est, strength = seam_from_conf(lum, conf)
+        est.append((f, r_est, strength))
+
+    # phase fit on the STRONG frames only (seam visibly inside the grid),
+    # unwrapping the sawtooth (seam advances dr, wraps at gh)
+    est.sort(key=lambda e: -e[2])
+    strong = est[: max(30, len(est) // 3)]
+    fs = np.array([e[0] for e in strong], np.float64)
+    rs_ = np.array([e[1] for e in strong], np.float64)
+    best_fit, best_err = None, 1e18
+    for dr_c in np.arange(2.0, 60.0, 0.05):
+        ph = (rs_ - dr_c * fs) % gh
+        med = np.median(ph)
+        err = np.median(np.abs((ph - med + gh / 2) % gh - gh / 2))
+        if err < best_err:
+            best_err, best_fit = err, (med, dr_c)
+    r0_est, dr_est = best_fit
+    print(f"seam fit: r0 {r0_est:.1f} (true {r0}), dr {dr_est:.2f} "
+          f"(true {dr}), median residual {best_err:.1f} rows")
+
+    for f, (s_hdr, bits1d, conf) in frames_cache.items():
+        seam = int(r0_est + f * dr_est) % gh
+        # which side does the header band sit on this frame?
+        hdr_on_top = hdr_rows[1] < seam
+        exp_top, exp_bot = (s_hdr, s_hdr - 1) if hdr_on_top else \
+                           (s_hdr + 1, s_hdr)
         bc = conf[: nb * 8].reshape(nb, 8).min(axis=1)
         blocks, _m, _b = fd.certify(bits1d, bc)
         for j, blk in blocks:

@@ -42,7 +42,7 @@ def main():
     ap.add_argument("--grid", default="252x163")
     ap.add_argument("--ecc", type=int, default=48)
     ap.add_argument("--payload", default=str(Path(__file__).parent.parent /
-                                             "demo" / "kitten.png"))
+                                             "demo" / "kitten_big.png"))
     ap.add_argument("--frames", type=int, default=40)
     ap.add_argument("--lo", type=float, default=0.05)
     ap.add_argument("--hi", type=float, default=0.95)
