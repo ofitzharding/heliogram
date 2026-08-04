@@ -157,6 +157,50 @@ EOF
   echo "AirDrop it, then gate with:  python3 poc/analyze_strobe.py ~/Downloads/IMG_XXXX.MOV --grid 302x196"
   echo "if framing+exposure pass:    python3 poc/fast_decode.py ~/Downloads/IMG_XXXX.MOV /tmp/out.bin --grid 302x196 --ecc 48 --subblock --soft --scan --from-start"
   ;;
+session)
+  cat <<'EOF'
+==================================================================
+  ONE SITTING, EVERYTHING.  Payload: kitten_big.png (1.1 MB).
+  Before starting: screen brightness MAXIMUM, Do Not Disturb ON,
+  camera at 4K/60, landscape, fill the frame, tap-hold AE/AF lock
+  during each countdown, never touch the exposure slider.
+
+  LEG 1  PROBE (15s film)  - gates exposure + framing, ~90s verdict
+  LEG 2  STROBE LADDER     - one ~3.5min take: 12/11/10/9 px, 45s each
+  LEG 3  ROLLING (4K60!)   - one ~2min take: 120fps transmit, plain
+                             camera. The rolling-shutter harvest.
+  LEG 4  SPEED (optional)  - camera to 4K/120 first: 11px at 120
+==================================================================
+EOF
+  quiet_start; sleep 4
+  pkill -f "http.server 8000" 2>/dev/null
+  (python3 -m http.server 8000 >/tmp/heliogram_httpd.log 2>&1 &)
+  sleep 1; dock true
+  echo ">>> LEG 1: film the screen for ~15s, then stop. Enter when filmed."
+  open -a Safari "http://localhost:8000/tx120.html?dir=demo/webtx&strobe=1&cd=6"
+  read -r
+  cat <<'EOF'
+  AirDrop the probe, then gate it (Claude runs these):
+    python3 poc/analyze_strobe.py ~/Downloads/IMG_XXXX.MOV \
+        --payload demo/kitten_big.png
+  Wait for PASS (side ~0, cam-px/cell >= 12.5) before Leg 2.
+  Enter to start LEG 2 (film the whole ~4 min, countdown included).
+EOF
+  read -r
+  open -a Safari "http://localhost:8000/tx120.html?dirs=demo/webtx,demo/webtx11,demo/webtx10,demo/webtx9&strobe=1&segsec=45"
+  echo ">>> Enter when the ladder take is done."
+  read -r
+  echo ">>> LEG 3: camera STAYS at 4K/60. Film the whole ~2.5 min."
+  open -a Safari "http://localhost:8000/tx120.html?dirs=demo/webtx,demo/webtx11&segsec=45"
+  echo ">>> Enter when the rolling take is done."
+  read -r
+  echo ">>> LEG 4 (optional): switch camera to 4K/120 now, then film."
+  open -a Safari "http://localhost:8000/tx120.html?dir=demo/webtx11&loops=8"
+  echo ">>> Enter when done (or to finish)."
+  read -r
+  pkill -f "http.server 8000"; dock false
+  echo "AirDrop everything, then:  python3 poc/decode_session.py"
+  ;;
 *)
-  echo "usage: ./film.sh density | strobe | 120 | 11 | strobe11 | strobe10"; exit 1 ;;
+  echo "usage: ./film.sh session | density | strobe | 120 | 11 | strobe11 | strobe10"; exit 1 ;;
 esac

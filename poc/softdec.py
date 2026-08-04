@@ -53,6 +53,35 @@ from codec import grid
 import exp_tile_prml as T
 import exp_turbo_frame as TB
 
+# ---- vectorized GF(2^8) syndrome screen (prim 0x11d, generator 2, fcr 0)
+# One numpy pass computes all syndromes of all codewords in a frame. A
+# codeword whose syndromes are all zero IS its own decode (reedsolo returns
+# the message unchanged when max(synd)==0), so the C decoder is skipped for
+# it entirely - which on a good frame is most of them. Bit-identical by
+# construction; only the arithmetic route changes.
+_GF_EXP = np.zeros(512, np.uint8)
+_GF_LOG = np.zeros(256, np.int16)
+_x = 1
+for _i in range(255):
+    _GF_EXP[_i] = _x
+    _GF_LOG[_x] = _i
+    _x <<= 1
+    if _x & 0x100:
+        _x ^= 0x11D
+_GF_EXP[255:510] = _GF_EXP[:255]
+# _SYN_POW[i, j] = (i * (254 - j)) % 255 : exponent of alpha^i at msg pos j
+_SYN_POW = (np.arange(48)[:, None] * (254 - np.arange(255))[None, :]) % 255
+
+
+def syndromes_zero(chunks_u8, nsym):
+    """chunks_u8: (n, 255) uint8. Returns (n,) bool: True = clean codeword."""
+    logm = _GF_LOG[chunks_u8].astype(np.int32)          # (n, 255)
+    e = (logm[:, None, :] + _SYN_POW[None, :nsym, :]) % 255
+    terms = _GF_EXP[e]                                   # (n, nsym, 255)
+    terms = np.where(chunks_u8[:, None, :] == 0, 0, terms)
+    synd = np.bitwise_xor.reduce(terms, axis=2)          # (n, nsym)
+    return ~synd.any(axis=1)
+
 
 class FrameDecoder:
     """Stateful across frames: holds the rolling kernel donor."""
@@ -120,13 +149,20 @@ class FrameDecoder:
         blocks = []
         cmask = np.zeros(len(self.cells), bool)
         cbits = np.zeros(len(self.cells), np.float32)
-        for j in (range(self.n_sub) if only is None else only):
+        js = list(range(self.n_sub) if only is None else only)
+        clean = syndromes_zero(by[: self.n_sub * 255].reshape(
+            self.n_sub, 255)[js], self.ecc) if js else []
+        for ci, j in enumerate(js):
             lo, hi = j * 255, (j + 1) * 255
             chunk = bytes(by[lo:hi])
             dec = None
-            try:
+            if clean[ci]:
+                dec = chunk[: 255 - self.ecc]   # zero syndromes: decode is
+                                                # the message itself
+            else:
+              try:
                 dec = bytes(self.rs.decode(chunk)[0])
-            except ReedSolomonError:
+              except ReedSolomonError:
                 if self.erase and byteconf is not None:
                     order = np.argsort(byteconf[lo:hi])
                     for n_er in range(4, int(self.ecc * 0.7) + 1, 6):

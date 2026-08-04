@@ -30,6 +30,12 @@ canvas{display:block;width:100vw;height:100vh}
 // (0/1000 mid-band px, vs 19/1000 for ffplay fullscreen).
 const q = new URLSearchParams(location.search);
 const DIR   = q.get('dir')   || 'demo/webtx';
+// PLAYLIST: dirs=a,b,c&segsec=45 plays each transmit for segsec seconds in
+// one continuous session - one camera take answers every rung. The countdown
+// runs once, over the FIRST segment's own frames, so the AE/AF lock carries
+// through every rung unchanged.
+const DIRS  = (q.get('dirs') || DIR).split(',');
+const SEGSEC= +(q.get('segsec') || 45);
 const LOOPS = +(q.get('loops') || 6);
 const CD    = +(q.get('cd')    || 22);
 // STROBE: draw code on even refreshes, full black on odd ones. The display
@@ -47,31 +53,45 @@ const STROBE = q.get('strobe') === '1';
 const c = document.getElementById('c'), hud = document.getElementById('hud');
 const msg = document.getElementById('msg');
 const ctx = c.getContext('2d', {alpha:false});
+let segs = [];          // {meta, bits, off, offctx, img, scale, x0, y0}
+let seg = 0;
 let meta = null, bits = null, off = null, offctx = null, img = null;
 let scale = 1, x0 = 0, y0 = 0;
+
+function activate(i){
+  seg = i;
+  const s = segs[i];
+  meta = s.meta; bits = s.bits; off = s.off; offctx = s.offctx; img = s.img;
+  scale = s.scale; x0 = s.x0; y0 = s.y0;
+}
 
 function size(){
   c.width  = Math.round(innerWidth  * devicePixelRatio);
   c.height = Math.round(innerHeight * devicePixelRatio);
   ctx.imageSmoothingEnabled = false;
-  if (meta){
+  for (const s of segs){
     // integer scale only: a fractional factor resamples the cell grid, which
     // is what destroyed the code in the windowed-ffplay take
-    scale = Math.max(1, Math.floor(Math.min(c.width/meta.gw, c.height/meta.gh)));
-    x0 = (c.width  - meta.gw*scale) >> 1;
-    y0 = (c.height - meta.gh*scale) >> 1;
+    s.scale = Math.max(1, Math.floor(Math.min(c.width/s.meta.gw,
+                                              c.height/s.meta.gh)));
+    s.x0 = (c.width  - s.meta.gw*s.scale) >> 1;
+    s.y0 = (c.height - s.meta.gh*s.scale) >> 1;
   }
+  if (segs.length) activate(seg);
 }
 
 async function boot(){
-  meta = await (await fetch(DIR + '/meta.json')).json();
-  const buf = await (await fetch(DIR + '/frames.bin')).arrayBuffer();
-  bits = new Uint8Array(buf);
-  off = document.createElement('canvas');
-  off.width = meta.gw; off.height = meta.gh;
-  offctx = off.getContext('2d', {alpha:false});
-  img = offctx.createImageData(meta.gw, meta.gh);
-  size(); addEventListener('resize', size);
+  for (const d of DIRS){
+    const m = await (await fetch(d + '/meta.json')).json();
+    const buf = await (await fetch(d + '/frames.bin')).arrayBuffer();
+    const o = document.createElement('canvas');
+    o.width = m.gw; o.height = m.gh;
+    const octx = o.getContext('2d', {alpha:false});
+    segs.push({meta: m, bits: new Uint8Array(buf), off: o, offctx: octx,
+               img: octx.createImageData(m.gw, m.gh),
+               scale: 1, x0: 0, y0: 0});
+  }
+  size(); activate(0); addEventListener('resize', size);
   msg.textContent = 'click / press F for fullscreen, then hit record';
   addEventListener('keydown', e => {
     if (e.key === 'f' || e.key === 'F') document.documentElement.requestFullscreen();
@@ -136,6 +156,12 @@ function tick(){
     requestAnimationFrame(tick);
     return;
   }
+  if (cd <= 0 && segs.length > 1){
+    // playlist: advance to the segment this wall-clock second belongs to
+    const want = Math.min(segs.length - 1,
+                          Math.floor((now - t0 - CD*1000) / (SEGSEC*1000)));
+    if (want !== seg){ activate(want); shown = 0; }
+  }
   if (cd > 0){
     // Countdown over REAL code frames, so an AE/AF lock taken during it
     // carries over to the payload unchanged, and every lead frame still
@@ -154,6 +180,16 @@ function tick(){
     const i = shown % meta.frames;
     drawFrame(i);
     shown++;
+    if (segs.length > 1){
+      // playlist end: SEGSEC per segment, DONE after the last
+      if ((now - t0 - CD*1000) > SEGSEC*1000*segs.length){
+        ctx.fillStyle='#000'; ctx.fillRect(0,0,c.width,c.height);
+        ctx.fillStyle='#fff'; ctx.textAlign='center';
+        ctx.font = `${Math.round(40*devicePixelRatio)}px -apple-system,monospace`;
+        ctx.fillText('DONE - stop recording', c.width/2, c.height/2);
+        return;
+      }
+    } else
     if (i === meta.frames - 1 && ++loops >= LOOPS){
       ctx.fillStyle='#000'; ctx.fillRect(0,0,c.width,c.height);
       ctx.fillStyle='#fff'; ctx.textAlign='center';
