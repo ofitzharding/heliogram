@@ -12,7 +12,7 @@
 #
 # Costs nothing on the receiver - the gray4 demodulator learns its four levels
 # by k-means from each frame, so it adapts to whatever peak arrives.
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 osascript -e 'tell application "System Events" to tell dock preferences to set autohide to true' \
           -e 'tell application "System Events" to tell dock preferences to set autohide menu bar to true' 2>/dev/null
 sleep 1
@@ -45,7 +45,7 @@ python3 -c "print(f'displayed {$T1-$T0:.1f}s')"
 cat <<'EOF'
 stop recording, AirDrop it, then:
 
-  python3 poc/analyze_lumen.py ~/Downloads/IMG_XXXX.MOV
+  python3 src/analyze_lumen.py ~/Downloads/IMG_XXXX.MOV
 
 Read the MONO row first. If it is not back near ~90%, the take is bad and no
 gray4 row means anything. If mono is healthy, read gray4 down the peak column

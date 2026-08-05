@@ -4,7 +4,7 @@
 # shutter 1/500, ISO 400, WB + focus locked, 1x lens, ~45cm, code ~2/3 of frame.
 # Name each clip in AirDrop order; the decode step maps them by timestamp.
 set -e
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 VIDEO="${1:-demo/transmit_c4.mp4}"
 
 run_condition() {

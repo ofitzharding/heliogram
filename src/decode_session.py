@@ -2,7 +2,7 @@
 """
 decode_session.py — drive the whole one-sitting session unattended.
 
-    python3 poc/decode_session.py LADDER.MOV [ROLLING.MOV] [SPEED.MOV]
+    python3 src/decode_session.py LADDER.MOV [ROLLING.MOV] [SPEED.MOV]
 
 For each capture: identify which transmit grid is on screen at regular
 probes (headers are self-labelling: each webtx dir has a distinct grid),

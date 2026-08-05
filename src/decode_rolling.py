@@ -19,7 +19,7 @@ Two passes over the capture:
 Every block still passes RS+CRC, the cross-loop conflict filter drops any
 index certified with two contents, and the sha256 is the final judge.
 
-    python3 poc/decode_rolling.py CAPTURE.MOV out.bin --grid 274x178
+    python3 src/decode_rolling.py CAPTURE.MOV out.bin --grid 274x178
 """
 import argparse
 import hashlib

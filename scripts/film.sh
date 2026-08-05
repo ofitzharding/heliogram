@@ -8,7 +8,7 @@
 # Camera discipline is identical for all three: stock Camera, landscape, 1x,
 # fill the frame with the screen, hit record, tap-hold to lock AE/AF during
 # the countdown, do NOT touch the exposure slider, then hold still.
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 MODE="$1"
 
 dock() {
@@ -21,9 +21,9 @@ quiet_start() {
   # payload cells, and it steals focus from the transmitter. The background
   # decodes/renders THIS project spawns are the usual source, so stop them for
   # the duration rather than hoping they stay silent.
-  pkill -f "poc/fast_decode.py"     2>/dev/null
-  pkill -f "poc/analyze_"           2>/dev/null
-  pkill -f "poc/make_"              2>/dev/null
+  pkill -f "src/fast_decode.py"     2>/dev/null
+  pkill -f "src/analyze_"           2>/dev/null
+  pkill -f "src/make_"              2>/dev/null
   cat <<'QEOF'
   >> Turn on Focus / Do Not Disturb now (Control Centre > Focus).
   >> macOS 15 has no scriptable switch for it without a user shortcut, so
@@ -45,7 +45,7 @@ EOF
   ffplay -v error -fs -alwaysontop -noborder -autoexit demo/_tx_density_lead.mp4
   ffplay -v error -fs -alwaysontop -noborder -loop 3 -autoexit demo/_tx_density.mp4
   dock false
-  echo "AirDrop it, then:  python3 poc/analyze_density.py ~/Downloads/IMG_XXXX.MOV"
+  echo "AirDrop it, then:  python3 src/analyze_density.py ~/Downloads/IMG_XXXX.MOV"
   ;;
 strobe)
   cat <<'EOF'
@@ -67,10 +67,10 @@ EOF
   pkill -f "http.server 8000" 2>/dev/null
   (python3 -m http.server 8000 >/tmp/heliogram_httpd.log 2>&1 &)
   sleep 1; dock true
-  open -a Safari "http://localhost:8000/tx120.html?strobe=1&loops=5"
+  open -a Safari "http://localhost:8000/lab/tx120.html?strobe=1&loops=5"
   echo "server up; press enter here when the take is done to stop it"
   read -r; pkill -f "http.server 8000"; dock false
-  echo "AirDrop it, then:  python3 poc/fast_decode.py ~/Downloads/IMG_XXXX.MOV /tmp/out.bin --grid 252x163 --ecc 48 --subblock --soft --scan --full"
+  echo "AirDrop it, then:  python3 src/fast_decode.py ~/Downloads/IMG_XXXX.MOV /tmp/out.bin --grid 252x163 --ecc 48 --subblock --soft --scan --full"
   ;;
 120)
   cat <<'EOF'
@@ -88,10 +88,10 @@ EOF
   pkill -f "http.server 8000" 2>/dev/null
   (python3 -m http.server 8000 >/tmp/heliogram_httpd.log 2>&1 &)
   sleep 1; dock true
-  open -a Safari "http://localhost:8000/tx120.html?loops=6"
+  open -a Safari "http://localhost:8000/lab/tx120.html?loops=6"
   echo "server up; press enter here when the take is done to stop it"
   read -r; pkill -f "http.server 8000"; dock false
-  echo "AirDrop it, then:  python3 poc/fast_decode.py ~/Downloads/IMG_XXXX.MOV /tmp/out.bin --grid 252x163 --ecc 48 --subblock --soft --scan --full"
+  echo "AirDrop it, then:  python3 src/fast_decode.py ~/Downloads/IMG_XXXX.MOV /tmp/out.bin --grid 252x163 --ecc 48 --subblock --soft --scan --full"
   ;;
 11)
   cat <<'EOF'
@@ -109,10 +109,10 @@ EOF
   pkill -f "http.server 8000" 2>/dev/null
   (python3 -m http.server 8000 >/tmp/heliogram_httpd.log 2>&1 &)
   sleep 1; dock true
-  open -a Safari "http://localhost:8000/tx120.html?dir=demo/webtx11&loops=6"
+  open -a Safari "http://localhost:8000/lab/tx120.html?dir=demo/webtx11&loops=6"
   echo "server up; press enter here when the take is done to stop it"
   read -r; pkill -f "http.server 8000"; dock false
-  echo "AirDrop it, then:  python3 poc/fast_decode.py ~/Downloads/IMG_XXXX.MOV /tmp/out.bin --grid 274x178 --ecc 48 --subblock --soft --scan --from-start"
+  echo "AirDrop it, then:  python3 src/fast_decode.py ~/Downloads/IMG_XXXX.MOV /tmp/out.bin --grid 274x178 --ecc 48 --subblock --soft --scan --from-start"
   ;;
 strobe11)
   cat <<'EOF'
@@ -120,17 +120,17 @@ strobe11)
   11PX STROBE.  274x178 at 11 px, code on even refreshes, black on
   odd.  Camera: 4K at 60 fps.  SCREEN BRIGHTNESS: MAXIMUM - the AE
   lock must land at <= 1/120 s or mixing returns; the capture
-  self-reports it (poc/analyze_strobe.py --grid 274x178).
+  self-reports it (src/analyze_strobe.py --grid 274x178).
 ------------------------------------------------------------------
 EOF
   quiet_start; sleep 6
   pkill -f "http.server 8000" 2>/dev/null
   (python3 -m http.server 8000 >/tmp/heliogram_httpd.log 2>&1 &)
   sleep 1; dock true
-  open -a Safari "http://localhost:8000/tx120.html?dir=demo/webtx11&strobe=1&loops=5"
+  open -a Safari "http://localhost:8000/lab/tx120.html?dir=demo/webtx11&strobe=1&loops=5"
   echo "server up; press enter here when the take is done to stop it"
   read -r; pkill -f "http.server 8000"; dock false
-  echo "AirDrop it, then:  python3 poc/fast_decode.py ~/Downloads/IMG_XXXX.MOV /tmp/out.bin --grid 274x178 --ecc 48 --subblock --soft --scan --from-start"
+  echo "AirDrop it, then:  python3 src/fast_decode.py ~/Downloads/IMG_XXXX.MOV /tmp/out.bin --grid 274x178 --ecc 48 --subblock --soft --scan --from-start"
   ;;
 strobe10)
   cat <<'EOF'
@@ -151,11 +151,11 @@ EOF
   pkill -f "http.server 8000" 2>/dev/null
   (python3 -m http.server 8000 >/tmp/heliogram_httpd.log 2>&1 &)
   sleep 1; dock true
-  open -a Safari "http://localhost:8000/tx120.html?dir=demo/webtx10&strobe=1&loops=5"
+  open -a Safari "http://localhost:8000/lab/tx120.html?dir=demo/webtx10&strobe=1&loops=5"
   echo "server up; press enter here when the take is done to stop it"
   read -r; pkill -f "http.server 8000"; dock false
-  echo "AirDrop it, then gate with:  python3 poc/analyze_strobe.py ~/Downloads/IMG_XXXX.MOV --grid 302x196"
-  echo "if framing+exposure pass:    python3 poc/fast_decode.py ~/Downloads/IMG_XXXX.MOV /tmp/out.bin --grid 302x196 --ecc 48 --subblock --soft --scan --from-start"
+  echo "AirDrop it, then gate with:  python3 src/analyze_strobe.py ~/Downloads/IMG_XXXX.MOV --grid 302x196"
+  echo "if framing+exposure pass:    python3 src/fast_decode.py ~/Downloads/IMG_XXXX.MOV /tmp/out.bin --grid 302x196 --ecc 48 --subblock --soft --scan --from-start"
   ;;
 session)
   cat <<'EOF'
@@ -177,29 +177,29 @@ EOF
   (python3 -m http.server 8000 >/tmp/heliogram_httpd.log 2>&1 &)
   sleep 1; dock true
   echo ">>> LEG 1: film the screen for ~15s, then stop. Enter when filmed."
-  open -a Safari "http://localhost:8000/tx120.html?dir=demo/webtx&strobe=1&cd=6"
+  open -a Safari "http://localhost:8000/lab/tx120.html?dir=demo/webtx&strobe=1&cd=6"
   read -r
   cat <<'EOF'
   AirDrop the probe, then gate it (Claude runs these):
-    python3 poc/analyze_strobe.py ~/Downloads/IMG_XXXX.MOV \
+    python3 src/analyze_strobe.py ~/Downloads/IMG_XXXX.MOV \
         --payload demo/kitten_big.png
   Wait for PASS (side ~0, cam-px/cell >= 12.5) before Leg 2.
   Enter to start LEG 2 (film the whole ~4 min, countdown included).
 EOF
   read -r
-  open -a Safari "http://localhost:8000/tx120.html?dirs=demo/webtx,demo/webtx11,demo/webtx10,demo/webtx9&strobe=1&segsec=45"
+  open -a Safari "http://localhost:8000/lab/tx120.html?dirs=demo/webtx,demo/webtx11,demo/webtx10,demo/webtx9&strobe=1&segsec=45"
   echo ">>> Enter when the ladder take is done."
   read -r
   echo ">>> LEG 3: camera STAYS at 4K/60. Film the whole ~2.5 min."
-  open -a Safari "http://localhost:8000/tx120.html?dirs=demo/webtx,demo/webtx11&segsec=45"
+  open -a Safari "http://localhost:8000/lab/tx120.html?dirs=demo/webtx,demo/webtx11&segsec=45"
   echo ">>> Enter when the rolling take is done."
   read -r
   echo ">>> LEG 4 (optional): switch camera to 4K/120 now, then film."
-  open -a Safari "http://localhost:8000/tx120.html?dir=demo/webtx11&loops=8"
+  open -a Safari "http://localhost:8000/lab/tx120.html?dir=demo/webtx11&loops=8"
   echo ">>> Enter when done (or to finish)."
   read -r
   pkill -f "http.server 8000"; dock false
-  echo "AirDrop everything, then:  python3 poc/decode_session.py"
+  echo "AirDrop everything, then:  python3 src/decode_session.py"
   ;;
 *)
   echo "usage: ./film.sh session | density | strobe | 120 | 11 | strobe11 | strobe10"; exit 1 ;;

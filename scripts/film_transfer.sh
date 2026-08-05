@@ -2,7 +2,7 @@
 # Film one transfer clip: dialog gate, then fullscreen looping playback.
 # Usage: ./film_transfer.sh [video]   (default: demo/transmit_mono.mp4)
 set -e
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 VIDEO="${1:-demo/transmit_mono.mp4}"
 
 osascript >/dev/null <<EOF

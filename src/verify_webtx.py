@@ -6,8 +6,8 @@ Bit-compares every demo/webtx*/frames.bin against the truth renderer (the
 same encoder+renderer chain the analyzers were dress-rehearsed on). A take
 filmed against a verified transmitter cannot be wasted by an encoding bug.
 
-    python3 poc/verify_webtx.py            # all demo/webtx* dirs
-    python3 poc/verify_webtx.py demo/webtx11
+    python3 src/verify_webtx.py            # all demo/webtx* dirs
+    python3 src/verify_webtx.py demo/webtx11
 """
 import json
 import sys

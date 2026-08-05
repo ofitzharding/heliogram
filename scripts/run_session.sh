@@ -3,7 +3,7 @@
 # Phase 1: smeartest --auto (alternate 25s -> split 25s -> static 25s), one slo-mo clip.
 # Phase 2: fullscreen transfer video, one normal-video clip.
 set -e
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 
 osascript >/dev/null <<'EOF'
 display dialog "PHASE 1 of 2 — Smear test (~75 seconds)

@@ -96,7 +96,7 @@ def main():
     print(f"\nwrote {bits_path} ({sz/1e6:.1f} MB) and {out/'meta.json'}")
     print(f"\nserve and open:\n"
           f"  cd {Path(__file__).parent.parent} && python3 -m http.server 8000\n"
-          f"  then open  http://localhost:8000/tx120.html  and press F for "
+          f"  then open  http://localhost:8000/lab/tx120.html  and press F for "
           f"fullscreen")
 
 

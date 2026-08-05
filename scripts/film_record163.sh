@@ -9,7 +9,7 @@
 # file, and "first header wins" learned k=5525/1.12MB from it and then tried to
 # rebuild that from a 277KB transmission. The lead-in here is the transmit
 # itself: luminance-matched by construction, and every frame of it is real data.
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 osascript -e 'tell application "System Events" to tell dock preferences to set autohide to true' \
           -e 'tell application "System Events" to tell dock preferences to set autohide menu bar to true' 2>/dev/null
 sleep 1
@@ -48,6 +48,6 @@ python3 -c "print(f'displayed {$T1-$T0:.1f}s')"
 cat <<'EOF'
 stop recording, AirDrop it, then:
 
-  python3 poc/fast_decode.py ~/Downloads/IMG_XXXX.MOV /tmp/out.bin \
+  python3 src/fast_decode.py ~/Downloads/IMG_XXXX.MOV /tmp/out.bin \
       --grid 252x163 --ecc 48 --subblock --soft --scan
 EOF

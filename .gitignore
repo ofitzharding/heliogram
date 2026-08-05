@@ -1,18 +1,19 @@
+# Captures and rendered video: large, and regenerable from the code.
 captures/
 demo/*.mp4
-__pycache__/
-*.pyc
 demo/_tx_*
 demo/_countdown*
-*.dat.npy
-demo/payload.png
-demo/payload_big.png
+demo/payload*.png
 demo/recovered.png
-demo/webtx/
-demo/webtx11/
-demo/webtx10/
-demo/webtx9/
-poc/crs.dylib
-demo/webtx8/
-poc/crs2.dylib
-demo/webtx9e24/
+*.dat.npy
+
+# Generated transmit dirs (frames.bin runs to tens of MB). The published web
+# receiver's slim metadata is the one exception: it ships with the site.
+demo/webtx*/*
+!demo/webtxweb/rxmeta.slim.json
+
+# Build products.
+__pycache__/
+*.pyc
+src/*.dylib
+experiments/smear-test/smeartest

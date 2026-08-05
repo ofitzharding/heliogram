@@ -139,7 +139,7 @@ def main():
         bad = []
     if not bad and est * 1.4 >= 200:
         print("  VERDICT: GOOD — decode it in full:")
-        print(f"    python3 poc/fast_decode.py {args.capture} /tmp/out.bin \\")
+        print(f"    python3 src/fast_decode.py {args.capture} /tmp/out.bin \\")
         print(f"        --grid {args.grid} --ecc {args.ecc} --subblock --soft --scan")
     else:
         print("  VERDICT: REFILM" if bad else

@@ -150,7 +150,7 @@ def main():
           f"({Path(args.out).stat().st_size/1e6:.0f} MB, "
           f"{len(CONFIGS)*args.seconds:.0f}s per loop)")
     print(f"wrote {lead_out}")
-    print(f"\nfilm it, then:\n  python3 poc/analyze_gray.py <capture.MOV>")
+    print(f"\nfilm it, then:\n  python3 src/analyze_gray.py <capture.MOV>")
 
 
 if __name__ == "__main__":

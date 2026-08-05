@@ -2,7 +2,7 @@
 # RECORD ATTEMPT. 252x140 mono - the density measured at 176-193 KB/s in the
 # settled portion of the probe take. Long countdown because the camera's
 # AF/AE transient is ~7s (measured: BER 8.23% -> 1.51% over frames 127-446).
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 osascript -e 'tell application "System Events" to tell dock preferences to set autohide to true' \
           -e 'tell application "System Events" to tell dock preferences to set autohide menu bar to true' 2>/dev/null
 sleep 1

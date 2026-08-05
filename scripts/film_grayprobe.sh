@@ -14,7 +14,7 @@
 #
 # ecc 64 is the hedge: if gray4/48 fails and gray4/64 holds, the alphabet is
 # fine and the parity was the binding constraint.
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 osascript -e 'tell application "System Events" to tell dock preferences to set autohide to true' \
           -e 'tell application "System Events" to tell dock preferences to set autohide menu bar to true' 2>/dev/null
 sleep 1
@@ -45,7 +45,7 @@ python3 -c "print(f'displayed {$T1-$T0:.1f}s')"
 cat <<'EOF'
 stop recording, AirDrop it, then:
 
-  python3 poc/analyze_gray.py ~/Downloads/IMG_XXXX.MOV
+  python3 src/analyze_gray.py ~/Downloads/IMG_XXXX.MOV
 
 Read the result as: gray4 wins if its KB/s column beats mono's, even at a
 much lower yield percentage. Yield is not the figure of merit here, KB/s is.

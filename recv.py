@@ -22,11 +22,13 @@ import sys
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent / "poc"))
+sys.path.insert(0, str(Path(__file__).parent / "src"))
 import container
 
 HERE = Path(__file__).parent
-GRIDS = ["252x163", "252x140"]
+# Newest transmit geometries first: the 8px record grid, then down the
+# density ladder to the earliest published takes.
+GRIDS = ["378x245", "336x218", "302x196", "274x178", "252x163", "252x140"]
 
 
 def main():
@@ -47,9 +49,9 @@ def main():
     tmp = Path(tempfile.mkdtemp()) / "raw.bin"
     for gridspec in ([args.grid] if args.grid else GRIDS):
         print(f"=== decoding {cap.name} at {gridspec} ===")
-        cmd = [sys.executable, str(HERE / "poc" / "fast_decode.py"),
+        cmd = [sys.executable, str(HERE / "src" / "fast_decode.py"),
                str(cap), str(tmp), "--grid", gridspec, "--ecc", str(args.ecc),
-               "--subblock", "--soft", "--scan"]
+               "--subblock", "--soft", "--scan", "--from-start"]
         if args.header_top:
             cmd.append("--header-top")
         r = subprocess.run(cmd)
@@ -57,7 +59,7 @@ def main():
             break
         print(f"  nothing decodable at {gridspec}\n")
     else:
-        sys.exit("FAILED: no grid produced a file. Run poc/quickcheck.py on "
+        sys.exit("FAILED: no grid produced a file. Run src/quickcheck.py on "
                  "the capture to see which stage is losing it.")
 
     blob = tmp.read_bytes()

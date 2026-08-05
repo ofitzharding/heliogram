@@ -53,7 +53,7 @@ These are measurements, not estimates:
   file from lights-on handheld footage (252x140 grid, binary cells).
 - Best SIMULATED: 174.3 KB/s (4-level grey at 203x112 plus per-codeword
   fountain symbols). **I do not trust this number** — see "what I need" below.
-- Baseline to beat: `a prior published optical-transfer tool` reports ~128 KB/s handheld and
+- Baseline to beat: `decimen-optical-transfer` reports ~128 KB/s handheld and
   ~186 KB/s propped, decoding LIVE in a browser via zxing-wasm (QR v40).
   libcimbar reports ~106 KB/s.
 

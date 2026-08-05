@@ -19,7 +19,7 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent / "poc"))
+sys.path.insert(0, str(Path(__file__).parent / "src"))
 import container
 import make_record
 

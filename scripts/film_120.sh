@@ -21,7 +21,7 @@
 # RECORD AT 4K120. The iPhone 17 Pro Max does it. If the camera runs at 60 while
 # the display runs at 120, every camera frame integrates TWO different code
 # frames and nothing will decode at all.
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 osascript -e 'tell application "System Events" to tell dock preferences to set autohide to true' \
           -e 'tell application "System Events" to tell dock preferences to set autohide menu bar to true' 2>/dev/null
 sleep 1
@@ -63,7 +63,7 @@ if el > exp*1.25:
 cat <<'EOF'
 stop recording, AirDrop it, then:
 
-  python3 poc/fast_decode.py ~/Downloads/IMG_XXXX.MOV /tmp/out.bin \
+  python3 src/fast_decode.py ~/Downloads/IMG_XXXX.MOV /tmp/out.bin \
       --grid 252x163 --ecc 48 --subblock --soft --scan --full
 
 Read GOODPUT (full span), not BEST WINDOW. Full span is the honest

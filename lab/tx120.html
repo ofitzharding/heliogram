@@ -29,6 +29,11 @@ canvas{display:block;width:100vw;height:100vh}
 // tx.html already measured this canvas route as the sharpest available here
 // (0/1000 mid-band px, vs 19/1000 for ffplay fullscreen).
 const q = new URLSearchParams(location.search);
+// This page lives in lab/ while the transmit dirs live at the repo root, so
+// a dir from the query string is resolved against the PARENT folder. That
+// keeps every caller (film.sh, bookmarks) writing dir=demo/webtx11.
+const ROOT  = new URL('../', location.href);
+const asset = (d, f) => new URL(`${d}/${f}`, ROOT).href;
 const DIR   = q.get('dir')   || 'demo/webtx';
 // PLAYLIST: dirs=a,b,c&segsec=45 plays each transmit for segsec seconds in
 // one continuous session - one camera take answers every rung. The countdown
@@ -88,8 +93,8 @@ function size(){
 
 async function boot(){
   for (const d of DIRS){
-    const m = await (await fetch(d + '/meta.json')).json();
-    const buf = await (await fetch(d + '/frames.bin')).arrayBuffer();
+    const m = await (await fetch(asset(d, 'meta.json'))).json();
+    const buf = await (await fetch(asset(d, 'frames.bin'))).arrayBuffer();
     const o = document.createElement('canvas');
     o.width = m.gw; o.height = m.gh;
     const octx = o.getContext('2d', {alpha:false});

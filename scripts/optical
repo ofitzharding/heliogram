@@ -26,8 +26,9 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-POC = HERE / "poc"
-sys.path.insert(0, str(POC))
+ROOT = HERE.parent
+SRC = ROOT / "src"
+sys.path.insert(0, str(SRC))
 
 # Profiles, ordered by throughput. Constants are MEASURED on real captures:
 #   camera blur sigma ~3.6 px  ->  cells below ~13 camera-px collapse
@@ -267,7 +268,7 @@ def cmd_send(args):
     src = Path(args.file).expanduser().resolve()
     if not src.exists():
         sys.exit(f"no such file: {src}")
-    out = HERE / "demo" / f"_tx_{src.stem}_{args.profile}.mp4"
+    out = ROOT / "demo" / f"_tx_{src.stem}_{args.profile}.mp4"
     out.parent.mkdir(exist_ok=True)
 
     size = src.stat().st_size
@@ -278,7 +279,7 @@ def cmd_send(args):
     if out.exists() and not args.force:
         print(f"reusing {out.name} (pass --force to re-encode)")
     else:
-        rc = run(f"cd {POC} && python3 encode.py {src!s} {out!s} "
+        rc = run(f"cd {SRC} && python3 encode.py {src!s} {out!s} "
                  f"--mode {p['mode']} --grid {p['grid']} --cell-px {p['cell_px']} "
                  f"--fps 60 --overhead {args.overhead} --ecc {p['ecc']} "
                  f"{'--subblock' if p.get('subblock') else ''}")
@@ -441,7 +442,7 @@ def cmd_recv(args):
     name, p, hl, k1, centered = _detect(capture)
     out = Path(args.out) if args.out else Path.cwd() / f"recovered_{capture.stem}.bin"
     t0 = time.time()
-    rc = run(f"cd {POC} && python3 fast_decode.py {capture!s} {out!s} "
+    rc = run(f"cd {SRC} && python3 fast_decode.py {capture!s} {out!s} "
              f"--grid {p['grid']} --ecc {p['ecc']} --radial {k1} --header-len {hl} "
              f"{'--header-top' if not centered else ''} "
              f"{'--subblock' if p.get('subblock') else ''} --scan")
@@ -455,7 +456,7 @@ def cmd_bench(args):
     capture = Path(args.capture).expanduser().resolve()
     name, p, hl, k1, centered = _detect(capture)
     tmp = Path("/tmp/_optical_bench.bin")
-    run(f"cd {POC} && python3 fast_decode.py {capture!s} {tmp!s} "
+    run(f"cd {SRC} && python3 fast_decode.py {capture!s} {tmp!s} "
         f"--grid {p['grid']} --ecc {p['ecc']} --radial {k1} --header-len {hl} "
         f"{'--header-top' if not centered else ''} "
         f"{'--subblock' if p.get('subblock') else ''} --scan")

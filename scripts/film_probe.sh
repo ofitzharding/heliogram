@@ -1,7 +1,7 @@
 #!/bin/bash
 # One take, whole operating envelope. Hides Dock/menu bar, plays a
 # luminance-matched countdown so an AE/AF lock carries over, then the probe.
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 D=demo
 osascript -e 'tell application "System Events" to tell dock preferences to set autohide to true' \
           -e 'tell application "System Events" to tell dock preferences to set autohide menu bar to true' 2>/dev/null

@@ -697,6 +697,10 @@ def main():
                          "codeword yield instead.")
     ap.add_argument("--no-geom-search", action="store_true",
                     help="do not retry failed codewords at other sub-cell sampling offsets")
+    ap.add_argument("--assume-proto", default="",
+                    help="k,block_size,file_size: hand the decoder its "
+                         "transfer constants when no hard header survives "
+                         "(forensic use; arms ML rescue without a probe hit)")
     ap.add_argument("--vt", action="store_true",
                     help="VideoToolbox hardware frame ingestion in workers "
                          "(instrument change: adopt only after an A/B shows "
@@ -801,6 +805,12 @@ def main():
             print(f"  NOTE: {len(set((h['k'],h['file_size']) for h in hdrs))} "
                   f"distinct transmissions in this capture; using the majority "
                   f"(k={key[0]}, file={key[2]:,} B)")
+    if proto_full is None and args.assume_proto:
+        k_, bs_, fs_ = (int(v) for v in args.assume_proto.split(","))
+        proto_full = dict(seq=0, k=k_, block_size=bs_, file_size=fs_,
+                          mode=grid.MODE_MONO, zone_w=0, zone_modes=0)
+        seqs = [3000]
+        print(f"proto ASSUMED from --assume-proto: k={k_} block={bs_}")
     if proto_full is not None:
         max_seq = max(1500, int(max(seqs) * 1.5))
         print(f"proto learned from {len(seqs)}/40 probe frames: "
@@ -886,27 +896,38 @@ def main():
         at least one sighting lies, and the index is excluded outright. No
         thresholds, no geometry, receiver-legal, and it catches ANY poison
         source whose index also appears cleanly elsewhere."""
-        seen = {}
-        bad = set()
+        variants = {}
         for _n, sq, bl, _p in hs:
-            b = bytes(bl)
-            if sq in seen:
-                if seen[sq] != b:
-                    bad.add(sq)
+            variants.setdefault(sq, set()).add(bytes(bl))
+        first = {sq: v.copy().pop() if len(v) == 1 else None
+                 for sq, v in variants.items()}
+        # POOL-LEVEL GHOST SWEEP + DUAL-SEQ RESCUE. A variant whose content
+        # equals the same codeword position one seq earlier is a straddle
+        # ghost (collision odds 2^-1600): its true symbol is already pooled
+        # at the earlier index. Instead of dropping every conflicted index
+        # outright, drop only the ghost VARIANTS; if exactly one variant
+        # survives, it is the true symbol and the index is RESCUED.
+        def ghostly(sq, b):
+            lo = variants.get(sq - ns_pool)
+            return lo is not None and b in lo
+        bad = set()
+        keep_content = {}
+        for sq, vs in variants.items():
+            good = {b for b in vs if not ghostly(sq, b)}
+            if len(good) == 1:
+                keep_content[sq] = next(iter(good))
             else:
-                seen[sq] = b
-        # POOL-LEVEL GHOST SWEEP. The worker's detector only compares
-        # adjacent frames; here any index whose content equals the SAME
-        # position one seq earlier is a straddle ghost wherever its clean
-        # sighting came from (collision odds 2^-1600). The later index is
-        # the one carrying the earlier frame's rows: drop it.
-        for idx, b in list(seen.items()):
-            if seen.get(idx - ns_pool) == b:
-                bad.add(idx)
-        if bad:
-            print(f"  conflict filter: {len(bad)} poisoned indices dropped "
+                bad.add(sq)        # zero survivors (pure ghost) or still
+                                   # ambiguous: exclude the index
+        n_rescued = sum(1 for sq in keep_content
+                        if len(variants[sq]) > 1)
+        n_dropped = len(bad)
+        if n_dropped or n_rescued:
+            print(f"  conflict filter: {n_dropped} indices dropped, "
+                  f"{n_rescued} conflicted indices rescued by dual-seq "
                   f"({len(hs)} hits)")
-        return [h for h in hs if h[1] not in bad]
+        return [h for h in hs
+                if h[1] not in bad and bytes(h[2]) == keep_content[h[1]]]
 
     def _try_assemble(hs):
         if not hs:

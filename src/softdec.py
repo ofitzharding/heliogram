@@ -5,7 +5,7 @@ softdec.py — one frame's worth of the certified-label receiver.
 This is the mechanism that survived every negative result in this project
 (Findings §14 for why nothing self-supervised works here, §3 for why the
 fountain+CRC structure makes the labels exactly correct by construction),
-lifted out of poc/exp_probe_soft.py so the PRODUCTION decoder can run it
+lifted out of src/exp_probe_soft.py so the PRODUCTION decoder can run it
 instead of only the experiments.
 
 Per frame, in order:
