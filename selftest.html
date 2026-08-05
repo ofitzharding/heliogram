@@ -113,11 +113,9 @@ function randBytes(n){
     return dec.decoded.size;
   };
   globalThis._rxFrame = (gray, w, h) => {
-    const fs = findFinders(gray, w, h);
-    if (!fs) return { st: "nolock" };
-    const H = homography(M.finders, fs);
-    if (!H) return { st: "noH" };
-    const sb = sampleBits(gray, w, h, H);
+    const d = detectH(p => gray[p], w, h);
+    if (!d) return { st: "nolock" };
+    const sb = d.sb;
     const hb = new Uint8Array(HC.length);
     const hc = new Float32Array(HC.length);
     for (let i = 0; i < HC.length; i++){
@@ -126,7 +124,7 @@ function randBytes(n){
     const hd = tryHeader(hb, hc);
     const before = stats.certified;
     if (hd) finishFrame(sb.bitAt, sb.confAt, 0);
-    return { st: hd ? "hdr" : "nohdr",
+    return { st: hd ? "hdr" : "nohdr", rot: d.rot,
              cw: stats.certified - before,
              got: dec.decoded.size, k: dynK };
   };
@@ -175,8 +173,11 @@ function randBytes(n){
                `(got ${got}/${rx.ev("dynK")})`, "f");
   }
 
-  // camera model: draw cells at S px/cell, panel-ish levels, blur, noise
-  const cam = (cells, S, blend) => {
+  // camera model: draw cells at S px/cell, panel-ish levels, blur, noise.
+  // rot simulates a rotation-locked phone buffer: the code arrives
+  // transposed, which is what an iPhone with portrait lock delivers no
+  // matter how the phone is held.
+  const cam = (cells, S, blend, rot) => {
     const Mx = tx.ev("M");
     const mg = Math.round(4 * S);
     const w = Mx.gw * S + mg * 2, h = Mx.gh * S + mg * 2;
@@ -201,14 +202,25 @@ function randBytes(n){
     };
     draw(cells, 1);
     if (blend) draw(blend, 0.5);
-    const img = g.getImageData(0, 0, w, h).data;
-    const gray = new Uint8Array(w * h);
+    let src = cv, sw = w, sh = h;
+    if (rot){
+      const c2 = document.createElement("canvas");
+      c2.width = h; c2.height = w;
+      const g2 = c2.getContext("2d", { willReadFrequently: true });
+      g2.translate(c2.width / 2, c2.height / 2);
+      g2.rotate(Math.PI / 2);
+      g2.drawImage(cv, -w / 2, -h / 2);
+      src = c2; sw = h; sh = w;
+    }
+    const img = src.getContext("2d", { willReadFrequently: true })
+                   .getImageData(0, 0, sw, sh).data;
+    const gray = new Uint8Array(sw * sh);
     for (let i = 0, j = 0; j < gray.length; i += 4, j++){
       const n = (Math.random() + Math.random() + Math.random() - 1.5) * 4;
       let v = ((img[i]*77 + img[i+1]*150 + img[i+2]*29) >> 8) + n;
       gray[j] = v < 0 ? 0 : (v > 255 ? 255 : v);
     }
-    return { gray, w, h };
+    return { gray, w: sw, h: sh };
   };
 
   // ---------- TEST C: two-frame blend kills the header ----------
@@ -266,6 +278,31 @@ function randBytes(n){
         : `B FAIL: closed but sha mismatch`, hex === want ? "p" : "f");
     } else say(`B FAIL: no close in ${s} frames ` +
                `(${r ? r.got + "/" + r.k : "?"})`, "f");
+  }
+
+  // ---------- TEST D: rotation-locked buffer (the field failure) ----------
+  {
+    const payload = randBytes(100 * 1024);
+    const want = await sha(payload);
+    const wr = await tx.ev("containerize")(payload, "rot.bin");
+    tx.ev("prepare")(wr, "rot.bin");
+    rx.ev("_rxReset()");
+    let s = 0, r = null, rots = 0;
+    for (; s < 300; s++){
+      const { gray, w, h } = cam(tx.ev("_txCells")(s), 8, null, true);
+      r = rx.ev("_rxFrame")(gray, w, h);
+      if (r.st === "hdr" && r.rot % 180 !== 0) rots++;
+      if (r.k && r.got >= r.k) break;
+    }
+    if (r && r.k && r.got >= r.k){
+      const body = unwrap(rx.ev("_rxOut()"));
+      const hex = body ? await sha(body) : "no-container";
+      say(hex === want
+        ? `D PASS: transposed capture decodes as rot 90/270 ` +
+          `(${rots} frames), 100 KB closed bit-exact in ${s+1} frames`
+        : `D FAIL: closed but sha mismatch`, hex === want ? "p" : "f");
+    } else say(`D FAIL: rotated capture did not close in ${s} frames ` +
+               `(${r ? r.st + " " + r.got + "/" + r.k : "?"})`, "f");
   }
   say("done.");
 })().catch(e => say("HARNESS ERROR: " + (e.stack || e), "f"));

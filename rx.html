@@ -324,12 +324,12 @@ function ratioAt(runs, p){
   return null;
 }
 let lastCands = 0;
-function findFinders(gray, w, h){
-  const th = otsu(gray);
+function findFinders(G, w, h){
+  const th = otsu(G, w * h);
   const cands = [];
   const step = Math.max(1, Math.floor(h / 500));
   for (let y = 0; y < h; y += step){
-    const rowGet = i => gray[y*w+i];
+    const rowGet = i => G(y*w+i);
     const runs = runsAt(rowGet, w, th);
     for (let i = 0; i + 4 < runs.length; i++){
       if (runs[i][0] !== 1) continue;
@@ -345,7 +345,7 @@ function findFinders(gray, w, h){
       // horizontal 1:1:3:1:1 runs constantly; a true finder must show the
       // same ratio vertically through the same centre, with a matching
       // module size. This is what separates a finder from noise.
-      const colGet = j => gray[j*w+cx];
+      const colGet = j => G(j*w+cx);
       const vr = ratioAt(runsAt(colGet, h, th), y);
       if (!vr) continue;
       if (Math.abs(vr.u - u) > Math.max(u, vr.u) * 0.5) continue;
@@ -378,18 +378,50 @@ function findFinders(gray, w, h){
     if (g.x - g.y < bl.x - bl.y) bl = g;
   }
   const four = [tl, tr, bl, br];
-  // sanity: four distinct points spanning a plausible rectangle
+  // sanity: four distinct points spanning a plausible size. NO aspect gate
+  // here: a portrait phone sees the landscape code transposed, and gating
+  // on upright aspect made that unlockable (243 candidate hits, 0 locks in
+  // the field). Orientation is detectH's job.
   const wpx = Math.hypot(tr.x-tl.x, tr.y-tl.y);
   const hpx = Math.hypot(bl.x-tl.x, bl.y-tl.y);
   if (wpx < 40 || hpx < 30) return null;
-  const aspect = (wpx / hpx) / ((M.gw - 9) / (M.gh - 9));
-  if (aspect < 0.6 || aspect > 1.7) return null;
   return four.map(g => [g.x, g.y]);
 }
 
-function otsu(gray){
+// Try the four orientations of the detected corner quad. Aspect prefilter
+// keeps it to the plausible ones (upright: 0/180, transposed: 90/270), and
+// the header, being a zero-false-accept oracle, adjudicates between the
+// survivors. If no orientation certifies a header (countdown, glare), the
+// first aspect-valid one still gives the guide a geometry to report.
+function detectH(G, w, h){
+  const four = findFinders(G, w, h);
+  if (!four) return null;
+  const [tl, tr, bl, br] = four;
+  const A = (M.gw - 9) / (M.gh - 9);
+  const quads = [[[tl,tr,bl,br], 0],   [[tr,br,tl,bl], 90],
+                 [[bl,tl,br,tr], 270], [[br,bl,tr,tl], 180]];
+  let fallback = null;
+  for (const [q, rot] of quads){
+    const wpx = Math.hypot(q[1][0]-q[0][0], q[1][1]-q[0][1]);
+    const hpx = Math.hypot(q[2][0]-q[0][0], q[2][1]-q[0][1]);
+    const r = (wpx / hpx) / A;
+    if (r < 0.6 || r > 1.7) continue;
+    const H = homography(M.finders, q);
+    if (!H) continue;
+    const sb = sampleBits(G, w, h, H);
+    const hb = new Uint8Array(HC.length), hc = new Float32Array(HC.length);
+    for (let i = 0; i < HC.length; i++){
+      hb[i] = sb.bitAt[HC[i]]; hc[i] = sb.confAt[HC[i]];
+    }
+    if (tryHeader(hb, hc)) return { H, sb, rot };
+    if (!fallback) fallback = { H, sb, rot };
+  }
+  return fallback;
+}
+
+function otsu(G, n){
   const hist = new Uint32Array(256);
-  for (let i = 0; i < gray.length; i += 7) hist[gray[i]]++;
+  for (let i = 0; i < n; i += 13) hist[G(i)]++;
   let total = 0, sum = 0;
   for (let i = 0; i < 256; i++){ total += hist[i]; sum += i * hist[i]; }
   let sumB = 0, wB = 0, best = 127, bv = -1;
@@ -499,9 +531,11 @@ function processFrame(){
   cvs.width = w; cvs.height = h;
   cctx.drawImage(v, 0, 0, w, h);
   const img = cctx.getImageData(0, 0, w, h).data;
-  const gray = new Uint8Array(w * h);
-  for (let i = 0, j = 0; j < gray.length; i += 4, j++)
-    gray[j] = (img[i] * 77 + img[i+1] * 150 + img[i+2] * 29) >> 8;
+  // Luma is tapped on demand, not precomputed: converting all 8.3M px to
+  // gray before touching any of them was the dominant fixed cost per frame
+  // on the phone, and the decoder only ever reads a fraction of the pixels
+  // (cell centres, scan rows, a sparse histogram).
+  const G = p => (img[p<<2]*77 + img[(p<<2)+1]*150 + img[(p<<2)+2]*29) >> 8;
   stats.frames++;
   // GEOMETRY TRACKING. Re-running finder detection on every frame is the
   // dominant cost AND the dominant loss: measured 31 of 212 frames located
@@ -513,7 +547,7 @@ function processFrame(){
   if (lastH){
     const hb0 = new Uint8Array(HC.length);
     const hc0 = new Float32Array(HC.length);
-    const bits0 = sampleBits(gray, w, h, lastH);
+    const bits0 = sampleBits(G, w, h, lastH);
     for (let i = 0; i < HC.length; i++){
       hb0[i] = bits0.bitAt[HC[i]];
       hc0[i] = bits0.confAt[HC[i]];
@@ -521,13 +555,11 @@ function processFrame(){
     if (tryHeader(hb0, hc0)){ H = lastH; tracked = true; cachedBits = bits0; }
   }
   if (!H){
-    const fs = findFinders(gray, w, h);
-    if (!fs){ lastH = null;
+    const d = detectH(G, w, h);
+    if (!d){ lastH = null;
       guide("NO LOCK", `hold the whole code in frame (${lastCands} hits)`, 0);
       return; }
-    H = homography(M.finders, fs);
-    if (!H){ lastH = null; guide("NO LOCK", "steady the phone", 0); return; }
-    cachedBits = null;
+    H = d.H; cachedBits = d.sb;
   }
   lastH = H;
   stats.located++;
@@ -540,11 +572,11 @@ function processFrame(){
   const pxPerCell = (Math.hypot(p1[0]-p0[0], p1[1]-p0[1]) +
                      Math.hypot(p2[0]-p0[0], p2[1]-p0[1])) / 2;
   lastPx = pxPerCell;
-  const sb = cachedBits || sampleBits(gray, w, h, H);
+  const sb = cachedBits || sampleBits(G, w, h, H);
   finishFrame(sb.bitAt, sb.confAt, pxPerCell);
 }
 
-function sampleBits(gray, w, h, H){
+function sampleBits(G, w, h, H){
   const nCells = M.gw * M.gh;
   const lum = new Float32Array(nCells);
   for (let r = 0; r < M.gh; r++){
@@ -552,8 +584,8 @@ function sampleBits(gray, w, h, H){
       const [px, py] = applyH(H, c + 0.5, r + 0.5);
       const xi = Math.min(w-2, Math.max(0, px|0));
       const yi = Math.min(h-2, Math.max(0, py|0));
-      lum[r*M.gw+c] = (gray[yi*w+xi] + gray[yi*w+xi+1] +
-                       gray[(yi+1)*w+xi] + gray[(yi+1)*w+xi+1]) / 4;
+      lum[r*M.gw+c] = (G(yi*w+xi) + G(yi*w+xi+1) +
+                       G((yi+1)*w+xi) + G((yi+1)*w+xi+1)) / 4;
     }
   }
   // local threshold over cell space, 15-cell box via integral image
@@ -759,7 +791,7 @@ $("sf").onclick = async () => {
   const gray = new Uint8Array(W*H0);
   for (let i = 0, j = 0; j < gray.length; i += 4, j++)
     gray[j] = (px[i]*77 + px[i+1]*150 + px[i+2]*29) >> 8;
-  const fs = findFinders(gray, W, H0);
+  const fs = findFinders(p => gray[p], W, H0);
   let msg = `synthetic optics: ${lastCands} finder hits, ` +
             `groups ${fs ? "4 FOUND" : "FAILED"}`;
   if (fs){
