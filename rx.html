@@ -400,21 +400,56 @@ function detectH(G, w, h){
   const A = (M.gw - 9) / (M.gh - 9);
   const quads = [[[tl,tr,bl,br], 0],   [[tr,br,tl,bl], 90],
                  [[bl,tl,br,tr], 270], [[br,bl,tr,tl], 180]];
-  let fallback = null;
+  // Hard-decode only in here: detectH may try many (orientation, k1)
+  // candidates per frame and the erasure ladder is the expensive path. A
+  // correct geometry usually decodes hard; the ladder gets ONE shot per
+  // frame, in finishFrame, on the chosen geometry.
+  const headerOf = sb => {
+    const hb = new Uint8Array(HC.length);
+    for (let i = 0; i < HC.length; i++) hb[i] = sb.bitAt[HC[i]];
+    return tryHeader(hb);
+  };
+  // Geometry model: the homography lives in UNDISTORTED space and each
+  // sample point is re-distorted by k1 (sampleBits). Fitting H on the raw
+  // corner points and then bending them too would perturb the four exact
+  // registrations; undistort-fit-redistort pins the corners by
+  // construction, which is how the film-pipeline decoder applies k1.
+  const undist = (q, k1) => {
+    if (!k1) return q;
+    const cx = w / 2, cy = h / 2, rn2 = (w*w + h*h) / 4;
+    return q.map(([x, y]) => {
+      const dx = x - cx, dy = y - cy;
+      const s = 1 + k1 * (dx*dx + dy*dy) / rn2;
+      return [cx + dx / s, cy + dy / s];
+    });
+  };
+  let fallback = null, prefQ = null, prefRot = 0;
   for (const [q, rot] of quads){
     const wpx = Math.hypot(q[1][0]-q[0][0], q[1][1]-q[0][1]);
     const hpx = Math.hypot(q[2][0]-q[0][0], q[2][1]-q[0][1]);
     const r = (wpx / hpx) / A;
     if (r < 0.6 || r > 1.7) continue;
-    const H = homography(M.finders, q);
+    const H = homography(M.finders, undist(q, K1));
     if (!H) continue;
-    const sb = sampleBits(G, w, h, H);
-    const hb = new Uint8Array(HC.length), hc = new Float32Array(HC.length);
-    for (let i = 0; i < HC.length; i++){
-      hb[i] = sb.bitAt[HC[i]]; hc[i] = sb.confAt[HC[i]];
+    if (!prefQ){ prefQ = q; prefRot = rot; }
+    const sb = sampleBits(G, w, h, H, K1);
+    const hd = headerOf(sb);
+    if (hd) return { H, sb, rot, hd };
+    if (!fallback) fallback = { H, sb, rot, hd: null };
+  }
+  // k1 sweep, header-certified, rate-limited. Runs only while nothing
+  // decodes at the current K1, on the first plausible orientation, with
+  // the homography refit per candidate.
+  if (prefQ && performance.now() - k1SweepAt > 800){
+    k1SweepAt = performance.now();
+    for (const k1 of K1LADDER){
+      if (k1 === K1) continue;
+      const H = homography(M.finders, undist(prefQ, k1));
+      if (!H) continue;
+      const sb = sampleBits(G, w, h, H, k1);
+      const hd = headerOf(sb);
+      if (hd){ K1 = k1; return { H, sb, rot: prefRot, hd }; }
     }
-    if (tryHeader(hb, hc)) return { H, sb, rot };
-    if (!fallback) fallback = { H, sb, rot };
   }
   return fallback;
 }
@@ -543,23 +578,24 @@ function processFrame(){
   // the PREVIOUS frame's homography first and keep it if the header still
   // decodes. That is a far stricter test than any tracking residual: 68
   // bytes behind RS(68,28) and a CRC16 do not pass on stale geometry.
-  let H = null, tracked = false;
+  let H = null, tracked = false, hdKnown;
   if (lastH){
     const hb0 = new Uint8Array(HC.length);
     const hc0 = new Float32Array(HC.length);
-    const bits0 = sampleBits(G, w, h, lastH);
+    const bits0 = sampleBits(G, w, h, lastH, K1);
     for (let i = 0; i < HC.length; i++){
       hb0[i] = bits0.bitAt[HC[i]];
       hc0[i] = bits0.confAt[HC[i]];
     }
-    if (tryHeader(hb0, hc0)){ H = lastH; tracked = true; cachedBits = bits0; }
+    const hd0 = tryHeader(hb0, hc0);
+    if (hd0){ H = lastH; tracked = true; cachedBits = bits0; hdKnown = hd0; }
   }
   if (!H){
     const d = detectH(G, w, h);
     if (!d){ lastH = null;
       guide("NO LOCK", `hold the whole code in frame (${lastCands} hits)`, 0);
       return; }
-    H = d.H; cachedBits = d.sb;
+    H = d.H; cachedBits = d.sb; hdKnown = d.hd || undefined;
   }
   lastH = H;
   stats.located++;
@@ -572,16 +608,33 @@ function processFrame(){
   const pxPerCell = (Math.hypot(p1[0]-p0[0], p1[1]-p0[1]) +
                      Math.hypot(p2[0]-p0[0], p2[1]-p0[1])) / 2;
   lastPx = pxPerCell;
-  const sb = cachedBits || sampleBits(G, w, h, H);
-  finishFrame(sb.bitAt, sb.confAt, pxPerCell);
+  const sb = cachedBits || sampleBits(G, w, h, H, K1);
+  finishFrame(sb.bitAt, sb.confAt, pxPerCell, hdKnown);
 }
 
-function sampleBits(G, w, h, H){
+// Radial term. The homography is fit on four corner pilots, but the phone
+// lens is not a pinhole: mid-field sample points drift off-grid by several
+// px, which at 8-10 cam-px/cell corrupts most codewords while the corners
+// (and often the header band) still read. The film-pipeline decoder proved
+// this exact mechanism: geometry chosen by border pilots alone loses 87.3%
+// of codewords vs geometry chosen by the code (k1 hill-climb). K1 is swept
+// by detectH with the header as the certifier and then held.
+let K1 = 0, k1SweepAt = 0;
+const K1LADDER = [0.005, 0.01, 0.015, 0.02, 0.03, 0.045,
+                  -0.005, -0.01, -0.02, -0.03];
+
+function sampleBits(G, w, h, H, k1){
   const nCells = M.gw * M.gh;
   const lum = new Float32Array(nCells);
+  const cx = w / 2, cy = h / 2, rn2 = (w*w + h*h) / 4;
   for (let r = 0; r < M.gh; r++){
     for (let c = 0; c < M.gw; c++){
-      const [px, py] = applyH(H, c + 0.5, r + 0.5);
+      let [px, py] = applyH(H, c + 0.5, r + 0.5);
+      if (k1){
+        const dx = px - cx, dy = py - cy;
+        const s = 1 + k1 * (dx*dx + dy*dy) / rn2;
+        px = cx + dx * s; py = cy + dy * s;
+      }
       const xi = Math.min(w-2, Math.max(0, px|0));
       const yi = Math.min(h-2, Math.max(0, py|0));
       lum[r*M.gw+c] = (G(yi*w+xi) + G(yi*w+xi+1) +
@@ -614,14 +667,17 @@ function sampleBits(G, w, h, H){
   return { bitAt, confAt };
 }
 
-function finishFrame(bitAt, confAt, pxPerCell){
-  const hb = new Uint8Array(HC.length);
-  const hcf = new Float32Array(HC.length);
-  for (let i = 0; i < HC.length; i++){
-    hb[i] = bitAt[HC[i]];
-    hcf[i] = confAt[HC[i]];
+function finishFrame(bitAt, confAt, pxPerCell, hdIn){
+  let hd = hdIn;
+  if (hd === undefined){
+    const hb = new Uint8Array(HC.length);
+    const hcf = new Float32Array(HC.length);
+    for (let i = 0; i < HC.length; i++){
+      hb[i] = bitAt[HC[i]];
+      hcf[i] = confAt[HC[i]];
+    }
+    hd = tryHeader(hb, hcf);
   }
-  const hd = tryHeader(hb, hcf);
   if (hd && JSMODE && hd.k !== dynK){
     dynK = hd.k; dynSize = hd.fileSize; dynCum = robustSoliton(dynK);
   }
@@ -726,8 +782,8 @@ function guide(state, tip, px, yld){
   g.style.color = col;
   g.innerHTML = `<b>${state}</b> &nbsp; ${tip}` +
     (px ? `<br><small>${px.toFixed(1)} cam-px/cell` +
-          (yAvg ? ` &nbsp; yield ${(100*yAvg).toFixed(0)}%` : "")
-          + `</small>` : "");
+          (yAvg ? ` &nbsp; yield ${(100*yAvg).toFixed(0)}%` : "") +
+          ` &nbsp; k1 ${K1.toFixed(3)}</small>` : "");
 }
 
 let running = false;

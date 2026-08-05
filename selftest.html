@@ -92,6 +92,7 @@ function randBytes(n){
   rx.ev(`globalThis._rxReset = () => {
     dec = newDecoder(); dynK = 0; dynCum = null; dynSize = 0;
     prevBlocks = null; prevSeq = -10; lastH = null; cachedBits = null;
+    K1 = 0; k1SweepAt = 0;
     stats = { frames:0, located:0, tracked:0, certified:0,
               t0: performance.now(), firstHit: 0 };
   };
@@ -121,9 +122,9 @@ function randBytes(n){
     for (let i = 0; i < HC.length; i++){
       hb[i] = sb.bitAt[HC[i]]; hc[i] = sb.confAt[HC[i]];
     }
-    const hd = tryHeader(hb, hc);
+    const hd = d.hd || tryHeader(hb, hc);
     const before = stats.certified;
-    if (hd) finishFrame(sb.bitAt, sb.confAt, 0);
+    if (hd) finishFrame(sb.bitAt, sb.confAt, 0, hd);
     return { st: hd ? "hdr" : "nohdr", rot: d.rot,
              cw: stats.certified - before,
              got: dec.decoded.size, k: dynK };
@@ -177,7 +178,7 @@ function randBytes(n){
   // rot simulates a rotation-locked phone buffer: the code arrives
   // transposed, which is what an iPhone with portrait lock delivers no
   // matter how the phone is held.
-  const cam = (cells, S, blend, rot) => {
+  const cam = (cells, S, blend, rot, kc) => {
     const Mx = tx.ev("M");
     const mg = Math.round(4 * S);
     const w = Mx.gw * S + mg * 2, h = Mx.gh * S + mg * 2;
@@ -219,6 +220,19 @@ function randBytes(n){
       const n = (Math.random() + Math.random() + Math.random() - 1.5) * 4;
       let v = ((img[i]*77 + img[i+1]*150 + img[i+2]*29) >> 8) + n;
       gray[j] = v < 0 ? 0 : (v > 255 ? 255 : v);
+    }
+    if (kc){
+      // barrel-distort like a real lens: dest p reads ideal at radius
+      // scaled by (1 + kc r^2), same family the receiver's K1 inverts
+      const g2 = new Uint8Array(sw * sh);
+      const cx = sw / 2, cy = sh / 2, rn2 = (sw*sw + sh*sh) / 4;
+      for (let y = 0; y < sh; y++) for (let x = 0; x < sw; x++){
+        const dx = x - cx, dy = y - cy;
+        const sc = 1 + kc * (dx*dx + dy*dy) / rn2;
+        const sx = (cx + dx*sc) | 0, sy = (cy + dy*sc) | 0;
+        g2[y*sw+x] = (sx>=0 && sx<sw && sy>=0 && sy<sh) ? gray[sy*sw+sx] : 8;
+      }
+      return { gray: g2, w: sw, h: sh };
     }
     return { gray, w: sw, h: sh };
   };
@@ -303,6 +317,31 @@ function randBytes(n){
         : `D FAIL: closed but sha mismatch`, hex === want ? "p" : "f");
     } else say(`D FAIL: rotated capture did not close in ${s} frames ` +
                `(${r ? r.st + " " + r.got + "/" + r.k : "?"})`, "f");
+  }
+
+  // ---------- TEST E: lens distortion, k1 swept by the header ----------
+  {
+    const payload = randBytes(100 * 1024);
+    const want = await sha(payload);
+    const wr = await tx.ev("containerize")(payload, "warp.bin");
+    tx.ev("prepare")(wr, "warp.bin");
+    rx.ev("_rxReset()");
+    let s = 0, r = null;
+    for (; s < 300; s++){
+      const { gray, w, h } = cam(tx.ev("_txCells")(s), 9, null, false, 0.02);
+      r = rx.ev("_rxFrame")(gray, w, h);
+      if (r.k && r.got >= r.k) break;
+    }
+    const k1 = rx.ev("K1");
+    if (r && r.k && r.got >= r.k){
+      const body = unwrap(rx.ev("_rxOut()"));
+      const hex = body ? await sha(body) : "no-container";
+      say(hex === want
+        ? `E PASS: barrel-distorted capture (kc 0.020) closed 100 KB ` +
+          `bit-exact in ${s+1} frames, sweep chose k1 ${k1.toFixed(3)}`
+        : `E FAIL: closed but sha mismatch`, hex === want ? "p" : "f");
+    } else say(`E FAIL: distorted capture no close in ${s} frames ` +
+               `(k1 ${k1.toFixed(3)}, ${r ? r.got + "/" + r.k : "?"})`, "f");
   }
   say("done.");
 })().catch(e => say("HARNESS ERROR: " + (e.stack || e), "f"));
