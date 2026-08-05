@@ -242,6 +242,15 @@ function drawSeq(seq){
 
 let seq = 0, running = false, t0 = 0, n = 0, fpsT = 0, fpsN = 0;
 const CD = 12;
+// SEQ PACING. One code frame per animation tick is wrong on both ends: a
+// ProMotion laptop ticks at 120 Hz while the phone's getUserMedia captures
+// 30 fps, so nearly every capture integrates two or more DIFFERENT code
+// frames, and a blended frame is unrecoverable (measured: the SIC oracle
+// left residual d' 0.04-1.20). Pace seqs on the clock instead, at a rate a
+// 30 fps receiver can see one-to-one. ?rate=60 if the receiver runs 60.
+const RATE = Math.max(1, +(new URLSearchParams(location.search).get("rate")
+                           || 30));
+let nextT = 0;
 function tick(){
   if (!running) return;
   const now = performance.now();
@@ -275,12 +284,18 @@ function tick(){
                  c.width/2, c.height*0.57);
   } else {
     if (!$("hud").classList.contains("mid")) $("hud").classList.add("mid");
-    drawSeq(seq++); n++;
+    if (!nextT) nextT = now;
+    if (now >= nextT){
+      drawSeq(seq++); n++;
+      nextT += 1000 / RATE;
+      if (now - nextT > 500) nextT = now + 1000 / RATE;   // stalled; resync
+    }
   }
   fpsN++;
   if (now - fpsT > 1000){
     $("hud").textContent = `${FNAME} ${FSIZE.toLocaleString()}B  k=${K}  ` +
-      `${(fpsN*1000/(now-fpsT)).toFixed(0)}fps  seq ${seq}`;
+      `${RATE}seq/s  display ${(fpsN*1000/(now-fpsT)).toFixed(0)}fps  ` +
+      `seq ${seq}`;
     fpsN = 0; fpsT = now;
   }
   requestAnimationFrame(tick);

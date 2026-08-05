@@ -1,0 +1,272 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>heliogram selftest</title>
+<style>
+body{background:#000;color:#0f0;font:13px monospace;padding:16px}
+pre{white-space:pre-wrap}
+.f{color:#f33}.p{color:#0f0}.d{color:#7a7}
+</style></head><body>
+<h3>heliogram end-to-end selftest</h3>
+<pre id="log">booting…</pre>
+<script>
+// Loads the REAL hgtx.html and rx.html scripts (fetched, extracted,
+// evaluated with a stub DOM) and drives them against each other. Three
+// tests, in order of what they prove:
+//   A  coding layer at 1 MB: sender bytes -> receiver bytes, sha256 equal
+//   B  optics: rendered cells through a camera model (blur+noise) at a
+//      ladder of cam-px/cell, ending with a full closed transfer
+//   C  two-frame blend: why the sender must not outpace the camera
+// This is the dress-rehearsal rule as a page: no camera, no phone, and any
+// failure here is a code bug, not an optics problem.
+const L = document.getElementById("log");
+const say = (s, cls) => { L.innerHTML += `\n<span class="${cls||''}">${s}</span>`; };
+
+async function loadPage(url, loc){
+  const html = await (await fetch(url)).text();
+  const src = html.match(/<script>([\s\S]*)<\/script>/)[1];
+  const elems = {};
+  const mk = id => elems[id] || (elems[id] =
+    id === "c" ? document.createElement("canvas")
+    : { classList:{add(){},remove(){},toggle(){},contains:()=>false},
+        style:{}, textContent:"", innerHTML:"", onclick:null,
+        onchange:null, addEventListener(){}, files:[] });
+  const doc = { getElementById: mk,
+                createElement: t => document.createElement(t),
+                addEventListener(){},
+                documentElement:{ requestFullscreen(){} } };
+  const f = new Function("document","location","addEventListener",
+    src + '\n;return {ev: c => eval(c)};');
+  return f(doc, loc, () => {});
+}
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const sha = async b => [...new Uint8Array(
+  await crypto.subtle.digest("SHA-256", b))]
+  .map(x => x.toString(16).padStart(2, "0")).join("");
+function randBytes(n){
+  const b = new Uint8Array(n);
+  for (let o = 0; o < n; o += 65536)
+    crypto.getRandomValues(b.subarray(o, Math.min(n, o + 65536)));
+  return b;
+}
+
+(async () => {
+  const tx = await loadPage("hgtx.html", {search:""});
+  const rx = await loadPage("rx.html",  {search:"?js=1"});
+  while (!tx.ev("M") || !rx.ev("M")) await sleep(50);
+  const M = tx.ev("M");
+  say(`pages loaded: grid ${M.gw}x${M.gh}, ${M.n_sub} cw/frame, ` +
+      `sub ${M.sub}, ecc ${M.ecc}`, "d");
+
+  // sender helpers, defined INSIDE the sender's scope
+  tx.ev(`globalThis._txFrame = seq => {
+    const hdr = packHeader(seq, K, M.sub, FSIZE);
+    const cws = [];
+    for (let j = 0; j < M.n_sub; j++){
+      const blk = fountainBlock(seq * M.n_sub + j);
+      const msg = new Uint8Array(4 + M.sub);
+      const cr = crc32(blk, 0, blk.length);
+      msg[0]=cr&255; msg[1]=(cr>>>8)&255; msg[2]=(cr>>>16)&255;
+      msg[3]=(cr>>>24)&255;
+      msg.set(blk, 4);
+      cws.push(rsEncode(msg, M.ecc));
+    }
+    return { hdr, cws };
+  };
+  globalThis._txCells = seq => {
+    if (!FILLER) buildFiller();
+    const cells = new Uint8Array(M.gw * M.gh);
+    for (const [i, v] of FILLER) cells[i] = v;
+    for (let i = 0; i < SC.length; i++)
+      cells[SC[i]] = (SV[i>>3] >> (7-(i&7))) & 1;
+    const f = _txFrame(seq);
+    for (let i = 0; i < f.hdr.length; i++)
+      for (let b = 0; b < 8; b++)
+        cells[HC[i*8+b]] = (f.hdr[i] >> (7-b)) & 1;
+    for (let j = 0; j < M.n_sub; j++)
+      for (let i = 0; i < 255; i++)
+        for (let b = 0; b < 8; b++)
+          cells[PC[(j*255+i)*8+b]] = (f.cws[j][i] >> (7-b)) & 1;
+    return cells;
+  };`);
+
+  // receiver helpers, defined INSIDE the receiver's scope
+  rx.ev(`globalThis._rxReset = () => {
+    dec = newDecoder(); dynK = 0; dynCum = null; dynSize = 0;
+    prevBlocks = null; prevSeq = -10; lastH = null; cachedBits = null;
+    stats = { frames:0, located:0, tracked:0, certified:0,
+              t0: performance.now(), firstHit: 0 };
+  };
+  globalThis._rxBytes = (hdrBytes, cwList) => {
+    const nb = M.hdr_len_enc * 8;
+    const bits = new Uint8Array(nb);
+    for (let i = 0; i < hdrBytes.length; i++)
+      for (let b = 0; b < 8; b++)
+        bits[i*8+b] = (hdrBytes[i] >> (7-b)) & 1;
+    const hd = tryHeader(bits);
+    if (!hd) return -1;
+    if (JSMODE && hd.k !== dynK){
+      dynK = hd.k; dynSize = hd.fileSize; dynCum = robustSoliton(dynK);
+    }
+    for (let j = 0; j < cwList.length; j++){
+      const blk = certify(Uint8Array.from(cwList[j]), null, M.ecc, M.sub);
+      if (blk) fountainAdd(hd.seq * M.n_sub + j, blk);
+    }
+    return dec.decoded.size;
+  };
+  globalThis._rxFrame = (gray, w, h) => {
+    const fs = findFinders(gray, w, h);
+    if (!fs) return { st: "nolock" };
+    const H = homography(M.finders, fs);
+    if (!H) return { st: "noH" };
+    const sb = sampleBits(gray, w, h, H);
+    const hb = new Uint8Array(HC.length);
+    const hc = new Float32Array(HC.length);
+    for (let i = 0; i < HC.length; i++){
+      hb[i] = sb.bitAt[HC[i]]; hc[i] = sb.confAt[HC[i]];
+    }
+    const hd = tryHeader(hb, hc);
+    const before = stats.certified;
+    if (hd) finishFrame(sb.bitAt, sb.confAt, 0);
+    return { st: hd ? "hdr" : "nohdr",
+             cw: stats.certified - before,
+             got: dec.decoded.size, k: dynK };
+  };
+  globalThis._rxOut = () => {
+    const out = new Uint8Array(dynK * M.sub);
+    for (let i = 0; i < dynK; i++) out.set(dec.decoded.get(i), i * M.sub);
+    return out.slice(0, dynSize);
+  };`);
+
+  function unwrap(data){
+    if (!(data[0]===0x48 && data[1]===0x47 && data[2]===0x43 &&
+          data[3]===0x31)) return null;
+    const dv = new DataView(data.buffer, data.byteOffset);
+    const nl = dv.getUint16(4, true);
+    const sz = dv.getUint32(6 + nl, true);
+    return data.subarray(42 + nl, 42 + nl + sz);
+  }
+
+  // ---------- TEST A: coding layer, 1 MB ----------
+  {
+    const payload = randBytes(1 << 20);
+    const want = await sha(payload);
+    const wrapped = await tx.ev("containerize")(payload, "blob.bin");
+    tx.ev("prepare")(wrapped, "blob.bin");
+    rx.ev("_rxReset()");
+    const t0 = performance.now();
+    let got = 0, frames = 0, K = tx.ev("K");
+    for (; frames < 600; frames++){
+      const f = tx.ev("_txFrame")(frames);
+      got = rx.ev("_rxBytes")(f.hdr, f.cws);
+      if (got < 0){ say(`A FAIL: header rejected at seq ${frames}`, "f");
+                    got = 0; break; }
+      if (got >= rx.ev("dynK") && rx.ev("dynK")) break;
+    }
+    const dt = performance.now() - t0;
+    if (got && got >= rx.ev("dynK")){
+      const data = rx.ev("_rxOut()");
+      const body = unwrap(data);
+      const hex = body ? await sha(body) : "no-container";
+      say(hex === want
+        ? `A PASS: 1 MB (k=${K}) closed in ${frames+1} frames, ` +
+          `${(dt/1000).toFixed(1)}s decode wall, sha256 equal`
+        : `A FAIL: closed but sha mismatch (${hex.slice(0,12)} vs ` +
+          `${want.slice(0,12)})`, hex === want ? "p" : "f");
+    } else say(`A FAIL: fountain did not close in ${frames} frames ` +
+               `(got ${got}/${rx.ev("dynK")})`, "f");
+  }
+
+  // camera model: draw cells at S px/cell, panel-ish levels, blur, noise
+  const cam = (cells, S, blend) => {
+    const Mx = tx.ev("M");
+    const mg = Math.round(4 * S);
+    const w = Mx.gw * S + mg * 2, h = Mx.gh * S + mg * 2;
+    const cv = document.createElement("canvas");
+    cv.width = w; cv.height = h;
+    const g = cv.getContext("2d", { willReadFrequently: true });
+    g.fillStyle = "rgb(8,8,8)"; g.fillRect(0, 0, w, h);
+    const draw = (cs, alpha) => {
+      g.globalAlpha = alpha;
+      const id = g.createImageData(Mx.gw, Mx.gh);
+      for (let i = 0; i < cs.length; i++){
+        const v = cs[i] ? 230 : 20, p = i * 4;
+        id.data[p] = id.data[p+1] = id.data[p+2] = v; id.data[p+3] = 255;
+      }
+      const oc = document.createElement("canvas");
+      oc.width = Mx.gw; oc.height = Mx.gh;
+      oc.getContext("2d").putImageData(id, 0, 0);
+      g.imageSmoothingEnabled = false;
+      g.filter = `blur(${(0.13 * S).toFixed(2)}px)`;
+      g.drawImage(oc, 0, 0, Mx.gw, Mx.gh, mg, mg, Mx.gw*S, Mx.gh*S);
+      g.filter = "none"; g.globalAlpha = 1;
+    };
+    draw(cells, 1);
+    if (blend) draw(blend, 0.5);
+    const img = g.getImageData(0, 0, w, h).data;
+    const gray = new Uint8Array(w * h);
+    for (let i = 0, j = 0; j < gray.length; i += 4, j++){
+      const n = (Math.random() + Math.random() + Math.random() - 1.5) * 4;
+      let v = ((img[i]*77 + img[i+1]*150 + img[i+2]*29) >> 8) + n;
+      gray[j] = v < 0 ? 0 : (v > 255 ? 255 : v);
+    }
+    return { gray, w, h };
+  };
+
+  // ---------- TEST C: two-frame blend kills the header ----------
+  {
+    const wrapped = await tx.ev("containerize")(randBytes(65536), "c.bin");
+    tx.ev("prepare")(wrapped, "c.bin");
+    rx.ev("_rxReset()");
+    let hits = 0;
+    for (let s = 0; s < 20; s++){
+      const a = tx.ev("_txCells")(s), b = tx.ev("_txCells")(s + 1);
+      const { gray, w, h } = cam(a, 6, b);
+      if (rx.ev("_rxFrame")(gray, w, h).st === "hdr") hits++;
+    }
+    say(`C ${hits === 0 ? "CONFIRMED" : "UNEXPECTED"}: 50/50 blend of ` +
+        `consecutive frames -> header decodes ${hits}/20 ` +
+        `(clean control below)`, hits === 0 ? "p" : "f");
+  }
+
+  // ---------- TEST B: optics ladder, then a full closed transfer ----------
+  {
+    const wrapped = await tx.ev("containerize")(randBytes(65536), "b.bin");
+    tx.ev("prepare")(wrapped, "b.bin");
+    for (const S of [12, 10, 9, 8, 7, 6, 5]){
+      rx.ev("_rxReset()");
+      let hdr = 0, cw = 0, n = 12;
+      for (let s = 0; s < n; s++){
+        const { gray, w, h } = cam(tx.ev("_txCells")(s), S);
+        const r = rx.ev("_rxFrame")(gray, w, h);
+        if (r.st === "hdr"){ hdr++; cw += r.cw; }
+      }
+      say(`B ladder ${S} px/cell: header ${hdr}/${n}, ` +
+          `yield ${(100*cw/(n*M.n_sub)).toFixed(0)}%`,
+          hdr ? "d" : "f");
+    }
+    // full transfer at 6 px/cell equivalent of a mid-distance phone
+    const payload = randBytes(200 * 1024);
+    const want = await sha(payload);
+    const w2 = await tx.ev("containerize")(payload, "full.bin");
+    tx.ev("prepare")(w2, "full.bin");
+    rx.ev("_rxReset()");
+    let s = 0, r = null;
+    const t0 = performance.now();
+    for (; s < 400; s++){
+      const { gray, w, h } = cam(tx.ev("_txCells")(s), 8);
+      r = rx.ev("_rxFrame")(gray, w, h);
+      if (r.k && r.got >= r.k) break;
+    }
+    if (r && r.k && r.got >= r.k){
+      const body = unwrap(rx.ev("_rxOut()"));
+      const hex = body ? await sha(body) : "no-container";
+      say(hex === want
+        ? `B PASS: 200 KB closed through the camera model at 8 px/cell ` +
+          `in ${s+1} frames, ${(1e-3*(performance.now()-t0)).toFixed(1)}s, ` +
+          `sha256 equal`
+        : `B FAIL: closed but sha mismatch`, hex === want ? "p" : "f");
+    } else say(`B FAIL: no close in ${s} frames ` +
+               `(${r ? r.got + "/" + r.k : "?"})`, "f");
+  }
+  say("done.");
+})().catch(e => say("HARNESS ERROR: " + (e.stack || e), "f"));
+</script></body></html>

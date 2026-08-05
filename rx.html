@@ -242,8 +242,13 @@ function certify(chunk, order, ecc, sub){
 }
 
 // ---------- header ----------
-function tryHeader(bits){
-  // bits: Uint8Array over header cells (MSB-first bytes)
+function tryHeader(bits, conf){
+  // bits: Uint8Array over header cells (MSB-first bytes). conf, when given,
+  // is the per-cell |lum - local mean| margin for the same cells, and buys
+  // the header the SAME confidence-ordered erasure ladder the payload gets.
+  // The header is the bootstrap: nothing pools, nothing tracks, and the bar
+  // never moves until it certifies, so it must not be the weakest code on
+  // the screen.
   const nB = M.hdr_len_enc;
   const raw = new Uint8Array(nB);
   for (let i = 0; i < nB; i++){
@@ -251,24 +256,43 @@ function tryHeader(bits){
     for (let b = 0; b < 8; b++) v = (v << 1) | bits[i*8+b];
     raw[i] = v;
   }
-  for (let ph = 0; ph < M.hdr_phases; ph++){
-    const mask = HDR_MASKS[ph];
-    const dew = new Uint8Array(nB);
-    for (let i = 0; i < nB; i++) dew[i] = raw[i] ^ mask[i];
-    if (!correctMsg(dew, nB, M.hdr_ecc, null, 0)) continue;
-    const body = dew.subarray(0, M.hdr_len_pre);
-    if (body[0]!==0x53||body[1]!==0x43||body[2]!==0x50||body[3]!==0x43)
-      continue;                                     // "SCPC"
-    const crc = body[M.hdr_len_pre-2] | (body[M.hdr_len_pre-1] << 8);
-    if (crc16z(body, M.hdr_len_pre - 2) !== crc) continue;
-    const dv = new DataView(body.buffer, body.byteOffset);
-    const seq = dv.getUint32(6, true);
-    if (seq % M.hdr_phases !== ph) continue;
-    return { seq, k: dv.getUint32(10, true),
-             blockSize: dv.getUint16(14, true),
-             fileSize: dv.getUint32(16, true) };
+  let order = null;
+  if (conf){
+    const bc = new Float32Array(nB);
+    for (let i = 0; i < nB; i++){
+      let m = 1e9;
+      for (let b = 0; b < 8; b++) if (conf[i*8+b] < m) m = conf[i*8+b];
+      bc[i] = m;
+    }
+    order = Array.from({length: nB}, (_, i) => i)
+                 .sort((a, b) => bc[a] - bc[b]);
   }
-  return null;
+  const attempt = nEr => {
+    for (let ph = 0; ph < M.hdr_phases; ph++){
+      const mask = HDR_MASKS[ph];
+      const dew = new Uint8Array(nB);
+      for (let i = 0; i < nB; i++) dew[i] = raw[i] ^ mask[i];
+      if (!correctMsg(dew, nB, M.hdr_ecc, nEr ? order : null, nEr)) continue;
+      const body = dew.subarray(0, M.hdr_len_pre);
+      if (body[0]!==0x53||body[1]!==0x43||body[2]!==0x50||body[3]!==0x43)
+        continue;                                     // "SCPC"
+      const crc = body[M.hdr_len_pre-2] | (body[M.hdr_len_pre-1] << 8);
+      if (crc16z(body, M.hdr_len_pre - 2) !== crc) continue;
+      const dv = new DataView(body.buffer, body.byteOffset);
+      const seq = dv.getUint32(6, true);
+      if (seq % M.hdr_phases !== ph) continue;
+      return { seq, k: dv.getUint32(10, true),
+               blockSize: dv.getUint16(14, true),
+               fileSize: dv.getUint32(16, true) };
+    }
+    return null;
+  };
+  let hd = attempt(0);
+  if (!hd && order){
+    const top = Math.floor(M.hdr_ecc * 0.7);
+    for (let nEr = 4; !hd && nEr <= top; nEr += 6) hd = attempt(nEr);
+  }
+  return hd;
 }
 
 // ---------- finder detection: QR-style 1:1:3:1:1 run scan ----------
@@ -488,9 +512,13 @@ function processFrame(){
   let H = null, tracked = false;
   if (lastH){
     const hb0 = new Uint8Array(HC.length);
+    const hc0 = new Float32Array(HC.length);
     const bits0 = sampleBits(gray, w, h, lastH);
-    for (let i = 0; i < HC.length; i++) hb0[i] = bits0.bitAt[HC[i]];
-    if (tryHeader(hb0)){ H = lastH; tracked = true; cachedBits = bits0; }
+    for (let i = 0; i < HC.length; i++){
+      hb0[i] = bits0.bitAt[HC[i]];
+      hc0[i] = bits0.confAt[HC[i]];
+    }
+    if (tryHeader(hb0, hc0)){ H = lastH; tracked = true; cachedBits = bits0; }
   }
   if (!H){
     const fs = findFinders(gray, w, h);
@@ -556,8 +584,12 @@ function sampleBits(gray, w, h, H){
 
 function finishFrame(bitAt, confAt, pxPerCell){
   const hb = new Uint8Array(HC.length);
-  for (let i = 0; i < HC.length; i++) hb[i] = bitAt[HC[i]];
-  const hd = tryHeader(hb);
+  const hcf = new Float32Array(HC.length);
+  for (let i = 0; i < HC.length; i++){
+    hb[i] = bitAt[HC[i]];
+    hcf[i] = confAt[HC[i]];
+  }
+  const hd = tryHeader(hb, hcf);
   if (hd && JSMODE && hd.k !== dynK){
     dynK = hd.k; dynSize = hd.fileSize; dynCum = robustSoliton(dynK);
   }
@@ -677,7 +709,7 @@ function loop(){
   $("hud").textContent = CAMDESC + "\n" +
     `frames ${stats.frames}  located ${stats.located} (tracked ${stats.tracked})  ` +
     `certified ${stats.certified}\n` +
-    `fountain ${dec.decoded.size}/${M.k}  ` +
+    `fountain ${dec.decoded.size}/${JSMODE ? (dynK || "?") : M.k}  ` +
     `${(performance.now()-t).toFixed(0)}ms/frame  ${el.toFixed(1)}s`;
   if ($("v").requestVideoFrameCallback)
     $("v").requestVideoFrameCallback(loop);
