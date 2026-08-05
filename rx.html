@@ -1,0 +1,777 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>heliogram rx</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body{margin:0;background:#000;color:#0f0;font:14px monospace}
+/* CONTAIN, not cover: the preview must show exactly the frame the decoder
+   samples. `cover` crops the edges, so the code could be clipped out of the
+   real capture while still looking fully in frame here. Letterboxing is the
+   honest choice when you are aiming by eye. */
+#v{width:100vw;height:52vh;object-fit:contain;background:#000;display:block}
+#hud{padding:10px;white-space:pre-wrap}
+/* Landscape is the RIGHT way to hold this (a wide code in a wide frame),
+   so the layout must not waste it: shrink the video band and the chrome so
+   the numbers and guidance stay readable beside it. */
+@media (orientation: landscape){
+  #v{height:58vh}
+  body{font-size:12px}
+  #guide{font-size:13px !important;padding:4px 8px !important}
+  #hud{padding:4px 8px;font-size:12px}
+  #bar{height:8px;margin:4px 8px}
+  button{font-size:12px;margin:4px 6px;padding:5px 9px}
+}
+#bar{height:14px;background:#123;margin:8px 10px;border:1px solid #0f0}
+#fill{height:100%;width:0%;background:#0f0}
+button{font:16px monospace;margin:8px 10px;padding:8px 14px}
+a{color:#8ff}
+</style></head><body>
+<video id="v" autoplay playsinline muted></video>
+<div id="guide" style="padding:8px 10px;font-size:17px;color:#f80">point the camera at the sending screen</div>
+<div id="bar"><div id="fill"></div></div>
+<div id="hud">loading rxmeta…</div>
+<button id="go">START CAMERA</button>
+<button id="st">RS SELF-TEST</button>
+<button id="sf">OPTICS SELF-TEST</button>
+<div id="out"></div>
+<script>
+// heliogram browser receiver: realtime screen-to-camera file transfer.
+// Every deterministic artifact (fountain composition, whitening masks,
+// cell orders) is precomputed server-side into rxmeta.json; this page
+// does signal processing, RS+CRC certification, ghost defenses, and the
+// fountain, live on every camera frame.
+
+const $ = id => document.getElementById(id);
+let M = null;                     // rxmeta
+// JS-SENDER MODE (rx.html?js=1): pairs with hgtx.html, where the file is
+// chosen in the browser. Sender and receiver then share ONE deterministic
+// PRNG for the fountain instead of consulting precomputed numpy tables, so
+// any dropped file works; k and size come from the header.
+let JSMODE = new URLSearchParams(location.search).get("js") === "1";
+// A build without the precomputed composition table can ONLY be the
+// browser-sender pair, so imply the mode rather than making a public
+// visitor know to add ?js=1.
+let dynK = 0, dynCum = null, dynSize = 0;
+function mulberry32(a){
+  return function(){
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function robustSoliton(k){
+  const c = 0.03, delta = 0.5;
+  const s = c * Math.log(k / delta) * Math.sqrt(k);
+  const pmf = new Float64Array(k + 1);
+  pmf[1] = 1 / k;
+  for (let d = 2; d <= k; d++) pmf[d] = 1 / (d * (d - 1));
+  const pivot = Math.max(1, Math.min(k, Math.round(k / s)));
+  for (let d = 1; d < pivot; d++) pmf[d] += s / (k * d);
+  if (s > 1) pmf[pivot] += s * Math.log(s / delta) / k;
+  let tot = 0;
+  for (let d = 1; d <= k; d++) tot += pmf[d];
+  const cum = new Float64Array(k + 1);
+  let run = 0;
+  for (let d = 1; d <= k; d++){ run += pmf[d] / tot; cum[d] = run; }
+  return cum;
+}
+function blockIndices(seq, k, cum){
+  const rng = mulberry32(seq ^ 0x9E3779B9);
+  const u = rng();
+  let d = 1;
+  while (d < k && cum[d] < u) d++;
+  const idx = [], seen = new Set();
+  while (idx.length < d){
+    const i = Math.floor(rng() * k) % k;
+    if (!seen.has(i)){ seen.add(i); idx.push(i); }
+  }
+  return idx;
+}
+function idxFor(flat){
+  if (JSMODE) return dynK ? blockIndices(flat, dynK, dynCum) : null;
+  return flat < M.indices.length ? M.indices[flat] : null;
+}
+const b64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+
+// ---------- GF(256), prim 0x11d ----------
+const EXP = new Uint8Array(512), LOG = new Int32Array(256);
+(() => { let x = 1;
+  for (let i = 0; i < 255; i++){ EXP[i] = x; LOG[x] = i;
+    x <<= 1; if (x & 0x100) x ^= 0x11d; }
+  for (let i = 255; i < 512; i++) EXP[i] = EXP[i - 255]; })();
+const gmul = (a,b) => (a===0||b===0) ? 0 : EXP[LOG[a]+LOG[b]];
+const gdiv = (a,b) => a===0 ? 0 : EXP[(LOG[a]+255-LOG[b])%255];
+const ginv = x => EXP[255-LOG[x]];
+const gpowg = p => { let e = p % 255; if (e < 0) e += 255; return EXP[e]; };
+
+function polyEval(p, lp, x){
+  let y = p[0];
+  for (let i = 1; i < lp; i++) y = gmul(y, x) ^ p[i];
+  return y;
+}
+function polyMul(a, la, b, lb, out){
+  const lo = la + lb - 1; out.fill(0, 0, lo);
+  for (let i = 0; i < la; i++) for (let j = 0; j < lb; j++)
+    out[i+j] ^= gmul(a[i], b[j]);
+  return lo;
+}
+function calcSynd(msg, n, nsym, synd){
+  let mx = 0; synd[0] = 0;
+  for (let i = 0; i < nsym; i++){
+    const v = polyEval(msg, n, gpowg(i)); synd[1+i] = v; if (v > mx) mx = v;
+  }
+  return mx;
+}
+// exact port of crs2.c correct_msg (itself a line-by-line reedsolo port)
+function correctMsg(msg, n, nsym, erase, nErase){
+  const synd = new Uint8Array(64), fsynd = new Uint8Array(64);
+  let errLoc = new Uint8Array(128), oldLoc = new Uint8Array(128);
+  const tmp = new Uint8Array(128);
+  if (nErase > nsym) return false;
+  for (let i = 0; i < nErase; i++) msg[erase[i]] = 0;
+  if (calcSynd(msg, n, nsym, synd) === 0) return true;
+  const lf = nsym;
+  for (let i = 0; i < lf; i++) fsynd[i] = synd[1+i];
+  for (let i = 0; i < nErase; i++){
+    const x = gpowg(n - 1 - erase[i]);
+    for (let j = 0; j < lf - 1; j++)
+      fsynd[j] = gmul(fsynd[j], x) ^ fsynd[j+1];
+  }
+  let le = 1, lo_ = 1; errLoc[0] = 1; oldLoc[0] = 1;
+  for (let i = 0; i < nsym - nErase; i++){
+    const K = i;
+    let delta = fsynd[K];
+    for (let j = 1; j < le; j++)
+      delta ^= gmul(errLoc[le-1-j], fsynd[K-j]);
+    oldLoc[lo_++] = 0;
+    if (delta !== 0){
+      if (lo_ > le){
+        for (let j = 0; j < lo_; j++) tmp[j] = gmul(oldLoc[j], delta);
+        const di = ginv(delta);
+        for (let j = 0; j < le; j++) oldLoc[j] = gmul(errLoc[j], di);
+        const t = lo_; lo_ = le; le = t;
+        errLoc.set(tmp.subarray(0, le));
+      }
+      const lm = Math.max(le, lo_);
+      const sum = new Uint8Array(lm);
+      for (let j = 0; j < le; j++) sum[lm-le+j] ^= errLoc[j];
+      for (let j = 0; j < lo_; j++) sum[lm-lo_+j] ^= gmul(oldLoc[j], delta);
+      errLoc.set(sum.subarray(0, lm)); le = lm;
+    }
+  }
+  let lead = 0; while (lead < le && errLoc[lead] === 0) lead++;
+  le -= lead;
+  const eloc = errLoc.subarray(lead, lead + le);
+  const errs = le - 1;
+  if ((errs - nErase) * 2 + nErase > nsym) return false;
+  const rev = new Uint8Array(le);
+  for (let i = 0; i < le; i++) rev[i] = eloc[le-1-i];
+  const errPos = [];
+  for (let i = 0; i < n; i++)
+    if (polyEval(rev, le, gpowg(i)) === 0) errPos.push(n - 1 - i);
+  if (errPos.length !== errs) return false;
+  const pos = [];
+  for (let i = 0; i < nErase; i++) pos.push(erase[i]);
+  for (const p of errPos) pos.push(p);
+  const np = pos.length;
+  const coef = pos.map(p => n - 1 - p);
+  let eloc2 = new Uint8Array(220); eloc2[0] = 1; let lel = 1;
+  const prod = new Uint8Array(300);
+  for (let i = 0; i < np; i++){
+    const term = new Uint8Array([gpowg(coef[i]), 1]);
+    const lp = polyMul(eloc2, lel, term, 2, prod);
+    eloc2.set(prod.subarray(0, lp)); lel = lp;
+  }
+  const ls = nsym + 1;
+  const srev = new Uint8Array(ls);
+  for (let i = 0; i < ls; i++) srev[i] = synd[ls-1-i];
+  const prod2 = new Uint8Array(400);
+  const lp2 = polyMul(srev, ls, eloc2, lel, prod2);
+  const lev = lel;
+  const evalR = new Uint8Array(lev);
+  for (let i = 0; i < lev; i++) evalR[i] = prod2[lp2-1-i];
+  const X = coef.map(c => gpowg(-(255 - c)));
+  const E = new Uint8Array(n);
+  const evrev = new Uint8Array(lev);
+  for (let j = 0; j < lev; j++) evrev[j] = evalR[lev-1-j];
+  for (let i = 0; i < np; i++){
+    const Xi = X[i], XiInv = ginv(Xi);
+    let prime = 1;
+    for (let j = 0; j < np; j++)
+      if (j !== i) prime = gmul(prime, 1 ^ gmul(XiInv, X[j]));
+    if (prime === 0) return false;
+    let y = polyEval(evrev, lev, XiInv);
+    y = gmul(Xi, y);
+    E[pos[i]] = gdiv(y, prime);
+  }
+  for (let i = 0; i < n; i++) msg[i] ^= E[i];
+  return calcSynd(msg, n, nsym, synd) === 0;
+}
+
+// ---------- CRC32 ----------
+const CRC_T = new Uint32Array(256);
+(() => { for (let n = 0; n < 256; n++){ let c = n;
+  for (let k = 0; k < 8; k++) c = (c & 1) ? 0xEDB88320 ^ (c >>> 1) : c >>> 1;
+  CRC_T[n] = c >>> 0; } })();
+function crc32(buf, off, len){
+  let c = 0xFFFFFFFF;
+  for (let i = 0; i < len; i++)
+    c = CRC_T[(c ^ buf[off+i]) & 0xFF] ^ (c >>> 8);
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+function crc16z(buf, len){          // zlib.crc32 & 0xFFFF over the body
+  return crc32(buf, 0, len) & 0xFFFF;
+}
+
+// certify one codeword: hard, then erasure ladder, then CRC32 gate
+function certify(chunk, order, ecc, sub){
+  const msg = new Uint8Array(255);
+  msg.set(chunk);
+  let ok = correctMsg(msg, 255, ecc, null, 0);
+  if (!ok && order){
+    const top = Math.floor(ecc * 0.7);
+    for (let nEr = 4; nEr <= top && !ok; nEr += 6){
+      msg.set(chunk);
+      ok = correctMsg(msg, 255, ecc, order, nEr);
+    }
+  }
+  if (!ok) return null;
+  const want = (msg[0] | (msg[1]<<8) | (msg[2]<<16) | (msg[3]<<24)) >>> 0;
+  if (crc32(msg, 4, sub) !== want) return null;
+  return msg.slice(4, 4 + sub);
+}
+
+// ---------- header ----------
+function tryHeader(bits){
+  // bits: Uint8Array over header cells (MSB-first bytes)
+  const nB = M.hdr_len_enc;
+  const raw = new Uint8Array(nB);
+  for (let i = 0; i < nB; i++){
+    let v = 0;
+    for (let b = 0; b < 8; b++) v = (v << 1) | bits[i*8+b];
+    raw[i] = v;
+  }
+  for (let ph = 0; ph < M.hdr_phases; ph++){
+    const mask = HDR_MASKS[ph];
+    const dew = new Uint8Array(nB);
+    for (let i = 0; i < nB; i++) dew[i] = raw[i] ^ mask[i];
+    if (!correctMsg(dew, nB, M.hdr_ecc, null, 0)) continue;
+    const body = dew.subarray(0, M.hdr_len_pre);
+    if (body[0]!==0x53||body[1]!==0x43||body[2]!==0x50||body[3]!==0x43)
+      continue;                                     // "SCPC"
+    const crc = body[M.hdr_len_pre-2] | (body[M.hdr_len_pre-1] << 8);
+    if (crc16z(body, M.hdr_len_pre - 2) !== crc) continue;
+    const dv = new DataView(body.buffer, body.byteOffset);
+    const seq = dv.getUint32(6, true);
+    if (seq % M.hdr_phases !== ph) continue;
+    return { seq, k: dv.getUint32(10, true),
+             blockSize: dv.getUint16(14, true),
+             fileSize: dv.getUint32(16, true) };
+  }
+  return null;
+}
+
+// ---------- finder detection: QR-style 1:1:3:1:1 run scan ----------
+function runsAt(get, n, th){
+  const runs = []; let last = get(0) < th ? 1 : 0, len = 1;
+  for (let i = 1; i < n; i++){
+    const d = get(i) < th ? 1 : 0;
+    if (d === last) len++; else { runs.push([last, len, i-len]); last = d; len = 1; }
+  }
+  runs.push([last, len, n-len]);
+  return runs;
+}
+// centre and module size of a 1:1:3:1:1 dark-light-dark-light-dark pattern
+// containing index p, or null. This is the standard QR finder test.
+function ratioAt(runs, p){
+  for (let i = 0; i + 4 < runs.length; i++){
+    if (runs[i][0] !== 1) continue;
+    const q = runs.slice(i, i+5);
+    const [a,b,c,d,e] = q.map(r => r[1]);
+    const u = (a+b+c+d+e) / 7;
+    if (u < 1.5) continue;
+    const s0 = q[0][2], s5 = q[4][2] + q[4][1];
+    if (p < s0 || p > s5) continue;
+    if (Math.abs(a-u) < u*.6 && Math.abs(b-u) < u*.6 &&
+        Math.abs(c-3*u) < 3*u*.45 && Math.abs(d-u) < u*.6 &&
+        Math.abs(e-u) < u*.6)
+      return { c: q[0][2] + a + b + c/2, u };
+  }
+  return null;
+}
+let lastCands = 0;
+function findFinders(gray, w, h){
+  const th = otsu(gray);
+  const cands = [];
+  const step = Math.max(1, Math.floor(h / 500));
+  for (let y = 0; y < h; y += step){
+    const rowGet = i => gray[y*w+i];
+    const runs = runsAt(rowGet, w, th);
+    for (let i = 0; i + 4 < runs.length; i++){
+      if (runs[i][0] !== 1) continue;
+      const q = runs.slice(i, i+5);
+      const [a,b,c,d,e] = q.map(r => r[1]);
+      const u = (a+b+c+d+e) / 7;
+      if (u < 1.5) continue;
+      if (!(Math.abs(a-u) < u*.6 && Math.abs(b-u) < u*.6 &&
+            Math.abs(c-3*u) < 3*u*.45 && Math.abs(d-u) < u*.6 &&
+            Math.abs(e-u) < u*.6)) continue;
+      const cx = Math.round(q[0][2] + a + b + c/2);
+      // VERTICAL CROSS-CHECK. Dense pseudorandom payload throws accidental
+      // horizontal 1:1:3:1:1 runs constantly; a true finder must show the
+      // same ratio vertically through the same centre, with a matching
+      // module size. This is what separates a finder from noise.
+      const colGet = j => gray[j*w+cx];
+      const vr = ratioAt(runsAt(colGet, h, th), y);
+      if (!vr) continue;
+      if (Math.abs(vr.u - u) > Math.max(u, vr.u) * 0.5) continue;
+      cands.push([cx, vr.c, (u + vr.u) / 2]);
+    }
+  }
+  lastCands = cands.length;
+  if (cands.length < 4) return null;
+  // group by proximity (a real finder yields many near-identical hits)
+  const groups = [];
+  for (const c of cands){
+    let g = groups.find(g0 => Math.hypot(g0.x - c[0], g0.y - c[1]) < c[2] * 6);
+    if (!g){ g = { x: c[0], y: c[1], n: 0, sx: 0, sy: 0 }; groups.push(g); }
+    g.n++; g.sx += c[0]; g.sy += c[1];
+    g.x = g.sx / g.n; g.y = g.sy / g.n;
+  }
+  // The payload is pseudorandom, so it throws false 1:1:3:1:1 candidates
+  // all over the interior; counting hits just finds the densest noise. But
+  // the real finders are the EXTREME points of the candidate cloud (they
+  // sit at the code's four corners), so take extremes of x+y and x-y. This
+  // is the standard robust corner extraction and it does not care how much
+  // interior noise there is.
+  const pts = groups.filter(g => g.n >= 2);
+  if (pts.length < 4) return null;
+  let tl = pts[0], br = pts[0], tr = pts[0], bl = pts[0];
+  for (const g of pts){
+    if (g.x + g.y < tl.x + tl.y) tl = g;
+    if (g.x + g.y > br.x + br.y) br = g;
+    if (g.x - g.y > tr.x - tr.y) tr = g;
+    if (g.x - g.y < bl.x - bl.y) bl = g;
+  }
+  const four = [tl, tr, bl, br];
+  // sanity: four distinct points spanning a plausible rectangle
+  const wpx = Math.hypot(tr.x-tl.x, tr.y-tl.y);
+  const hpx = Math.hypot(bl.x-tl.x, bl.y-tl.y);
+  if (wpx < 40 || hpx < 30) return null;
+  const aspect = (wpx / hpx) / ((M.gw - 9) / (M.gh - 9));
+  if (aspect < 0.6 || aspect > 1.7) return null;
+  return four.map(g => [g.x, g.y]);
+}
+
+function otsu(gray){
+  const hist = new Uint32Array(256);
+  for (let i = 0; i < gray.length; i += 7) hist[gray[i]]++;
+  let total = 0, sum = 0;
+  for (let i = 0; i < 256; i++){ total += hist[i]; sum += i * hist[i]; }
+  let sumB = 0, wB = 0, best = 127, bv = -1;
+  for (let t = 0; t < 256; t++){
+    wB += hist[t]; if (!wB) continue;
+    const wF = total - wB; if (!wF) break;
+    sumB += t * hist[t];
+    const mB = sumB / wB, mF = (sum - sumB) / wF;
+    const v = wB * wF * (mB - mF) * (mB - mF);
+    // Return the MIDPOINT BETWEEN CLASS MEANS, not the argmax index. On a
+    // two-level image (which a rendered code frame is) every split between
+    // the levels has identical between-class variance, so argmax returns
+    // t=0 and `pixel < 0` classifies nothing as dark: the whole frame reads
+    // as one light run and no finder can ever be found.
+    if (v > bv){ bv = v; best = (mB + mF) / 2; }
+  }
+  return best;
+}
+const median = a => { const s = [...a].sort((x,y)=>x-y);
+  return s[s.length >> 1]; };
+
+// homography from 4 correspondences (DLT, 8x8 gaussian elimination)
+function homography(src, dst){
+  const A = [], b = [];
+  for (let i = 0; i < 4; i++){
+    const [x,y] = src[i], [u,v] = dst[i];
+    A.push([x,y,1,0,0,0,-u*x,-u*y]); b.push(u);
+    A.push([0,0,0,x,y,1,-v*x,-v*y]); b.push(v);
+  }
+  const n = 8;
+  for (let c = 0; c < n; c++){
+    let p = c;
+    for (let r = c+1; r < n; r++)
+      if (Math.abs(A[r][c]) > Math.abs(A[p][c])) p = r;
+    if (Math.abs(A[p][c]) < 1e-9) return null;
+    [A[c],A[p]] = [A[p],A[c]]; [b[c],b[p]] = [b[p],b[c]];
+    for (let r = 0; r < n; r++){
+      if (r === c) continue;
+      const f = A[r][c] / A[c][c];
+      for (let k = c; k < n; k++) A[r][k] -= f * A[c][k];
+      b[r] -= f * b[c];
+    }
+  }
+  const hcoef = b.map((v,i) => v / A[i][i]);
+  return [...hcoef, 1];
+}
+const applyH = (H, x, y) => {
+  const w = H[6]*x + H[7]*y + H[8];
+  return [(H[0]*x + H[1]*y + H[2]) / w, (H[3]*x + H[4]*y + H[5]) / w];
+};
+
+// ---------- fountain ----------
+let dec = null;
+function newDecoder(){
+  return { decoded: new Map(), pending: [], seen: new Set(),
+           pool: new Map() };
+}
+function fountainAdd(idx, block){
+  if (dec.seen.has(idx)) return;
+  // pool ghost sweep, live: content equal to same position one seq
+  // earlier is a straddle ghost
+  const prev = dec.pool.get(idx - M.n_sub);
+  if (prev && eqBytes(prev, block)) return;
+  dec.pool.set(idx, block);
+  dec.seen.add(idx);
+  const comp = idxFor(idx);
+  if (!comp) return;
+  let idxs = new Set(comp);
+  let data = Uint8Array.from(block);
+  for (const i of [...idxs])
+    if (dec.decoded.has(i)){ xorInto(data, dec.decoded.get(i)); idxs.delete(i); }
+  if (idxs.size === 0) return;
+  if (idxs.size === 1) resolve([...idxs][0], data);
+  else dec.pending.push([idxs, data]);
+}
+function resolve(i, data){
+  const stack = [[i, data]];
+  while (stack.length){
+    const [j, d] = stack.pop();
+    if (dec.decoded.has(j)) continue;
+    dec.decoded.set(j, d);
+    const still = [];
+    for (const [idxs, pd] of dec.pending){
+      if (idxs.has(j)){ xorInto(pd, d); idxs.delete(j); }
+      if (idxs.size === 1) stack.push([[...idxs][0], pd]);
+      else if (idxs.size) still.push([idxs, pd]);
+    }
+    dec.pending = still;
+  }
+}
+function xorInto(a, b){ for (let i = 0; i < a.length; i++) a[i] ^= b[i]; }
+const eqBytes = (a,b) => { if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true; };
+
+// ---------- frame pipeline ----------
+let HDR_MASKS = [], PC = null, HC = null;
+let prevBlocks = null, prevSeq = -10;
+let stats = { frames: 0, located: 0, tracked: 0, certified: 0, t0: 0, firstHit: 0 };
+const cvs = document.createElement("canvas");
+const cctx = cvs.getContext("2d", { willReadFrequently: true });
+
+function processFrame(){
+  const v = $("v");
+  if (!v.videoWidth) return;
+  const w = v.videoWidth, h = v.videoHeight;
+  cvs.width = w; cvs.height = h;
+  cctx.drawImage(v, 0, 0, w, h);
+  const img = cctx.getImageData(0, 0, w, h).data;
+  const gray = new Uint8Array(w * h);
+  for (let i = 0, j = 0; j < gray.length; i += 4, j++)
+    gray[j] = (img[i] * 77 + img[i+1] * 150 + img[i+2] * 29) >> 8;
+  stats.frames++;
+  // GEOMETRY TRACKING. Re-running finder detection on every frame is the
+  // dominant cost AND the dominant loss: measured 31 of 212 frames located
+  // at 68 ms each. The screen moves a fraction of a cell in 1/30 s, so try
+  // the PREVIOUS frame's homography first and keep it if the header still
+  // decodes. That is a far stricter test than any tracking residual: 68
+  // bytes behind RS(68,28) and a CRC16 do not pass on stale geometry.
+  let H = null, tracked = false;
+  if (lastH){
+    const hb0 = new Uint8Array(HC.length);
+    const bits0 = sampleBits(gray, w, h, lastH);
+    for (let i = 0; i < HC.length; i++) hb0[i] = bits0.bitAt[HC[i]];
+    if (tryHeader(hb0)){ H = lastH; tracked = true; cachedBits = bits0; }
+  }
+  if (!H){
+    const fs = findFinders(gray, w, h);
+    if (!fs){ lastH = null;
+      guide("NO LOCK", `hold the whole code in frame (${lastCands} hits)`, 0);
+      return; }
+    H = homography(M.finders, fs);
+    if (!H){ lastH = null; guide("NO LOCK", "steady the phone", 0); return; }
+    cachedBits = null;
+  }
+  lastH = H;
+  stats.located++;
+  if (tracked) stats.tracked++;
+  // camera-px per cell: the density gauge. Derive it from the HOMOGRAPHY,
+  // not from the finder points: the tracking path never runs detection, so
+  // referencing those points there threw on every frame and nothing could
+  // lock at all.
+  const p0 = applyH(H, 0, 0), p1 = applyH(H, 1, 0), p2 = applyH(H, 0, 1);
+  const pxPerCell = (Math.hypot(p1[0]-p0[0], p1[1]-p0[1]) +
+                     Math.hypot(p2[0]-p0[0], p2[1]-p0[1])) / 2;
+  lastPx = pxPerCell;
+  const sb = cachedBits || sampleBits(gray, w, h, H);
+  finishFrame(sb.bitAt, sb.confAt, pxPerCell);
+}
+
+function sampleBits(gray, w, h, H){
+  const nCells = M.gw * M.gh;
+  const lum = new Float32Array(nCells);
+  for (let r = 0; r < M.gh; r++){
+    for (let c = 0; c < M.gw; c++){
+      const [px, py] = applyH(H, c + 0.5, r + 0.5);
+      const xi = Math.min(w-2, Math.max(0, px|0));
+      const yi = Math.min(h-2, Math.max(0, py|0));
+      lum[r*M.gw+c] = (gray[yi*w+xi] + gray[yi*w+xi+1] +
+                       gray[(yi+1)*w+xi] + gray[(yi+1)*w+xi+1]) / 4;
+    }
+  }
+  // local threshold over cell space, 15-cell box via integral image
+  const II = new Float64Array((M.gw+1) * (M.gh+1));
+  for (let r = 0; r < M.gh; r++){
+    let rs = 0;
+    for (let c = 0; c < M.gw; c++){
+      rs += lum[r*M.gw+c];
+      II[(r+1)*(M.gw+1)+c+1] = II[r*(M.gw+1)+c+1] + rs;
+    }
+  }
+  const K = 15 >> 1;
+  const bitAt = new Uint8Array(nCells), confAt = new Float32Array(nCells);
+  for (let r = 0; r < M.gh; r++){
+    const r0 = Math.max(0, r-K), r1 = Math.min(M.gh, r+K+1);
+    for (let c = 0; c < M.gw; c++){
+      const c0 = Math.max(0, c-K), c1 = Math.min(M.gw, c+K+1);
+      const s = II[r1*(M.gw+1)+c1] - II[r0*(M.gw+1)+c1]
+              - II[r1*(M.gw+1)+c0] + II[r0*(M.gw+1)+c0];
+      const mean = s / ((r1-r0) * (c1-c0));
+      const l = lum[r*M.gw+c];
+      bitAt[r*M.gw+c] = l > mean ? 1 : 0;
+      confAt[r*M.gw+c] = Math.abs(l - mean);
+    }
+  }
+  return { bitAt, confAt };
+}
+
+function finishFrame(bitAt, confAt, pxPerCell){
+  const hb = new Uint8Array(HC.length);
+  for (let i = 0; i < HC.length; i++) hb[i] = bitAt[HC[i]];
+  const hd = tryHeader(hb);
+  if (hd && JSMODE && hd.k !== dynK){
+    dynK = hd.k; dynSize = hd.fileSize; dynCum = robustSoliton(dynK);
+  }
+  if (!hd || (!JSMODE && hd.k !== M.k)){
+    guide("LOCKED, no header",
+          pxPerCell < 7 ? "MOVE CLOSER" :
+          (pxPerCell > 16 ? "back off a little" :
+           "hold still, square to the screen"), pxPerCell);
+    return;
+  }
+  // payload codewords
+  const curBlocks = new Map();
+  const nb = M.n_sub * 255;
+  const pb = new Uint8Array(nb);
+  const pconf = new Float32Array(nb);
+  for (let i = 0; i < nb; i++){
+    let v8 = 0, cmin = 1e9;
+    for (let b = 0; b < 8; b++){
+      const cell = PC[i*8+b];
+      v8 = (v8 << 1) | bitAt[cell];
+      const cf = confAt[cell];
+      if (cf < cmin) cmin = cf;
+    }
+    pb[i] = v8; pconf[i] = cmin;
+  }
+  for (let j = 0; j < M.n_sub; j++){
+    const chunk = pb.subarray(j*255, (j+1)*255);
+    const order = Array.from({length:255}, (_,i)=>i)
+      .sort((a,b) => pconf[j*255+a] - pconf[j*255+b]);
+    const blk = certify(chunk, order, M.ecc, M.sub);
+    if (!blk) continue;
+    // straddle-ghost: identical content to previous frame's same j
+    if (prevBlocks && hd.seq === prevSeq + 1){
+      const pg = prevBlocks.get(j);
+      if (pg && eqBytes(pg, blk)) continue;
+    }
+    curBlocks.set(j, blk);
+    stats.certified++;
+    if (!stats.firstHit) stats.firstHit = performance.now();
+    fountainAdd(hd.seq * M.n_sub + j, blk);
+  }
+  prevBlocks = curBlocks; prevSeq = hd.seq;
+  const yield_ = curBlocks.size / M.n_sub;
+  guide(yield_ > 0.8 ? "STRONG" : (yield_ > 0.3 ? "DECODING" : "WEAK"),
+        yield_ > 0.8 ? "hold exactly there" :
+        (pxPerCell < 7 ? "MOVE CLOSER" :
+         (pxPerCell > 16 ? "back off" : "steady / square up / brighten")),
+        pxPerCell, yield_);
+  if (dec.decoded.size >= (JSMODE ? dynK : M.k)) finish();
+}
+
+async function finish(){
+  const kk = JSMODE ? dynK : M.k;
+  const out = new Uint8Array(kk * M.sub);
+  for (let i = 0; i < kk; i++) out.set(dec.decoded.get(i), i * M.sub);
+  let data = out.subarray(0, JSMODE ? dynSize : M.file_size);
+  let name = M.file_name, want = M.sha256;
+  if (JSMODE){
+    // unwrap the sender's container: magic, name, size, sha256, bytes
+    const dv = new DataView(data.buffer, data.byteOffset);
+    if (data[0]===0x48 && data[1]===0x47 && data[2]===0x43 && data[3]===0x31){
+      const nl = dv.getUint16(4, true);
+      name = new TextDecoder().decode(data.subarray(6, 6+nl));
+      const sz = dv.getUint32(6+nl, true);
+      want = [...data.subarray(10+nl, 42+nl)]
+             .map(b=>b.toString(16).padStart(2,"0")).join("");
+      data = data.subarray(42+nl, 42+nl+sz);
+    } else { name = "recovered.bin"; want = null; }
+  }
+  const dig = await crypto.subtle.digest("SHA-256", data);
+  const hex = [...new Uint8Array(dig)].map(b=>b.toString(16).padStart(2,"0")).join("");
+  const ok = want === null ? null : hex === want;
+  M = Object.assign({}, M, { file_name: name, file_size: data.length });
+  const span = (performance.now() - stats.firstHit) / 1000;
+  const rate = M.file_size / span / 1024;
+  const blob = new Blob([data]);
+  const url = URL.createObjectURL(blob);
+  $("out").innerHTML =
+    `<h2 style="color:${ok===false?'#f00':'#0f0'}">` +
+    `${ok===null?'RECOVERED (no hash to check)':ok?'BIT-EXACT':'HASH MISMATCH'}</h2>`
+    + `<p>${M.file_size.toLocaleString()} B in ${span.toFixed(2)}s = `
+    + `<b>${rate.toFixed(1)} KB/s</b></p>`
+    + `<p>sha256 ${hex.slice(0,16)}…</p>`
+    + `<a download="${M.file_name}" href="${url}">save ${M.file_name}</a>`;
+  running = false;
+}
+
+let lastPx = 0, CAMDESC = '', lastH = null, cachedBits = null;
+let gState = "", gTip = "", gPx = 0, gYld, gT = 0, yAvg = 0;
+function guide(state, tip, px, yld){
+  // The per-frame state flickers between LOCKED/STRONG/WEAK faster than it
+  // can be read. Hold each message for a beat and show a rolling yield, so
+  // the operator sees a trend they can steer by instead of a strobe.
+  if (yld !== undefined) yAvg = yAvg ? yAvg * 0.8 + yld * 0.2 : yld;
+  gState = state; gTip = tip; gPx = px; gYld = yld;
+  const now = performance.now();
+  if (now - gT < 400) return;
+  gT = now;
+  const g = $("guide");
+  const col = state === "STRONG" ? "#0f0" :
+              state === "DECODING" ? "#ff0" : "#f80";
+  g.style.color = col;
+  g.innerHTML = `<b>${state}</b> &nbsp; ${tip}` +
+    (px ? `<br><small>${px.toFixed(1)} cam-px/cell` +
+          (yAvg ? ` &nbsp; yield ${(100*yAvg).toFixed(0)}%` : "")
+          + `</small>` : "");
+}
+
+let running = false;
+function loop(){
+  if (!running) return;
+  const t = performance.now();
+  processFrame();
+  const el = (performance.now() - stats.t0) / 1000;
+  $("fill").style.width =
+    (100 * dec.decoded.size / (JSMODE ? (dynK||1) : M.k)) + "%";
+  $("hud").textContent = CAMDESC + "\n" +
+    `frames ${stats.frames}  located ${stats.located} (tracked ${stats.tracked})  ` +
+    `certified ${stats.certified}\n` +
+    `fountain ${dec.decoded.size}/${M.k}  ` +
+    `${(performance.now()-t).toFixed(0)}ms/frame  ${el.toFixed(1)}s`;
+  if ($("v").requestVideoFrameCallback)
+    $("v").requestVideoFrameCallback(loop);
+  else requestAnimationFrame(loop);
+}
+
+$("go").onclick = async () => {
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: "environment",
+             width: { ideal: 3840 }, height: { ideal: 2160 },
+             frameRate: { ideal: 60 } }, audio: false });
+  $("v").srcObject = stream;
+  const trk = stream.getVideoTracks()[0].getSettings();
+  dec = newDecoder();
+  stats = { frames:0, located:0, tracked:0, certified:0,
+            t0: performance.now(), firstHit: 0 };
+  running = true;
+  CAMDESC = `cam ${trk.width}x${trk.height}@${Math.round(trk.frameRate)}`;
+  $("hud").textContent = CAMDESC;
+  loop();
+};
+
+$("sf").onclick = async () => {
+  // SYNTHETIC OPTICS TEST: draw a real transmit frame into the video-sized
+  // canvas the way a camera would see it, then run findFinders + header on
+  // it. Proves the geometry chain without a camera.
+  const buf = new Uint8Array(await (await fetch("demo/webtxweb/frames.bin"))
+                             .arrayBuffer());
+  const bpf = Math.ceil(M.gw * M.gh / 8);
+  const CP = 4, W = M.gw*CP + 80, H0 = M.gh*CP + 80;
+  const c2 = document.createElement("canvas");
+  c2.width = W; c2.height = H0;
+  const g2 = c2.getContext("2d");
+  g2.fillStyle = "#000"; g2.fillRect(0, 0, W, H0);
+  const id = g2.createImageData(M.gw, M.gh);
+  for (let i = 0; i < M.gw*M.gh; i++){
+    const v = ((buf[7*bpf + (i>>3)] >> (7-(i&7))) & 1) ? 255 : 0;
+    id.data[i*4] = id.data[i*4+1] = id.data[i*4+2] = v;
+    id.data[i*4+3] = 255;
+  }
+  const off = document.createElement("canvas");
+  off.width = M.gw; off.height = M.gh;
+  off.getContext("2d").putImageData(id, 0, 0);
+  g2.imageSmoothingEnabled = false;
+  g2.drawImage(off, 40, 40, M.gw*CP, M.gh*CP);
+  const px = g2.getImageData(0, 0, W, H0).data;
+  const gray = new Uint8Array(W*H0);
+  for (let i = 0, j = 0; j < gray.length; i += 4, j++)
+    gray[j] = (px[i]*77 + px[i+1]*150 + px[i+2]*29) >> 8;
+  const fs = findFinders(gray, W, H0);
+  let msg = `synthetic optics: ${lastCands} finder hits, ` +
+            `groups ${fs ? "4 FOUND" : "FAILED"}`;
+  if (fs){
+    const Hh = homography(M.finders, fs);
+    const bitAt = new Uint8Array(M.gw*M.gh);
+    for (let r = 0; r < M.gh; r++) for (let c = 0; c < M.gw; c++){
+      const [ux, uy] = applyH(Hh, c+0.5, r+0.5);
+      bitAt[r*M.gw+c] = gray[(uy|0)*W + (ux|0)] > 127 ? 1 : 0;
+    }
+    const hb = new Uint8Array(HC.length);
+    for (let i = 0; i < HC.length; i++) hb[i] = bitAt[HC[i]];
+    const hd = tryHeader(hb);
+    msg += `\nheader: ${hd ? "OK seq="+hd.seq+" k="+hd.k : "FAILED"}`;
+    msg += `\nfinders at ${fs.map(f=>f.map(Math.round).join(",")).join(" | ")}`;
+  }
+  $("hud").textContent = msg;
+};
+
+$("st").onclick = () => {
+  let pass = 0, n = 0;
+  for (const v of M.rs_vectors){
+    n++;
+    const chunk = b64(v.chunk);
+    const blk = certify(chunk, v.order, M.ecc, M.sub);
+    const want = v.expect ? b64(v.expect) : null;
+    const got = blk;
+    const ok = (want === null && got === null) ||
+               (want !== null && got !== null && eqBytes(want, got));
+    if (ok) pass++;
+  }
+  $("hud").textContent = `RS self-test: ${pass}/${n} identical to python`;
+};
+
+(async () => {
+  M = await (await fetch("demo/webtxweb/rxmeta.json")).json()
+        .catch(async () =>
+          (await fetch("demo/webtxweb/rxmeta.slim.json")).json());
+  if (!M.indices) JSMODE = true;
+  HDR_MASKS = M.hdr_masks.map(b64);
+  PC = Int32Array.from(M.payload_cells);
+  HC = Int32Array.from(M.header_cells);
+  dec = newDecoder();
+  $("hud").textContent =
+    `ready: ${M.gw}x${M.gh}, ${M.n_sub} cw/frame, k=${M.k}\n` +
+    `sender: open tx120.html?dir=demo/webtxweb on the big screen`;
+})();
+</script></body></html>

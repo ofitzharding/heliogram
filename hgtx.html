@@ -1,0 +1,344 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>heliogram send</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+html,body{margin:0;background:#000;color:#0f0;font:14px monospace;height:100%}
+#drop{position:fixed;inset:0;display:flex;flex-direction:column;
+  align-items:center;justify-content:center;gap:16px;z-index:5;
+  border:3px dashed #0f0;margin:16px;border-radius:12px;text-align:center}
+#drop.hide{display:none}
+#drop.hot{background:#031;border-color:#0f8}
+canvas{display:block;width:100vw;height:100vh}
+#hud{position:fixed;left:8px;top:6px;color:#0f0;z-index:9;font-size:13px}
+#hud.mid{display:none}
+input{display:none}
+label{border:1px solid #0f0;padding:10px 18px;cursor:pointer}
+h1{font-size:20px;margin:0}
+small{color:#6a6;max-width:70vw}
+</style></head><body>
+<div id="hud"></div>
+<div id="drop">
+  <h1>heliogram sender</h1>
+  <div>drop any file here</div>
+  <label for="f">or choose a file</label>
+  <input id="f" type="file">
+  <small id="note">the file is encoded in this page and beamed as light.
+  open the receiver on your phone, then press F for fullscreen.</small>
+</div>
+<canvas id="c"></canvas>
+<script>
+// heliogram browser SENDER: drag a file in, it becomes light.
+//
+// Sender and receiver are both JavaScript here, so they only have to agree
+// with EACH OTHER: one shared deterministic PRNG defines the fountain, and
+// the cell layout comes from the same rxmeta.json both pages load. Nothing
+// needs to match numpy, which is what made a browser sender awkward before.
+
+const $ = id => document.getElementById(id);
+const b64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+let M = null, PC = null, HC = null, SC = null, SV = null, MASKS = [];
+
+// ---------- GF(256) prim 0x11d ----------
+const EXP = new Uint8Array(512), LOG = new Int32Array(256);
+(() => { let x = 1;
+  for (let i = 0; i < 255; i++){ EXP[i] = x; LOG[x] = i;
+    x <<= 1; if (x & 0x100) x ^= 0x11d; }
+  for (let i = 255; i < 512; i++) EXP[i] = EXP[i-255]; })();
+const gmul = (a,b) => (a===0||b===0) ? 0 : EXP[LOG[a]+LOG[b]];
+
+function rsGenPoly(n){
+  let g = new Uint8Array([1]);
+  for (let i = 0; i < n; i++){
+    const ng = new Uint8Array(g.length + 1);
+    for (let j = 0; j < g.length; j++){
+      ng[j] ^= g[j];
+      ng[j+1] ^= gmul(g[j], EXP[i]);
+    }
+    g = ng;
+  }
+  return g;
+}
+const GEN = {};
+// systematic RS encode: message then the remainder of msg*x^n mod generator
+function rsEncode(msg, nsym){
+  const g = GEN[nsym] || (GEN[nsym] = rsGenPoly(nsym));
+  const out = new Uint8Array(msg.length + nsym);
+  out.set(msg);
+  for (let i = 0; i < msg.length; i++){
+    const c = out[i];
+    if (!c) continue;
+    for (let j = 1; j < g.length; j++) out[i+j] ^= gmul(g[j], c);
+  }
+  out.set(msg);
+  return out;
+}
+
+// ---------- CRC32 ----------
+const CRC_T = new Uint32Array(256);
+(() => { for (let n = 0; n < 256; n++){ let c = n;
+  for (let k = 0; k < 8; k++) c = (c & 1) ? 0xEDB88320 ^ (c>>>1) : c>>>1;
+  CRC_T[n] = c>>>0; } })();
+function crc32(b, off, len){
+  let c = 0xFFFFFFFF;
+  for (let i = 0; i < len; i++) c = CRC_T[(c ^ b[off+i]) & 0xFF] ^ (c>>>8);
+  return (c ^ 0xFFFFFFFF)>>>0;
+}
+
+// ---------- shared deterministic fountain (must match rx.html exactly) ----
+function mulberry32(a){
+  return function(){
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function robustSoliton(k){
+  const c = 0.03, delta = 0.5;
+  const s = c * Math.log(k / delta) * Math.sqrt(k);
+  const pmf = new Float64Array(k + 1);
+  pmf[1] = 1 / k;
+  for (let d = 2; d <= k; d++) pmf[d] = 1 / (d * (d - 1));
+  const pivot = Math.max(1, Math.min(k, Math.round(k / s)));
+  for (let d = 1; d < pivot; d++) pmf[d] += s / (k * d);
+  if (s > 1) pmf[pivot] += s * Math.log(s / delta) / k;
+  let tot = 0;
+  for (let d = 1; d <= k; d++) tot += pmf[d];
+  const cum = new Float64Array(k + 1);
+  let run = 0;
+  for (let d = 1; d <= k; d++){ run += pmf[d] / tot; cum[d] = run; }
+  return cum;
+}
+function blockIndices(seq, k, cum){
+  const rng = mulberry32(seq ^ 0x9E3779B9);
+  const u = rng();
+  let d = 1;
+  while (d < k && cum[d] < u) d++;
+  const idx = [];
+  const seen = new Set();
+  while (idx.length < d){
+    const i = Math.floor(rng() * k) % k;
+    if (!seen.has(i)){ seen.add(i); idx.push(i); }
+  }
+  return idx;
+}
+
+// ---------- header ----------
+function packHeader(seq, k, blockSize, fileSize){
+  const pre = M.hdr_len_pre;
+  const b = new Uint8Array(pre);
+  b[0]=0x53; b[1]=0x43; b[2]=0x50; b[3]=0x43;           // "SCPC"
+  const dv = new DataView(b.buffer);
+  b[4] = 2; b[5] = 0;                                    // version, MODE_MONO
+  dv.setUint32(6, seq, true); dv.setUint32(10, k, true);
+  dv.setUint16(14, blockSize, true); dv.setUint32(16, fileSize, true);
+  b[20] = M.ecc; b[21] = 0; b[22] = 0;
+  const crc = crc32(b, 0, pre - 2) & 0xFFFF;
+  dv.setUint16(pre - 2, crc, true);
+  const enc = rsEncode(b, M.hdr_ecc);
+  const mask = MASKS[seq % M.hdr_phases];
+  const out = new Uint8Array(enc.length);
+  for (let i = 0; i < enc.length; i++) out[i] = enc[i] ^ mask[i];
+  return out;
+}
+
+// ---------- encode a dropped file ----------
+let blocks = null, K = 0, CUM = null, FSIZE = 0, FNAME = "";
+function prepare(bytes, name){
+  FSIZE = bytes.length; FNAME = name;
+  const bs = M.sub;
+  K = Math.ceil(FSIZE / bs);
+  const padded = new Uint8Array(K * bs);
+  padded.set(bytes);
+  blocks = [];
+  for (let i = 0; i < K; i++) blocks.push(padded.subarray(i*bs, (i+1)*bs));
+  CUM = robustSoliton(K);
+}
+function fountainBlock(idx){
+  const out = new Uint8Array(M.sub);
+  for (const i of blockIndices(idx, K, CUM)){
+    const b = blocks[i];
+    for (let j = 0; j < out.length; j++) out[j] ^= b[j];
+  }
+  return out;
+}
+
+// ---------- render one frame ----------
+const c = $("c"), ctx = c.getContext("2d", {alpha:false});
+let off = null, offctx = null, imgd = null, scale = 1, x0 = 0, y0 = 0;
+function sizeCanvas(){
+  c.width = Math.round(innerWidth * devicePixelRatio);
+  c.height = Math.round(innerHeight * devicePixelRatio);
+  ctx.imageSmoothingEnabled = false;
+  scale = Math.max(1, Math.floor(Math.min(c.width/M.gw, c.height/M.gh)));
+  x0 = (c.width - M.gw*scale) >> 1;
+  y0 = (c.height - M.gh*scale) >> 1;
+}
+// Cells that carry nothing: the grid is bigger than structure + header +
+// payload, and anything left unwritten renders BLACK. That is not cosmetic.
+// The receiver thresholds each cell against a 15-cell neighbourhood mean, so
+// a black slab drags the threshold down for every payload cell near it and
+// corrupts those rows. Fill the leftovers with balanced pseudorandom bits so
+// the local statistics look like payload everywhere. The receiver never
+// reads them, so their values are free.
+let FILLER = null;
+function buildFiller(){
+  const used = new Uint8Array(M.gw * M.gh);
+  // Mark ONLY cells this sender actually writes. Both the header list and
+  // the payload list are longer than what one frame fills, and every
+  // unwritten cell renders black: the payload tail (1012 cells) and the
+  // header tail both showed up as bands. Anything not written gets
+  // balanced pseudorandom fill so the local threshold sees uniform
+  // statistics everywhere.
+  for (const i of SC) used[i] = 1;
+  const hdrBits = M.hdr_len_enc * 8;
+  for (let i = 0; i < hdrBits && i < HC.length; i++) used[HC[i]] = 1;
+  const payBits = M.n_sub * 255 * 8;
+  for (let i = 0; i < payBits && i < PC.length; i++) used[PC[i]] = 1;
+  const idx = [];
+  for (let i = 0; i < used.length; i++) if (!used[i]) idx.push(i);
+  const rng = mulberry32(0x5EED1);
+  FILLER = idx.map(i => [i, rng() < 0.5 ? 0 : 1]);
+}
+
+function drawSeq(seq){
+  const cells = new Uint8Array(M.gw * M.gh);
+  if (!FILLER) buildFiller();
+  for (const [i, v] of FILLER) cells[i] = v;
+  for (let i = 0; i < SC.length; i++)
+    cells[SC[i]] = (SV[i>>3] >> (7-(i&7))) & 1;
+  const hdr = packHeader(seq, K, M.sub, FSIZE);
+  for (let i = 0; i < hdr.length; i++)
+    for (let b = 0; b < 8; b++)
+      cells[HC[i*8+b]] = (hdr[i] >> (7-b)) & 1;
+  for (let j = 0; j < M.n_sub; j++){
+    const blk = fountainBlock(seq * M.n_sub + j);
+    const msg = new Uint8Array(4 + M.sub);
+    const cr = crc32(blk, 0, blk.length);
+    msg[0]=cr&255; msg[1]=(cr>>>8)&255; msg[2]=(cr>>>16)&255; msg[3]=(cr>>>24)&255;
+    msg.set(blk, 4);
+    const cw = rsEncode(msg, M.ecc);
+    for (let i = 0; i < 255; i++)
+      for (let b = 0; b < 8; b++)
+        cells[PC[(j*255+i)*8+b]] = (cw[i] >> (7-b)) & 1;
+  }
+  const d = imgd.data;
+  for (let i = 0; i < cells.length; i++){
+    const v = cells[i] ? 255 : 0, p = i << 2;
+    d[p] = d[p+1] = d[p+2] = v; d[p+3] = 255;
+  }
+  offctx.putImageData(imgd, 0, 0);
+  ctx.fillStyle = "#000"; ctx.fillRect(0, 0, c.width, c.height);
+  ctx.drawImage(off, 0, 0, M.gw, M.gh, x0, y0, M.gw*scale, M.gh*scale);
+}
+
+let seq = 0, running = false, t0 = 0, n = 0, fpsT = 0, fpsN = 0;
+const CD = 12;
+function tick(){
+  if (!running) return;
+  const now = performance.now();
+  const cd = CD - (now - t0)/1000;
+  if (cd > 0){
+    // LOCK TARGET. Bright enough that the meter picks a SHORT exposure (a
+    // long one blends consecutive code frames), but NOT featureless: a
+    // blank white field gives autofocus nothing to converge on. So render
+    // white with the real structure cells (finders, ring, separators) in
+    // black, at the exact geometry the payload will occupy. The camera
+    // meters bright, focuses on hard edges, and locks on the very pattern
+    // it is about to decode.
+    const cells = new Uint8Array(M.gw * M.gh).fill(1);
+    for (let i = 0; i < SC.length; i++)
+      cells[SC[i]] = (SV[i>>3] >> (7-(i&7))) & 1;
+    const d = imgd.data;
+    for (let i = 0; i < cells.length; i++){
+      const v = cells[i] ? 255 : 0, p = i << 2;
+      d[p] = d[p+1] = d[p+2] = v; d[p+3] = 255;
+    }
+    offctx.putImageData(imgd, 0, 0);
+    ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, c.width, c.height);
+    ctx.drawImage(off, 0, 0, M.gw, M.gh, x0, y0, M.gw*scale, M.gh*scale);
+    ctx.fillStyle = "#000"; ctx.textAlign = "center";
+    ctx.font = `${Math.round(90*devicePixelRatio)}px monospace`;
+    ctx.fillText(Math.ceil(cd), c.width/2, c.height*0.46);
+    // size the hint to the canvas so it never runs off the edges
+    const fs = Math.max(11, Math.min(20, c.width / 42 / devicePixelRatio));
+    ctx.font = `${Math.round(fs*devicePixelRatio)}px monospace`;
+    ctx.fillText("fill the frame, tap to lock focus",
+                 c.width/2, c.height*0.57);
+  } else {
+    if (!$("hud").classList.contains("mid")) $("hud").classList.add("mid");
+    drawSeq(seq++); n++;
+  }
+  fpsN++;
+  if (now - fpsT > 1000){
+    $("hud").textContent = `${FNAME} ${FSIZE.toLocaleString()}B  k=${K}  ` +
+      `${(fpsN*1000/(now-fpsT)).toFixed(0)}fps  seq ${seq}`;
+    fpsN = 0; fpsT = now;
+  }
+  requestAnimationFrame(tick);
+}
+
+function start(bytes, name){
+  prepare(bytes, name);
+  off = document.createElement("canvas");
+  off.width = M.gw; off.height = M.gh;
+  offctx = off.getContext("2d", {alpha:false});
+  imgd = offctx.createImageData(M.gw, M.gh);
+  sizeCanvas(); addEventListener("resize", sizeCanvas);
+  $("drop").classList.add("hide");
+  running = true; t0 = performance.now(); fpsT = t0;
+  addEventListener("keydown", e => {
+    if (e.key === "f" || e.key === "F")
+      document.documentElement.requestFullscreen();
+    if (e.key === "h" || e.key === "H") $("hud").classList.toggle("mid");
+  });
+  document.addEventListener("fullscreenchange", sizeCanvas);
+  tick();
+}
+
+// The file travels inside a small container so the receiver can name it and
+// PROVE it: magic, name, size, sha256, then the bytes. Without this the
+// receiver would recover anonymous data it could not verify.
+async function containerize(bytes, name){
+  const nameB = new TextEncoder().encode(name);
+  const dig = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+  const out = new Uint8Array(4 + 2 + nameB.length + 4 + 32 + bytes.length);
+  const dv = new DataView(out.buffer);
+  out[0]=0x48; out[1]=0x47; out[2]=0x43; out[3]=0x31;      // "HGC1"
+  dv.setUint16(4, nameB.length, true);
+  out.set(nameB, 6);
+  dv.setUint32(6 + nameB.length, bytes.length, true);
+  out.set(dig, 10 + nameB.length);
+  out.set(bytes, 42 + nameB.length);
+  return out;
+}
+async function useFile(file){
+  const raw = new Uint8Array(await file.arrayBuffer());
+  const maxB = M.sub * 60000;
+  if (raw.length > maxB){
+    alert(`file too large for this grid (${(maxB/1e6).toFixed(1)} MB max)`);
+    return;
+  }
+  const bytes = await containerize(raw, file.name);
+  start(bytes, file.name);
+}
+$("f").onchange = e => e.target.files[0] && useFile(e.target.files[0]);
+addEventListener("dragover", e => { e.preventDefault();
+  $("drop").classList.add("hot"); });
+addEventListener("dragleave", () => $("drop").classList.remove("hot"));
+addEventListener("drop", e => { e.preventDefault();
+  $("drop").classList.remove("hot");
+  const f = e.dataTransfer.files[0]; if (f) useFile(f); });
+
+(async () => {
+  M = await (await fetch("demo/webtxweb/rxmeta.json")).json();
+  PC = Int32Array.from(M.payload_cells);
+  HC = Int32Array.from(M.header_cells);
+  SC = Int32Array.from(M.struct_cells);
+  SV = b64(M.struct_vals);
+  MASKS = M.hdr_masks.map(b64);
+  $("note").textContent =
+    `grid ${M.gw}x${M.gh}, ${M.n_sub} codewords/frame. ` +
+    `receiver: rx.html?js=1`;
+})();
+</script></body></html>

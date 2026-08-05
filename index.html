@@ -1,0 +1,71 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>heliogram — send files as light</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="description" content="Send a file from one screen to another phone's
+camera. No install, no network, no pairing. Two browser tabs and line of sight.">
+<style>
+:root{color-scheme:dark}
+body{margin:0;background:#000;color:#e8ffe8;
+  font:16px/1.55 -apple-system,BlinkMacSystemFont,system-ui,monospace;
+  display:flex;flex-direction:column;align-items:center;padding:38px 20px 60px}
+h1{font-size:34px;margin:0 0 6px;letter-spacing:-.5px}
+h2{font-size:17px;margin:34px 0 8px;color:#0f0}
+p,li{max-width:640px;color:#bfe8bf}
+.sub{color:#7a7;margin-top:0}
+a.btn{display:inline-block;border:1px solid #0f0;color:#0f0;text-decoration:none;
+  padding:14px 22px;margin:8px 8px 0 0;font-weight:600}
+a.btn:hover{background:#0f0;color:#000}
+code{background:#111;padding:2px 6px;color:#8f8}
+.wrap{max-width:640px;width:100%}
+.note{border-left:2px solid #333;padding-left:14px;color:#8a8;font-size:14px}
+footer{margin-top:40px;color:#565;font-size:13px}
+</style></head><body>
+<div class="wrap">
+<h1>heliogram</h1>
+<p class="sub">Send a file from one screen to another device's camera.
+No install, no account, no network, no pairing. Two browser tabs and line
+of sight.</p>
+
+<a class="btn" href="hgtx.html">SEND a file &rarr;</a>
+<a class="btn" href="rx.html">RECEIVE on this device &rarr;</a>
+
+<h2>How to try it</h2>
+<ol>
+<li>On a laptop or monitor, open <b>SEND</b> and drop in a small file.</li>
+<li>On a phone, open <b>RECEIVE</b> (this page's URL, then Receive).</li>
+<li>Press <code>F</code> on the sender for fullscreen. Point the phone at
+the screen during the white countdown and tap to lock focus.</li>
+<li>Fill the phone's frame with the code. The file rebuilds live and
+verifies its own SHA-256.</li>
+</ol>
+
+<h2>What it is</h2>
+<p>The sender turns a file into a dense grid of black and white cells and
+plays it as fast as the display refreshes. The receiver films that grid,
+finds it, reads it, and reassembles the file. Every cell block carries
+Reed-Solomon parity and its own CRC32, and the whole file travels as a
+fountain code, so the receiver can start anywhere, miss anything, and
+still finish.</p>
+
+<h2>Why it exists</h2>
+<p>An air gap is not a bug in the network, it is sometimes the point.
+This crosses one with nothing but light: a machine with no WiFi, no
+Bluetooth, no USB port you trust, and no shared account can still hand
+you a file if it has a screen. Nothing is transmitted back, so the sender
+cannot be reached from the receiving side at all.</p>
+
+<p class="note">It will never be faster than AirDrop over a good link,
+and it is not trying to be. It works where those cannot: across
+ecosystems, across air gaps, between strangers' devices, with the
+integrity of every byte checked on arrival.</p>
+
+<h2>Verify it yourself</h2>
+<p>The receiver ships with two self-tests. <b>RS SELF-TEST</b> checks its
+Reed-Solomon implementation against reference vectors, and <b>OPTICS
+SELF-TEST</b> runs a synthetic frame through the real detection and
+decoding path. Both run in your browser, with no camera needed.</p>
+
+<footer>Source: <a href="https://github.com/ofitzharding/heliogram"
+style="color:#8f8">github.com/ofitzharding/heliogram</a> · MIT</footer>
+</div>
+</body></html>

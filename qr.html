@@ -1,0 +1,138 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>heliogram rx link</title>
+<style>
+body{margin:0;background:#fff;color:#111;font:16px -apple-system,monospace;
+     display:flex;flex-direction:column;align-items:center;
+     justify-content:center;height:100vh;gap:18px}
+#qr{image-rendering:pixelated;width:min(70vmin,520px);height:min(70vmin,520px)}
+code{font-size:15px;color:#333;word-break:break-all;text-align:center;
+     max-width:80vw}
+</style></head><body>
+<canvas id="qr"></canvas>
+<code id="u"></code>
+<div style="color:#666">point the phone camera here, then open the link</div>
+<script>
+// Minimal QR encoder: byte mode, version chosen to fit, mask 0, ECC level L.
+// Enough for a URL; no dependencies, works offline.
+(() => {
+// The receiver must be reachable FROM THE PHONE, so a localhost origin is
+// never the right thing to encode. Prefer an explicit ?u=, else the tailnet
+// HTTPS origin (iOS requires HTTPS for getUserMedia), else this origin.
+const q = new URLSearchParams(location.search);
+const TAILNET = "https://luka-heasman.tail07a270.ts.net";
+const base = location.href.replace(/[^/]*$/, "");   // this page's folder
+const URL_ = q.get("u") ||
+  (location.hostname === "localhost" || location.hostname === "127.0.0.1"
+    ? TAILNET + "/rx.html?js=1"
+    : base.replace(/^http:/, "https:") + "rx.html");
+document.getElementById("u").textContent = URL_;
+
+// --- GF(256) for QR (prim 0x11d, same field as the project's RS)
+const EXP=new Uint8Array(512), LOG=new Uint8Array(256);
+{let x=1;for(let i=0;i<255;i++){EXP[i]=x;LOG[x]=i;x<<=1;if(x&0x100)x^=0x11d;}
+ for(let i=255;i<512;i++)EXP[i]=EXP[i-255];}
+const mul=(a,b)=>(a&&b)?EXP[LOG[a]+LOG[b]]:0;
+function rsGen(n){let g=[1];for(let i=0;i<n;i++){const ng=new Array(g.length+1).fill(0);
+  for(let j=0;j<g.length;j++){ng[j]^=g[j];ng[j+1]^=mul(g[j],EXP[i]);}g=ng;}return g;}
+function rsEnc(data,n){const g=rsGen(n),res=new Uint8Array(data.length+n);
+  res.set(data);
+  for(let i=0;i<data.length;i++){const c=res[i];if(!c)continue;
+    for(let j=0;j<g.length;j++)res[i+j]^=mul(g[j],c);}
+  return res.slice(data.length);}
+
+// version/ECC-L capacity table (byte mode) for versions 1..15
+const CAP=[null,17,32,53,78,106,134,154,192,230,271,321,367,425,458,520];
+const ECW=[null,7,10,15,20,26,18,20,24,30,18,20,24,26,30,22];
+const BLOCKS=[null,1,1,1,1,1,2,2,2,2,4,4,4,4,4,6];
+const TOTAL=[null,26,44,70,100,134,172,196,242,292,346,404,466,532,581,655];
+
+const bytes=new TextEncoder().encode(URL_);
+let ver=1; while(ver<15 && CAP[ver]<bytes.length) ver++;
+const size=17+ver*4;
+
+// bitstream: mode 0100, length, data, terminator, pad
+const bits=[];
+const push=(v,n)=>{for(let i=n-1;i>=0;i--)bits.push((v>>i)&1);};
+push(4,4); push(bytes.length, ver<10?8:16);
+for(const b of bytes) push(b,8);
+const totalCW=TOTAL[ver]-ECW[ver]*BLOCKS[ver];
+while(bits.length<totalCW*8 && bits.length%8) bits.push(0);
+const dataCW=[];
+for(let i=0;i<bits.length;i+=8){let v=0;for(let j=0;j<8;j++)v=(v<<1)|(bits[i+j]||0);dataCW.push(v);}
+const PAD=[0xEC,0x11]; let pi=0;
+while(dataCW.length<totalCW) dataCW.push(PAD[pi++%2]);
+
+// interleave blocks
+const perBlock=Math.floor(totalCW/BLOCKS[ver]);
+const dblocks=[],eblocks=[];
+for(let b=0;b<BLOCKS[ver];b++){
+  const d=Uint8Array.from(dataCW.slice(b*perBlock,(b+1)*perBlock));
+  dblocks.push(d); eblocks.push(rsEnc(d,ECW[ver]));
+}
+const final=[];
+for(let i=0;i<perBlock;i++) for(const d of dblocks) final.push(d[i]);
+for(let i=0;i<ECW[ver];i++) for(const e of eblocks) final.push(e[i]);
+
+// matrix
+const m=Array.from({length:size},()=>new Int8Array(size).fill(-1));
+const setF=(r,c,v)=>{if(r>=0&&r<size&&c>=0&&c<size)m[r][c]=v;};
+const finder=(r,c)=>{for(let i=-1;i<8;i++)for(let j=-1;j<8;j++){
+  const rr=r+i,cc=c+j; if(rr<0||cc<0||rr>=size||cc>=size)continue;
+  const on=(i>=0&&i<=6&&(j===0||j===6))||(j>=0&&j<=6&&(i===0||i===6))||
+           (i>=2&&i<=4&&j>=2&&j<=4);
+  setF(rr,cc,on?1:0);}};
+finder(0,0);finder(0,size-7);finder(size-7,0);
+for(let i=8;i<size-8;i++){const v=(i%2===0)?1:0;setF(6,i,v);setF(i,6,v);}
+// alignment patterns
+const AL=[[],[],[6,18],[6,22],[6,26],[6,30],[6,34],[6,22,38],[6,24,42],
+          [6,26,46],[6,28,50],[6,30,54],[6,32,58],[6,34,62],[6,26,46,66],
+          [6,26,48,70]][ver]||[];
+for(const r of AL) for(const c of AL){
+  if((r<9&&c<9)||(r<9&&c>size-10)||(r>size-10&&c<9))continue;
+  for(let i=-2;i<=2;i++)for(let j=-2;j<=2;j++)
+    setF(r+i,c+j,(Math.max(Math.abs(i),Math.abs(j))!==1)?1:0);}
+setF(size-8,8,1);   // dark module
+// reserve format areas
+for(let i=0;i<9;i++){if(m[8][i]===-1)setF(8,i,0);if(m[i][8]===-1)setF(i,8,0);}
+for(let i=size-8;i<size;i++){if(m[8][i]===-1)setF(8,i,0);}
+for(let i=size-8;i<size;i++){if(m[i][8]===-1)setF(i,8,0);}
+if(ver>=7){for(let i=0;i<6;i++)for(let j=0;j<3;j++){
+  setF(size-11+j,i,0);setF(i,size-11+j,0);}}
+
+// place data, mask 0 ((r+c)%2===0)
+let bi=0,dir=-1,col=size-1;
+const stream=[];
+for(const cw of final) for(let b=7;b>=0;b--) stream.push((cw>>b)&1);
+while(col>0){
+  if(col===6)col--;
+  for(let n=0;n<size;n++){
+    const row=dir<0?size-1-n:n;
+    for(const c of [col,col-1]){
+      if(m[row][c]!==-1)continue;
+      let v=stream[bi++]||0;
+      if((row+c)%2===0)v^=1;
+      m[row][c]=v;
+    }
+  }
+  dir=-dir;col-=2;
+}
+// format info: ECC L (01), mask 0 -> bits, BCH
+const fmt=(()=>{const d=(0b01<<3)|0;let v=d<<10;
+  for(let i=4;i>=0;i--) if((v>>(10+i))&1) v^=0b10100110111<<i;
+  return ((d<<10)|v)^0b101010000010010;})();
+const FP=[[8,0],[8,1],[8,2],[8,3],[8,4],[8,5],[8,7],[8,8],[7,8],[5,8],[4,8],
+          [3,8],[2,8],[1,8],[0,8]];
+for(let i=0;i<15;i++){const b=(fmt>>i)&1;
+  const [r,c]=FP[i]; setF(r,c,b);
+  if(i<8) setF(8,size-1-i,b); else setF(size-15+i,8,b);}
+
+// draw
+const S=8,Q=4,cv=document.getElementById("qr");
+cv.width=cv.height=(size+Q*2)*S;
+const g=cv.getContext("2d");
+g.fillStyle="#fff";g.fillRect(0,0,cv.width,cv.height);
+g.fillStyle="#000";
+for(let r=0;r<size;r++)for(let c=0;c<size;c++)
+  if(m[r][c]===1)g.fillRect((c+Q)*S,(r+Q)*S,S,S);
+})();
+</script></body></html>
