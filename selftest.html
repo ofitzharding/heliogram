@@ -92,7 +92,7 @@ function randBytes(n){
   rx.ev(`globalThis._rxReset = () => {
     dec = newDecoder(); dynK = 0; dynCum = null; dynSize = 0;
     prevBlocks = null; prevSeq = -10; lastH = null; cachedBits = null;
-    K1 = 0; k1SweepAt = 0;
+    K1 = 0; k1SweepAt = 0; SG = null;
     stats = { frames:0, located:0, tracked:0, certified:0,
               t0: performance.now(), firstHit: 0 };
   };
@@ -124,9 +124,31 @@ function randBytes(n){
     }
     const hd = d.hd || tryHeader(hb, hc);
     const before = stats.certified;
-    if (hd) finishFrame(sb.bitAt, sb.confAt, 0, hd);
+    if (hd){ finishFrame(sb.bitAt, sb.confAt, 0, hd); lastH = d.H; }
     return { st: hd ? "hdr" : "nohdr", rot: d.rot,
              cw: stats.certified - before,
+             got: dec.decoded.size, k: dynK };
+  };
+  globalThis._rxTrack = (rgba, w, h) => {
+    if (!lastH) return { st: "noH" };
+    if (!SG) SG = buildGrid(lastH, K1, w, h);
+    const { bx, by, bw, bh } = SG;
+    const data = new Uint8ClampedArray(bw * bh * 4);
+    for (let y = 0; y < bh; y++)
+      for (let x = 0; x < bw; x++){
+        const s = ((by + y) * w + bx + x) << 2, d2 = (y * bw + x) << 2;
+        data[d2] = rgba[s]; data[d2+1] = rgba[s+1];
+        data[d2+2] = rgba[s+2]; data[d2+3] = 255;
+      }
+    const sb = sampleGrid(data, SG);
+    const hb = new Uint8Array(HC.length), hc = new Float32Array(HC.length);
+    for (let i = 0; i < HC.length; i++){
+      hb[i] = sb.bitAt[HC[i]]; hc[i] = sb.confAt[HC[i]];
+    }
+    const hd = tryHeader(hb, hc);
+    const before = stats.certified;
+    if (hd) finishFrame(sb.bitAt, sb.confAt, 0, hd);
+    return { st: hd ? "hdr" : "nohdr", cw: stats.certified - before,
              got: dec.decoded.size, k: dynK };
   };
   globalThis._rxOut = () => {
@@ -342,6 +364,50 @@ function randBytes(n){
         : `E FAIL: closed but sha mismatch`, hex === want ? "p" : "f");
     } else say(`E FAIL: distorted capture no close in ${s} frames ` +
                `(k1 ${k1.toFixed(3)}, ${r ? r.got + "/" + r.k : "?"})`, "f");
+  }
+
+  // ---------- TEST F: tracked fast path (grid cache + bbox reads) --------
+  {
+    const payload = randBytes(100 * 1024);
+    const want = await sha(payload);
+    const wr = await tx.ev("containerize")(payload, "trk.bin");
+    tx.ev("prepare")(wr, "trk.bin");
+    rx.ev("_rxReset()");
+    const toRGBA = gray => {
+      const d = new Uint8ClampedArray(gray.length * 4);
+      for (let i = 0; i < gray.length; i++){
+        const p = i << 2;
+        d[p] = d[p+1] = d[p+2] = gray[i]; d[p+3] = 255;
+      }
+      return d;
+    };
+    // a few detection frames to set the lock, then tracked frames only
+    let s = 0, r = null, trackedHits = 0;
+    for (; s < 10; s++){
+      const { gray, w, h } = cam(tx.ev("_txCells")(s), 8);
+      r = rx.ev("_rxFrame")(gray, w, h);
+      if (r.st === "hdr") break;
+    }
+    if (r.st !== "hdr") say("F FAIL: no initial lock in 10 frames", "f");
+    else {
+      const t0 = performance.now();
+      for (s = s + 1; s < 300; s++){
+        const { gray, w, h } = cam(tx.ev("_txCells")(s), 8);
+        r = rx.ev("_rxTrack")(toRGBA(gray), w, h);
+        if (r.st === "hdr") trackedHits++;
+        if (r.k && r.got >= r.k) break;
+      }
+      if (r.k && r.got >= r.k){
+        const body = unwrap(rx.ev("_rxOut()"));
+        const hex = body ? await sha(body) : "no-container";
+        say(hex === want
+          ? `F PASS: tracked fast path closed 100 KB bit-exact in ${s+1} ` +
+            `frames (${trackedHits} tracked, ` +
+            `${((performance.now()-t0)/s).toFixed(0)} ms/frame in-harness)`
+          : `F FAIL: closed but sha mismatch`, hex === want ? "p" : "f");
+      } else say(`F FAIL: tracked path no close in ${s} frames ` +
+                 `(${r.got}/${r.k}, ${trackedHits} tracked)`, "f");
+    }
   }
   say("done.");
 })().catch(e => say("HARNESS ERROR: " + (e.stack || e), "f"));
