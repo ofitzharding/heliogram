@@ -608,12 +608,10 @@ function processFrame(){
   // decodes. That is a far stricter test than any tracking residual: 68
   // bytes behind RS(68,28) and a CRC16 do not pass on stale geometry.
   let H = null, tracked = false, hdKnown;
-  if (lastH && trackMiss < 3){
+  if (lastH && trackMiss < 5){
     // Fast path: constant cell->pixel table, and the video is rasterized
     // and read back ONLY over the code's bbox. A full-4K drawImage +
-    // getImageData never happens on a tracked frame. After 3 straight
-    // misses the attempt suspends (detection would run anyway; paying for
-    // both every frame is what pushed the field HUD to 144 ms/frame).
+    // getImageData never happens on a tracked frame.
     if (!SG) SG = buildGrid(lastH, K1, w, h);
     if (tCvs.width !== SG.bw || tCvs.height !== SG.bh){
       tCvs.width = SG.bw; tCvs.height = SG.bh;
@@ -630,7 +628,16 @@ function processFrame(){
     const hd0 = tryHeader(hb0, hc0, 10);
     if (hd0){ H = lastH; tracked = true; cachedBits = bits0; hdKnown = hd0;
               trackMiss = 0; }
-    else trackMiss++;
+    else {
+      // A blurred frame is unreadable at ANY geometry, so relearning
+      // geometry on it buys nothing (field HUD: 130 ms/frame, most of it
+      // detections that then failed too). Skip cheap, keep the lock, and
+      // only pay for detection after 5 straight misses. While signal is
+      // bad this duty-cycles ~5 cheap bbox reads per full detection.
+      trackMiss++;
+      guide("HOLD", "hold steady", lastPx);
+      return;
+    }
   }
   if (!H){
     SG = null;
@@ -642,14 +649,14 @@ function processFrame(){
     const G = p => (img[p<<2]*77 + img[(p<<2)+1]*150 + img[(p<<2)+2]*29) >> 8;
     const d = detectH(G, w, h);
     if (!d){
-      // Grace window: one blurry hand-held frame used to drop the lock and
-      // buy a detection storm (field HUD: 337 tracked vs 986 located).
-      // Keep the cheap tracked retry alive through a burst.
+      // Grace window: keep the lock through a burst; the cheap tracked
+      // attempts resume next frame.
+      trackMiss = 0;
       if (++lockMiss > 10) lastH = null;
       guide("NO LOCK", `hold the whole code in frame (${lastCands} hits)`, 0);
       return; }
     H = d.H; cachedBits = d.sb; hdKnown = d.hd || undefined;
-    if (hdKnown) trackMiss = 0;      // re-arm the tracked fast path
+    trackMiss = 0;                   // re-arm the cheap tracked attempts
   }
   lockMiss = 0;
   lastH = H;
@@ -858,8 +865,12 @@ function finishFrame(bitAt, confAt, pxPerCell, hdIn){
   }
   prevBlocks = curBlocks; prevSeq = hd.seq;
   const yield_ = (curBlocks.size + have) / M.n_sub;
-  guide(yield_ > 0.8 ? "STRONG" : (yield_ > 0.3 ? "DECODING" : "WEAK"),
-        yield_ > 0.8 ? "hold exactly there" :
+  // STRONG at 60%: instantaneous per-frame yield above 80% is nearly
+  // unreachable hand-held at ~10 px/cell, so the green state never showed
+  // and the guide read as perpetual mediocrity. 60% is the achievable
+  // "you are doing it right" band on real glass.
+  guide(yield_ > 0.6 ? "STRONG" : (yield_ > 0.3 ? "DECODING" : "WEAK"),
+        yield_ > 0.6 ? "hold exactly there" :
         (pxPerCell < 7 ? "MOVE CLOSER" :
          (pxPerCell > 16 ? "back off" : "steady / square up / brighten")),
         pxPerCell, yield_);
