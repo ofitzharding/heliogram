@@ -285,7 +285,7 @@ function tick(){
     // size the hint to the canvas so it never runs off the edges
     const fs = Math.max(11, Math.min(20, c.width / 42 / devicePixelRatio));
     ctx.font = `${Math.round(fs*devicePixelRatio)}px monospace`;
-    ctx.fillText("fill the frame, tap to lock focus",
+    ctx.fillText("SCREEN BRIGHTNESS TO MAX. fill the frame, tap to lock",
                  c.width/2, c.height*0.57);
   } else {
     if (!$("hud").classList.contains("mid")) $("hud").classList.add("mid");
@@ -306,8 +306,20 @@ function tick(){
   requestAnimationFrame(tick);
 }
 
+let wakeLock = null;
+async function holdWake(){
+  // No web API can raise display brightness, but a screen wake lock stops
+  // macOS auto-dim mid-transmit, which washes the code to gray mush (field
+  // run: lock held, yield 0%, capture visibly washed).
+  try { wakeLock = await navigator.wakeLock.request("screen"); } catch(e){}
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible" && running) holdWake();
+  }, { once: true });
+}
+
 function start(bytes, name){
   prepare(bytes, name);
+  holdWake();
   off = document.createElement("canvas");
   off.width = M.gw; off.height = M.gh;
   offctx = off.getContext("2d", {alpha:false});
