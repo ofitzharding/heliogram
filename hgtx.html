@@ -246,10 +246,15 @@ const CD = 12;
 // ProMotion laptop ticks at 120 Hz while the phone's getUserMedia captures
 // 30 fps, so nearly every capture integrates two or more DIFFERENT code
 // frames, and a blended frame is unrecoverable (measured: the SIC oracle
-// left residual d' 0.04-1.20). Pace seqs on the clock instead, at a rate a
-// 30 fps receiver can see one-to-one. ?rate=60 if the receiver runs 60.
+// left residual d' 0.04-1.20). Pace seqs on the clock instead.
+// NOT exactly 30: a 30 seq/s sender against a 30 fps camera PHASE-LOCKS,
+// and when the flip parks mid-exposure every frame is a blend for tens of
+// seconds at a time (field: LOCKED-no-header stalls at 48% band yield,
+// the same phase-locked straddle the film pipeline documented). 28 seq/s
+// rotates the phase through a full cycle every ~0.5 s, so dead phases
+// sweep past instead of parking. ?rate= overrides.
 const RATE = Math.max(1, +(new URLSearchParams(location.search).get("rate")
-                           || 30));
+                           || 28));
 let nextT = 0;
 function tick(){
   if (!running) return;

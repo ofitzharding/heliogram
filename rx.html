@@ -637,6 +637,16 @@ function processFrame(){
     if (a.hd){ H = lastH; tracked = true; cachedBits = a.sb; hdKnown = a.hd;
                trackMiss = 0; }
     else {
+      // Straddle frame with PROVEN geometry: codewords certify (a
+      // zero-false-accept test) even though the header band is riding the
+      // sender/camera phase seam. The geometry is fine, the frame is
+      // partially a blend; skip it for the cost of a syndrome count
+      // instead of burning 120 ms relearning what is not lost.
+      if (hardClean(a.sb) >= 3){
+        trackMiss = 0;
+        guide("STRADDLE", "phase seam, riding it out", lastPx);
+        return;
+      }
       trackMiss++;
       // Drift vs blur: re-locate the finders locally and refit, but TRUST
       // NOTHING until the header certifies at the refreshed geometry. The
