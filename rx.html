@@ -423,6 +423,30 @@ function detectH(G, w, h){
       return [cx + dx / s, cy + dy / s];
     });
   };
+  // K1 refinement, film-decoder style but throttled: the sweep accepted
+  // the FIRST k1 that decoded a header, and the payload optimum can sit a
+  // rung away. Judge = syndrome-clean codewords on this same frame, same
+  // quad refit per candidate, so corners stay pinned and camera motion
+  // cancels out of the comparison.
+  const refine = start => {
+    if (performance.now() - k1RefineAt < 2000) return start;
+    k1RefineAt = performance.now();
+    let best = start, bestN = hardClean(start.sb), bestK = K1;
+    for (const dk of [-0.005, 0.005]){
+      const k = +(K1 + dk).toFixed(3);
+      const H2 = homography(M.finders, undist(start.q, k));
+      if (!H2) continue;
+      const sb2 = sampleBits(G, w, h, H2, k);
+      if (hardClean(sb2) > bestN + 1){
+        const hd2 = headerOf(sb2);
+        if (hd2){ best = { H: H2, sb: sb2, rot: start.rot, hd: hd2,
+                           q: start.q };
+                  bestN = hardClean(sb2); bestK = k; }
+      }
+    }
+    K1 = bestK;
+    return best;
+  };
   let fallback = null, prefQ = null, prefRot = 0;
   for (const [q, rot] of quads){
     const wpx = Math.hypot(q[1][0]-q[0][0], q[1][1]-q[0][1]);
@@ -434,8 +458,8 @@ function detectH(G, w, h){
     if (!prefQ){ prefQ = q; prefRot = rot; }
     const sb = sampleBits(G, w, h, H, K1);
     const hd = headerOf(sb);
-    if (hd) return { H, sb, rot, hd };
-    if (!fallback) fallback = { H, sb, rot, hd: null };
+    if (hd) return refine({ H, sb, rot, hd, q });
+    if (!fallback) fallback = { H, sb, rot, hd: null, q };
   }
   // k1 sweep, header-certified, rate-limited. Runs only while nothing
   // decodes at the current K1, on the first plausible orientation, with
@@ -448,7 +472,7 @@ function detectH(G, w, h){
       if (!H) continue;
       const sb = sampleBits(G, w, h, H, k1);
       const hd = headerOf(sb);
-      if (hd){ K1 = k1; return { H, sb, rot: prefRot, hd }; }
+      if (hd){ K1 = k1; return { H, sb, rot: prefRot, hd, q: prefQ }; }
     }
   }
   return fallback;
@@ -597,11 +621,16 @@ function processFrame(){
     // and a sparse histogram, never all 8.3M px.
     const G = p => (img[p<<2]*77 + img[(p<<2)+1]*150 + img[(p<<2)+2]*29) >> 8;
     const d = detectH(G, w, h);
-    if (!d){ lastH = null;
+    if (!d){
+      // Grace window: one blurry hand-held frame used to drop the lock and
+      // buy a detection storm (field HUD: 337 tracked vs 986 located).
+      // Keep the cheap tracked retry alive through a burst.
+      if (++lockMiss > 10) lastH = null;
       guide("NO LOCK", `hold the whole code in frame (${lastCands} hits)`, 0);
       return; }
     H = d.H; cachedBits = d.sb; hdKnown = d.hd || undefined;
   }
+  lockMiss = 0;
   lastH = H;
   stats.located++;
   if (tracked) stats.tracked++;
@@ -624,9 +653,27 @@ function processFrame(){
 // this exact mechanism: geometry chosen by border pilots alone loses 87.3%
 // of codewords vs geometry chosen by the code (k1 hill-climb). K1 is swept
 // by detectH with the header as the certifier and then held.
-let K1 = 0, k1SweepAt = 0;
+let K1 = 0, k1SweepAt = 0, k1RefineAt = 0, lockMiss = 0;
 const K1LADDER = [0.005, 0.01, 0.015, 0.02, 0.03, 0.045,
                   -0.005, -0.01, -0.02, -0.03];
+
+// Syndrome-clean codeword count: the sharp, cheap judge for geometry
+// candidates (a clean syndrome set is a perfectly sampled codeword).
+function hardClean(sb){
+  const msg = new Uint8Array(255);
+  const synd = new Uint8Array(M.ecc + 1);
+  let n = 0;
+  for (let j = 0; j < M.n_sub; j++){
+    for (let i = 0; i < 255; i++){
+      let v = 0;
+      const o = (j*255 + i) * 8;
+      for (let b = 0; b < 8; b++) v = (v << 1) | sb.bitAt[PC[o + b]];
+      msg[i] = v;
+    }
+    if (calcSynd(msg, 255, M.ecc, synd) === 0) n++;
+  }
+  return n;
+}
 
 function sampleBits(G, w, h, H, k1){
   const nCells = M.gw * M.gh;
