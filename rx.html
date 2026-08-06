@@ -638,20 +638,21 @@ function processFrame(){
     if (a.hd){ H = lastH; tracked = true; cachedBits = a.sb; hdKnown = a.hd;
                trackMiss = 0; }
     else {
-      // Headerless frame with PROVEN geometry: payload codewords certify
-      // (zero false accepts) even though the header band is riding the
-      // phase seam or a glare patch. These frames used to be thrown away
-      // and they are MOST of the transfer. With a fresh clock fit, infer
-      // the seq and harvest into quarantine; without one, skip cheap.
-      if (certCount(a.sb, 10) >= 2){
+      // Headerless frame. The header is ONE contiguous band, so rolling-
+      // shutter shear or a seam kills it as a unit while the 31
+      // distributed payload bands still certify at 40%+. Those frames are
+      // most of the transfer. With a fresh clock fit, run the FULL
+      // ladder-assisted decode as both geometry judge and harvest: one
+      // certified codeword is a zero-false-accept proof, and the blocks
+      // go to quarantine under the inferred seq.
+      stageG = inferSeq(performance.now());
+      if (stageG !== null && (JSMODE ? dynK : M.k)){
+        H = lastH; tracked = true; cachedBits = a.sb; hdKnown = undefined;
+      } else if (certCount(a.sb, 10) >= 1){
+        // no usable fit yet; geometry still proven, keep the lock cheap
         trackMiss = 0;
-        stageG = inferSeq(performance.now());
-        if (stageG !== null && (JSMODE ? dynK : M.k)){
-          H = lastH; tracked = true; cachedBits = a.sb; hdKnown = undefined;
-        } else {
-          guide("STRADDLE", "phase seam, riding it out", lastPx);
-          return;
-        }
+        guide("STRADDLE", "phase seam, riding it out", lastPx);
+        return;
       }
       if (!H){
       trackMiss++;
@@ -692,6 +693,7 @@ function processFrame(){
       guide("NO LOCK", `hold the whole code in frame (${lastCands} hits)`, 0);
       return; }
     H = d.H; cachedBits = d.sb; hdKnown = d.hd || undefined;
+    if (!d.hd) stageG = inferSeq(performance.now());
     trackMiss = 0;                   // re-arm the cheap tracked attempts
   }
   lockMiss = 0;
@@ -703,7 +705,13 @@ function processFrame(){
                Math.hypot(p2[0]-p0[0], p2[1]-p0[1])) / 2;
   lastPxS = pxS;
   lastPx = pxS / SCALE;              // native cam-px/cell for the operator
-  finishFrame(cachedBits.bitAt, cachedBits.confAt, lastPx, hdKnown, stageG);
+  const got = finishFrame(cachedBits.bitAt, cachedBits.confAt, lastPx,
+                          hdKnown, stageG);
+  // On staging frames the certify result IS the lock verdict: zero
+  // certified blocks means the geometry (or the frame) is truly gone.
+  if (stageG !== null && hdKnown === undefined){
+    if (got > 0) trackMiss = 0; else trackMiss++;
+  }
 }
 
 // Radial term. The homography is fit on four corner pilots, but the phone
@@ -724,20 +732,38 @@ const K1LADDER = [0.005, 0.01, 0.015, 0.02, 0.03, 0.045,
 // field). Hard RS decode + CRC32 is the same zero-false-accept oracle the
 // whole decoder is built on.
 function certCount(sb, nSample){
+  // Includes a two-rung erasure ladder: on real glass most certifications
+  // come through erasure rescues, so a hard-only judge reads 0 on frames
+  // the full decoder handles at 40%+ yield.
   const msg = new Uint8Array(255);
   let n = 0;
   const step = Math.max(1, Math.floor(M.n_sub / nSample));
   for (let j = 0; j < M.n_sub; j += step){
+    const conf = new Float32Array(255);
     for (let i = 0; i < 255; i++){
-      let v = 0;
+      let v = 0, cmin = 1e9;
       const o = (j*255 + i) * 8;
-      for (let b = 0; b < 8; b++) v = (v << 1) | sb.bitAt[PC[o + b]];
-      msg[i] = v;
+      for (let b = 0; b < 8; b++){
+        const cell = PC[o + b];
+        v = (v << 1) | sb.bitAt[cell];
+        if (sb.confAt[cell] < cmin) cmin = sb.confAt[cell];
+      }
+      msg[i] = v; conf[i] = cmin;
     }
+    let ok = null;
     const m2 = Uint8Array.from(msg);
-    if (correctMsg(m2, 255, M.ecc, null, 0)){
-      const want = (m2[0] | (m2[1]<<8) | (m2[2]<<16) | (m2[3]<<24)) >>> 0;
-      if (crc32(m2, 4, M.sub) === want) n++;
+    if (correctMsg(m2, 255, M.ecc, null, 0)) ok = m2;
+    if (!ok){
+      const order = Array.from({length:255}, (_,i)=>i)
+        .sort((a,b) => conf[a] - conf[b]);
+      for (const nEr of [4, 10]){
+        const m3 = Uint8Array.from(msg);
+        if (correctMsg(m3, 255, M.ecc, order, nEr)){ ok = m3; break; }
+      }
+    }
+    if (ok){
+      const want = (ok[0] | (ok[1]<<8) | (ok[2]<<16) | (ok[3]<<24)) >>> 0;
+      if (crc32(ok, 4, M.sub) === want) n++;
     }
   }
   return n;
@@ -764,10 +790,10 @@ function seqFit(){
 }
 function inferSeq(now){
   const f = seqFit();
-  if (!f || now - f.tN > 2500) return null;     // stale fit: refuse
+  if (!f || now - f.tN > 4000) return null;     // stale fit: refuse
   const g = f.sN + f.b * (now - f.tN);
   const r = Math.round(g);
-  return Math.abs(g - r) < 0.22 ? r : null;     // mid-seq confidence only
+  return Math.abs(g - r) < 0.35 ? r : null;     // reject only seam-riders
 }
 function anchorSeq(now, seq){
   // validate + flush quarantine against this REAL header
@@ -964,7 +990,7 @@ function finishFrame(bitAt, confAt, pxPerCell, hdIn, stageG){
           pxPerCell < 7 ? "MOVE CLOSER" :
           (pxPerCell > 16 ? "back off a little" :
            "hold still, square to the screen"), pxPerCell);
-    return;
+    return 0;
   }
   const seq = staging ? stageG : hd.seq;
   if (!staging) anchorSeq(performance.now(), hd.seq);
@@ -1026,6 +1052,7 @@ function finishFrame(bitAt, confAt, pxPerCell, hdIn, stageG){
          (pxPerCell > 16 ? "back off" : "steady / square up / brighten")),
         pxPerCell, yield_);
   if (dec.decoded.size >= (JSMODE ? dynK : M.k)) finish();
+  return curBlocks.size + have;
 }
 
 async function finish(){
