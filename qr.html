@@ -29,10 +29,13 @@ const base = location.href.replace(/[^/]*$/, "");   // this page's folder
 // Fresh cache-buster on every render: iOS Safari caches rx.html hard, and a
 // stale receiver against a current sender has burned two field sessions.
 const bust = "v" + Date.now().toString(36);
-const URL_ = q.get("u") ||
+// The bust applies to ?u= overrides too: an un-busted override QR served a
+// cached receiver against a current sender at least once in the field.
+const raw = q.get("u") ||
   (location.hostname === "localhost" || location.hostname === "127.0.0.1"
-    ? PUBLIC + `/rx.html?js=1&${bust}`
-    : base.replace(/^http:/, "https:") + `rx.html?js=1&${bust}`);
+    ? PUBLIC + "/rx.html?js=1"
+    : base.replace(/^http:/, "https:") + "rx.html?js=1");
+const URL_ = raw + (raw.includes("?") ? "&" : "?") + bust;
 document.getElementById("u").textContent = URL_;
 
 // --- GF(256) for QR (prim 0x11d, same field as the project's RS)
