@@ -1042,14 +1042,24 @@ function finishFrame(bitAt, confAt, pxPerCell, hdIn, stageG){
     staged.push({ g: seq, blocks: stagedBlocks });
   prevBlocks = curBlocks; prevSeq = seq;
   const yield_ = (curBlocks.size + have) / M.n_sub;
+  // Eye size = mean |lum - local mean| over the grid. A washed capture
+  // (screen dimmed, blown metering) starves the decoder of contrast while
+  // geometry holds perfectly; a field run died exactly this way reported
+  // only as generic WEAK. Name it, with the number, so the operator fixes
+  // the actual problem (screen brightness / re-tap to meter).
+  let eyeSum = 0, eyeN = 0;
+  for (let i = 0; i < confAt.length; i += 199){ eyeSum += confAt[i]; eyeN++; }
+  const eye = eyeSum / eyeN;
+  lastEye = eye;
   // STRONG at 60%: instantaneous per-frame yield above 80% is nearly
   // unreachable hand-held at ~10 px/cell, so the green state never showed
   // and the guide read as perpetual mediocrity. 60% is the achievable
   // "you are doing it right" band on real glass.
   guide(yield_ > 0.6 ? "STRONG" : (yield_ > 0.3 ? "DECODING" : "WEAK"),
         yield_ > 0.6 ? "hold exactly there" :
+        (eye < 12 ? "WASHED OUT: screen brightness MAX, tap the code to re-meter" :
         (pxPerCell < 7 ? "MOVE CLOSER" :
-         (pxPerCell > 16 ? "back off" : "steady / square up / brighten")),
+         (pxPerCell > 16 ? "back off" : "steady / square up / brighten"))),
         pxPerCell, yield_);
   if (dec.decoded.size >= (JSMODE ? dynK : M.k)) finish();
   return curBlocks.size + have;
@@ -1107,7 +1117,7 @@ async function finish(){
   running = false;
 }
 
-let lastPx = 0, lastPxS = 0, CAMDESC = '', lastH = null, cachedBits = null;
+let lastPx = 0, lastPxS = 0, lastEye = 0, CAMDESC = '', lastH = null, cachedBits = null;
 let gState = "", gTip = "", gPx = 0, gYld, gT = 0, yAvg = 0;
 function guide(state, tip, px, yld){
   // The per-frame state flickers between LOCKED/STRONG/WEAK faster than it
@@ -1125,7 +1135,9 @@ function guide(state, tip, px, yld){
   g.innerHTML = `<b>${state}</b> &nbsp; ${tip}` +
     (px ? `<br><small>${px.toFixed(1)} cam-px/cell` +
           (yAvg ? ` &nbsp; yield ${(100*yAvg).toFixed(0)}%` : "") +
-          ` &nbsp; k1 ${K1.toFixed(3)}</small>` : "");
+          ` &nbsp; k1 ${K1.toFixed(3)}` +
+          (lastEye ? ` &nbsp; eye ${lastEye.toFixed(0)}` : "") +
+          `</small>` : "");
 }
 
 let running = false;
