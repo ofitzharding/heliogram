@@ -608,7 +608,7 @@ function processFrame(){
   // decodes. That is a far stricter test than any tracking residual: 68
   // bytes behind RS(68,28) and a CRC16 do not pass on stale geometry.
   let H = null, tracked = false, hdKnown;
-  if (lastH && trackMiss < 5){
+  if (lastH && trackMiss < 8){
     // Fast path: constant cell->pixel table, and the video is rasterized
     // and read back ONLY over the code's bbox. A full-4K drawImage +
     // getImageData never happens on a tracked frame.
@@ -629,13 +629,24 @@ function processFrame(){
     if (hd0){ H = lastH; tracked = true; cachedBits = bits0; hdKnown = hd0;
               trackMiss = 0; }
     else {
-      // A blurred frame is unreadable at ANY geometry, so relearning
-      // geometry on it buys nothing (field HUD: 130 ms/frame, most of it
-      // detections that then failed too). Skip cheap, keep the lock, and
-      // only pay for detection after 5 straight misses. While signal is
-      // bad this duty-cycles ~5 cheap bbox reads per full detection.
       trackMiss++;
-      guide("HOLD", "hold steady", lastPx);
+      // Drift vs blur, discriminated: a corner search that succeeds means
+      // the frame is fine and the geometry slid; refit and resume next
+      // frame. A search that fails means real blur; skip cheap. Full
+      // detection only after a genuine streak.
+      const q = cornerRefresh(data, SG, lastPx || 10);
+      if (q){
+        const H2 = homography(M.finders, (() => {
+          const cx = w / 2, cy = h / 2, rn2 = (w*w + h*h) / 4;
+          return q.map(([x, y]) => {
+            const dx = x - cx, dy = y - cy;
+            const s = 1 + K1 * (dx*dx + dy*dy) / rn2;
+            return [cx + dx / s, cy + dy / s];
+          });
+        })());
+        if (H2){ lastH = H2; SG = null; }
+        guide("HOLD", "re-locking", lastPx);
+      } else guide("HOLD", "hold steady", lastPx);
       return;
     }
   }
@@ -750,12 +761,71 @@ function buildGrid(H, k1, w, h){
       if (yi < miny) miny = yi; if (yi > maxy) maxy = yi;
     }
   }
-  const bx = Math.max(0, minx - 2), by = Math.max(0, miny - 2);
-  const bw = Math.min(w, maxx + 4) - bx, bh = Math.min(h, maxy + 4) - by;
+  // 18px margin: the corner-refresh search needs room around the finder
+  // centres, which sit at the grid's edge.
+  const bx = Math.max(0, minx - 18), by = Math.max(0, miny - 18);
+  const bw = Math.min(w, maxx + 36) - bx, bh = Math.min(h, maxy + 36) - by;
   const base = new Int32Array(nCells);
   for (let i = 0; i < nCells; i++)
     base[i] = (ys[i] - by) * bw + (xs[i] - bx);
-  return { base, bx, by, bw, bh };
+  // finder centres in bbox px, for drift refresh
+  const f4 = M.finders.map(([gx, gy]) => {
+    let [px, py] = applyH(H, gx, gy);
+    if (k1){
+      const dx = px - cx, dy = py - cy;
+      const s = 1 + k1 * (dx*dx + dy*dy) / rn2;
+      px = cx + dx * s; py = cy + dy * s;
+    }
+    return [px - bx, py - by];
+  });
+  return { base, bx, by, bw, bh, f4 };
+}
+
+// Drift refresh: hand-held tracking loses the header not to blur but to a
+// few px of slow drift, and the frame itself is fine. Re-locate each
+// finder inside a small window around its predicted position (normalized
+// correlation against the 7x7-cell finder pattern), and refit. ~1 ms in
+// the already-read bbox, vs ~100 ms of full detection that mostly failed
+// on the same frames. Blur genuinely fails this search, which is exactly
+// the skip signal the duty cycle wants.
+function cornerRefresh(data, sg, cell){
+  const { bw, bh, f4 } = sg;
+  const lumAt = (x, y) => {
+    const p = (y * bw + x) << 2;
+    return (data[p]*77 + data[p+1]*150 + data[p+2]*29) >> 8;
+  };
+  // 7x7 finder: dark border ring, light inner ring, dark 3x3 core
+  const sign = (i, j) => {
+    const a = Math.max(Math.abs(i), Math.abs(j));   // rings at radius 3,2,1
+    return a === 3 ? 1 : (a === 2 ? -1 : 1);
+  };
+  const out = [];
+  let good = 0;
+  for (const [fx0, fy0] of f4){
+    let best = -1, bx2 = fx0, by2 = fy0;
+    for (let dy = -12; dy <= 12; dy += 2){
+      for (let dx = -12; dx <= 12; dx += 2){
+        let sum = 0, taps = [];
+        for (let j = -3; j <= 3; j++)
+          for (let i = -3; i <= 3; i++){
+            const x = Math.round(fx0 + dx + i * cell);
+            const y = Math.round(fy0 + dy + j * cell);
+            const l = (x >= 0 && x < bw && y >= 0 && y < bh)
+              ? lumAt(x, y) : 128;
+            taps.push([sign(i, j), l]); sum += l;
+          }
+        const mean = sum / 49;
+        let sc = 0, mag = 1e-6;
+        for (const [e, l] of taps){ sc += e * (mean - l);
+                                    mag += Math.abs(l - mean); }
+        const n = sc / mag;
+        if (n > best){ best = n; bx2 = fx0 + dx; by2 = fy0 + dy; }
+      }
+    }
+    if (best > 0.45) good++;
+    out.push([bx2 + sg.bx, by2 + sg.by]);
+  }
+  return good >= 3 ? out : null;
 }
 function sampleGrid(data, sg){
   const { base, bw } = sg;
