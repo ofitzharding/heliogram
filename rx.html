@@ -229,10 +229,15 @@ function certify(chunk, order, ecc, sub){
   msg.set(chunk);
   let ok = correctMsg(msg, 255, ecc, null, 0);
   if (!ok && order){
-    const top = Math.floor(ecc * 0.7);
-    for (let nEr = 4; nEr <= top && !ok; nEr += 6){
-      msg.set(chunk);
-      ok = correctMsg(msg, 255, ecc, order, nEr);
+    // order may be a factory: the confidence sort costs a 255-element sort
+    // per codeword and is only needed once hard decode has failed.
+    const ord = typeof order === "function" ? order() : order;
+    if (ord){
+      const top = Math.floor(ecc * 0.7);
+      for (let nEr = 4; nEr <= top && !ok; nEr += 6){
+        msg.set(chunk);
+        ok = correctMsg(msg, 255, ecc, ord, nEr);
+      }
     }
   }
   if (!ok) return null;
@@ -242,7 +247,7 @@ function certify(chunk, order, ecc, sub){
 }
 
 // ---------- header ----------
-function tryHeader(bits, conf){
+function tryHeader(bits, conf, capEr){
   // bits: Uint8Array over header cells (MSB-first bytes). conf, when given,
   // is the per-cell |lum - local mean| margin for the same cells, and buys
   // the header the SAME confidence-ordered erasure ladder the payload gets.
@@ -289,7 +294,10 @@ function tryHeader(bits, conf){
   };
   let hd = attempt(0);
   if (!hd && order){
-    const top = Math.floor(M.hdr_ecc * 0.7);
+    // capEr bounds the ladder on paths that run every frame (tracking);
+    // the full ladder is for the once-per-frame chosen geometry.
+    let top = Math.floor(M.hdr_ecc * 0.7);
+    if (capEr && capEr < top) top = capEr;
     for (let nEr = 4; !hd && nEr <= top; nEr += 6) hd = attempt(nEr);
   }
   return hd;
@@ -582,13 +590,16 @@ let prevBlocks = null, prevSeq = -10;
 let stats = { frames: 0, located: 0, tracked: 0, certified: 0, t0: 0, firstHit: 0 };
 const cvs = document.createElement("canvas");
 const cctx = cvs.getContext("2d", { willReadFrequently: true });
+// Tracked frames draw and read ONLY the code's bbox through this canvas;
+// the full-frame canvas is touched on detection frames alone.
+const tCvs = document.createElement("canvas");
+const tCtx = tCvs.getContext("2d", { willReadFrequently: true });
+let trackMiss = 0;
 
 function processFrame(){
   const v = $("v");
   if (!v.videoWidth) return;
   const w = v.videoWidth, h = v.videoHeight;
-  cvs.width = w; cvs.height = h;
-  cctx.drawImage(v, 0, 0, w, h);
   stats.frames++;
   // GEOMETRY TRACKING. Re-running finder detection on every frame is the
   // dominant cost AND the dominant loss: measured 31 of 212 frames located
@@ -597,13 +608,18 @@ function processFrame(){
   // decodes. That is a far stricter test than any tracking residual: 68
   // bytes behind RS(68,28) and a CRC16 do not pass on stale geometry.
   let H = null, tracked = false, hdKnown;
-  if (lastH){
-    // Fast path: constant cell->pixel table, bbox-only readback. The full
-    // 4K getImageData plus 66k projective mappings per frame were most of
-    // the tracked-frame budget; this replaces both with one smaller copy
-    // and table lookups.
+  if (lastH && trackMiss < 3){
+    // Fast path: constant cell->pixel table, and the video is rasterized
+    // and read back ONLY over the code's bbox. A full-4K drawImage +
+    // getImageData never happens on a tracked frame. After 3 straight
+    // misses the attempt suspends (detection would run anyway; paying for
+    // both every frame is what pushed the field HUD to 144 ms/frame).
     if (!SG) SG = buildGrid(lastH, K1, w, h);
-    const data = cctx.getImageData(SG.bx, SG.by, SG.bw, SG.bh).data;
+    if (tCvs.width !== SG.bw || tCvs.height !== SG.bh){
+      tCvs.width = SG.bw; tCvs.height = SG.bh;
+    }
+    tCtx.drawImage(v, SG.bx, SG.by, SG.bw, SG.bh, 0, 0, SG.bw, SG.bh);
+    const data = tCtx.getImageData(0, 0, SG.bw, SG.bh).data;
     const bits0 = sampleGrid(data, SG);
     const hb0 = new Uint8Array(HC.length);
     const hc0 = new Float32Array(HC.length);
@@ -611,11 +627,15 @@ function processFrame(){
       hb0[i] = bits0.bitAt[HC[i]];
       hc0[i] = bits0.confAt[HC[i]];
     }
-    const hd0 = tryHeader(hb0, hc0);
-    if (hd0){ H = lastH; tracked = true; cachedBits = bits0; hdKnown = hd0; }
+    const hd0 = tryHeader(hb0, hc0, 10);
+    if (hd0){ H = lastH; tracked = true; cachedBits = bits0; hdKnown = hd0;
+              trackMiss = 0; }
+    else trackMiss++;
   }
   if (!H){
     SG = null;
+    if (cvs.width !== w){ cvs.width = w; cvs.height = h; }
+    cctx.drawImage(v, 0, 0, w, h);
     const img = cctx.getImageData(0, 0, w, h).data;
     // Luma tapped on demand: the decoder reads cell centres, scan rows,
     // and a sparse histogram, never all 8.3M px.
@@ -629,6 +649,7 @@ function processFrame(){
       guide("NO LOCK", `hold the whole code in frame (${lastCands} hits)`, 0);
       return; }
     H = d.H; cachedBits = d.sb; hdKnown = d.hd || undefined;
+    if (hdKnown) trackMiss = 0;      // re-arm the tracked fast path
   }
   lockMiss = 0;
   lastH = H;
@@ -820,7 +841,7 @@ function finishFrame(bitAt, confAt, pxPerCell, hdIn){
     if (dec.seen.has(hd.seq * M.n_sub + j)){ have++; continue; }
     const chunk = pb.subarray(j*255, (j+1)*255);
     const order = performance.now() < ladderBy
-      ? Array.from({length:255}, (_,i)=>i)
+      ? () => Array.from({length:255}, (_,i)=>i)
           .sort((a,b) => pconf[j*255+a] - pconf[j*255+b])
       : null;
     const blk = certify(chunk, order, M.ecc, M.sub);
@@ -949,7 +970,7 @@ $("go").onclick = async () => {
   if (track.getCapabilities)
     console.log("camera capabilities:", JSON.stringify(track.getCapabilities()));
   dec = newDecoder();
-  SG = null;
+  SG = null; trackMiss = 0; lockMiss = 0;
   lastPoolT = 0; lastPoolN = 0; poolRate = 0;
   stats = { frames:0, located:0, tracked:0, certified:0,
             t0: performance.now(), firstHit: 0 };
