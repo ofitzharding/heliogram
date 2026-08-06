@@ -596,58 +596,69 @@ const tCvs = document.createElement("canvas");
 const tCtx = tCvs.getContext("2d", { willReadFrequently: true });
 let trackMiss = 0;
 
+// PROCESSING SPACE. Everything runs at half resolution: the GPU's area
+// filter turns 10 native px/cell into 5 clean, pre-averaged px/cell (the
+// camera model holds ~75% yield there), and every readback, scan, and
+// mapping costs a quarter. That is the difference between decoding 10 of
+// 30 camera frames and all of them. K1 is scale-invariant (r^2/rn^2), so
+// geometry transfers. ?full=1 disables for A/B.
+const SCALE = new URLSearchParams(location.search).get("full") === "1"
+  ? 1 : 0.5;
+
 function processFrame(){
   const v = $("v");
   if (!v.videoWidth) return;
-  const w = v.videoWidth, h = v.videoHeight;
+  const w = Math.round(v.videoWidth * SCALE);
+  const h = Math.round(v.videoHeight * SCALE);
   stats.frames++;
-  // GEOMETRY TRACKING. Re-running finder detection on every frame is the
-  // dominant cost AND the dominant loss: measured 31 of 212 frames located
-  // at 68 ms each. The screen moves a fraction of a cell in 1/30 s, so try
-  // the PREVIOUS frame's homography first and keep it if the header still
-  // decodes. That is a far stricter test than any tracking residual: 68
-  // bytes behind RS(68,28) and a CRC16 do not pass on stale geometry.
+  // Draw + sample + header at geometry Hc, bbox-only, in the scaled
+  // space. The header is the zero-false-accept gate: no geometry is
+  // installed or harvested unless it certifies here.
+  const attemptAt = (Hc, sg) => {
+    sg = sg || buildGrid(Hc, K1, w, h);
+    if (tCvs.width !== sg.bw || tCvs.height !== sg.bh){
+      tCvs.width = sg.bw; tCvs.height = sg.bh;
+    }
+    tCtx.drawImage(v, sg.bx / SCALE, sg.by / SCALE,
+                   sg.bw / SCALE, sg.bh / SCALE, 0, 0, sg.bw, sg.bh);
+    const data = tCtx.getImageData(0, 0, sg.bw, sg.bh).data;
+    const sb = sampleGrid(data, sg);
+    const hb = new Uint8Array(HC.length);
+    const hc = new Float32Array(HC.length);
+    for (let i = 0; i < HC.length; i++){
+      hb[i] = sb.bitAt[HC[i]]; hc[i] = sb.confAt[HC[i]];
+    }
+    return { sg, data, sb, hd: tryHeader(hb, hc, 10) };
+  };
   let H = null, tracked = false, hdKnown;
   if (lastH && trackMiss < 8){
-    // Fast path: constant cell->pixel table, and the video is rasterized
-    // and read back ONLY over the code's bbox. A full-4K drawImage +
-    // getImageData never happens on a tracked frame.
-    if (!SG) SG = buildGrid(lastH, K1, w, h);
-    if (tCvs.width !== SG.bw || tCvs.height !== SG.bh){
-      tCvs.width = SG.bw; tCvs.height = SG.bh;
-    }
-    tCtx.drawImage(v, SG.bx, SG.by, SG.bw, SG.bh, 0, 0, SG.bw, SG.bh);
-    const data = tCtx.getImageData(0, 0, SG.bw, SG.bh).data;
-    const bits0 = sampleGrid(data, SG);
-    const hb0 = new Uint8Array(HC.length);
-    const hc0 = new Float32Array(HC.length);
-    for (let i = 0; i < HC.length; i++){
-      hb0[i] = bits0.bitAt[HC[i]];
-      hc0[i] = bits0.confAt[HC[i]];
-    }
-    const hd0 = tryHeader(hb0, hc0, 10);
-    if (hd0){ H = lastH; tracked = true; cachedBits = bits0; hdKnown = hd0;
-              trackMiss = 0; }
+    const a = attemptAt(lastH, SG);
+    SG = a.sg;
+    if (a.hd){ H = lastH; tracked = true; cachedBits = a.sb; hdKnown = a.hd;
+               trackMiss = 0; }
     else {
       trackMiss++;
-      // Drift vs blur, discriminated: a corner search that succeeds means
-      // the frame is fine and the geometry slid; refit and resume next
-      // frame. A search that fails means real blur; skip cheap. Full
-      // detection only after a genuine streak.
-      const q = cornerRefresh(data, SG, lastPx || 10);
+      // Drift vs blur: re-locate the finders locally and refit, but TRUST
+      // NOTHING until the header certifies at the refreshed geometry. The
+      // uncertified version of this refresh installed slightly-wrong fits,
+      // blocked detection behind them, and fell to ~2.5 KB/s in the field.
+      // A certified refresh repairs drift AND harvests this very frame.
+      const q = cornerRefresh(a.data, SG, lastPxS || 5);
       if (q){
-        const H2 = homography(M.finders, (() => {
-          const cx = w / 2, cy = h / 2, rn2 = (w*w + h*h) / 4;
-          return q.map(([x, y]) => {
-            const dx = x - cx, dy = y - cy;
-            const s = 1 + K1 * (dx*dx + dy*dy) / rn2;
-            return [cx + dx / s, cy + dy / s];
-          });
-        })());
-        if (H2){ lastH = H2; SG = null; }
-        guide("HOLD", "re-locking", lastPx);
-      } else guide("HOLD", "hold steady", lastPx);
-      return;
+        const cx = w / 2, cy = h / 2, rn2 = (w*w + h*h) / 4;
+        const H2 = homography(M.finders, q.map(([x, y]) => {
+          const dx = x - cx, dy = y - cy;
+          const s = 1 + K1 * (dx*dx + dy*dy) / rn2;
+          return [cx + dx / s, cy + dy / s];
+        }));
+        const a2 = H2 && attemptAt(H2);
+        if (a2 && a2.hd){
+          lastH = H2; SG = a2.sg;
+          H = H2; tracked = true; cachedBits = a2.sb; hdKnown = a2.hd;
+          trackMiss = 0;
+        }
+      }
+      if (!H){ guide("HOLD", "hold steady", lastPx); return; }
     }
   }
   if (!H){
@@ -655,13 +666,9 @@ function processFrame(){
     if (cvs.width !== w){ cvs.width = w; cvs.height = h; }
     cctx.drawImage(v, 0, 0, w, h);
     const img = cctx.getImageData(0, 0, w, h).data;
-    // Luma tapped on demand: the decoder reads cell centres, scan rows,
-    // and a sparse histogram, never all 8.3M px.
     const G = p => (img[p<<2]*77 + img[(p<<2)+1]*150 + img[(p<<2)+2]*29) >> 8;
     const d = detectH(G, w, h);
     if (!d){
-      // Grace window: keep the lock through a burst; the cheap tracked
-      // attempts resume next frame.
       trackMiss = 0;
       if (++lockMiss > 10) lastH = null;
       guide("NO LOCK", `hold the whole code in frame (${lastCands} hits)`, 0);
@@ -673,16 +680,12 @@ function processFrame(){
   lastH = H;
   stats.located++;
   if (tracked) stats.tracked++;
-  // camera-px per cell: the density gauge. Derive it from the HOMOGRAPHY,
-  // not from the finder points: the tracking path never runs detection, so
-  // referencing those points there threw on every frame and nothing could
-  // lock at all.
   const p0 = applyH(H, 0, 0), p1 = applyH(H, 1, 0), p2 = applyH(H, 0, 1);
-  const pxPerCell = (Math.hypot(p1[0]-p0[0], p1[1]-p0[1]) +
-                     Math.hypot(p2[0]-p0[0], p2[1]-p0[1])) / 2;
-  lastPx = pxPerCell;
-  const sb = cachedBits;
-  finishFrame(sb.bitAt, sb.confAt, pxPerCell, hdKnown);
+  const pxS = (Math.hypot(p1[0]-p0[0], p1[1]-p0[1]) +
+               Math.hypot(p2[0]-p0[0], p2[1]-p0[1])) / 2;
+  lastPxS = pxS;
+  lastPx = pxS / SCALE;              // native cam-px/cell for the operator
+  finishFrame(cachedBits.bitAt, cachedBits.confAt, lastPx, hdKnown);
 }
 
 // Radial term. The homography is fit on four corner pilots, but the phone
@@ -983,7 +986,7 @@ async function finish(){
   running = false;
 }
 
-let lastPx = 0, CAMDESC = '', lastH = null, cachedBits = null;
+let lastPx = 0, lastPxS = 0, CAMDESC = '', lastH = null, cachedBits = null;
 let gState = "", gTip = "", gPx = 0, gYld, gT = 0, yAvg = 0;
 function guide(state, tip, px, yld){
   // The per-frame state flickers between LOCKED/STRONG/WEAK faster than it
