@@ -359,11 +359,32 @@ symbol indices). Port the shipped rx.html logic:
    container, sha256. On mismatch WITH inferred symbols present: purge all
    inferred symbols, rebuild the fountain from the untagged pool, keep
    receiving (do not stop, do not report failure).
-8. **CAG-lite** (do this only after a live run passes 60 KB/s; it is the
-   yield lever): for codewords that fail the ladder, retry certification
-   with the whole-codeword sample grid offset by
-   (dx, dy) in {-0.3, 0, +0.3} cells (8 neighbors); each retry is just 255
-   resamples + one C call. Cap at 10 codewords per frame.
+8. **The yield engine — this is where the browser lost, build it early.**
+   Final browser field state: eye (contrast margin) 74, tracking 82%,
+   geometry and k1 converged, yield 0%. Diagnosis: the header RS(68,28)
+   tolerates ~29% byte corruption, the payload RS(255,207) only ~9-13%,
+   and the live channel sits between the two cliffs (cell BER ~2-4%
+   byte-packs to 15-25%). Headers certify, payload never does. Crossing
+   the payload cliff needs cell BER under ~1.5%, and these are the
+   measured levers, in order:
+   a. **Density**: at 4K60 with the code filling the frame you get
+      12-13 native px/cell (the portrait browser runs sat at ~10.6).
+      BER falls steeply with px/cell; this lever is free, coach the
+      operator with the HUD px/cell readout.
+   b. **Sampling**: bilinear subpixel taps at the exact (radially
+      corrected) position, 3x3 weighted window, instead of the browser's
+      2x2 box at integer offsets. Integer quantization at ~10 px/cell
+      contributes structured, geometry-correlated errors.
+   c. **CAG-lite offsets**: for codewords failing the ladder, retry with
+      the whole-codeword grid shifted (dx, dy) in {-0.3, 0, +0.3} cells
+      (8 neighbors); 255 resamples + one C call each. Film pipeline
+      measured the family at 1.22x codewords in isolation. Cap ~10
+      codewords/frame; at native cost this runs every frame.
+   d. **Certified-donor equalizer** (port of tile-PRML, the film
+      decoder's biggest yield machine): fit a 3x3 luma kernel on cells
+      of codewords that CERTIFIED this frame (proven labels only; never
+      fit on rescued observations), deconvolve the failed codewords'
+      samples with it, retry. Do this after a-c if yield is still short.
 
 ## 8. Test gates (XCTest; simulator; camera not required; run BEFORE any device work)
 
@@ -430,6 +451,7 @@ HOLD, STRADDLE, NO LOCK orange. px/cell guidance: <7 "MOVE CLOSER",
 | Interleaving hurts on this channel class | 38.1% -> 5.0%, 7.7x loss |
 | Below ~8 native px/cell the payload starves | 350x194 grid: 0/32 despite verified geometry; half-res field test collapsed |
 | Progress = pool fill, never decoded count | peeling is back-loaded by construction |
+| The channel lives between the header's and the payload's correction cliffs | final browser run: eye 74, tracked 82%, yield 0%. Header RS(68,28) ~29% byte tolerance vs payload RS(255,207) ~9-13%. The yield engine (7.8) exists to push cell BER under the payload cliff |
 
 ## 12. Working agreements for the executing agent
 

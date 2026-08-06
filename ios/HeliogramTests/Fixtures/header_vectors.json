@@ -1,0 +1,36 @@
+{
+ "note": "header bytes after RS+mask, hex; python reedsolo fcr=0 prim 0x11d",
+ "hdr_len_pre": 28,
+ "hdr_ecc": 40,
+ "hdr_phases": 8,
+ "vectors": [
+  {
+   "seq": 0,
+   "k": 997,
+   "blockSize": 203,
+   "fileSize": 199384,
+   "encoded_hex": "52df3187d41b8706c2d791ddd4d416f56703a99ab0ab4c71bc00d0a80a4076f759cbe267ae3cf239f62bcfac11da030c19b777225f354bdc0431432207e28c50ca0ec3e6"
+  },
+  {
+   "seq": 5,
+   "k": 997,
+   "blockSize": 203,
+   "fileSize": 199384,
+   "encoded_hex": "289169116326035a17ddfd3485f53311eeed2765d073fb1acd97371c1ff84a3ccfb0f5b3c73c3d6f71ca58a6bcedc8be88bad56bfdcc4eec6aee47528ec64f5aba991856"
+  },
+  {
+   "seq": 255,
+   "k": 5166,
+   "blockSize": 203,
+   "fileSize": 1048576,
+   "encoded_hex": "bed7bc04d7142373ce529c0a3d12afb452da4e41181b5eae701540424d71d4eced9c9f2b989aca301f992d66ded837058ebd002e5dfe14c48b69105038a8a5bf51b31e87"
+  },
+  {
+   "seq": 7449,
+   "k": 8057,
+   "blockSize": 203,
+   "fileSize": 1635571,
+   "encoded_hex": "1ddcdedc62af36d1c0e097ecf74e28ee03bb95df534dfc35930757782b90bca1d9aa946fcc02864c48f2e70d180b8ff55e9865b0764ae1ca293cc17eff2dc51eb07f423a"
+  }
+ ]
+}

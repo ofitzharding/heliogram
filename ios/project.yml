@@ -1,0 +1,23 @@
+name: Heliogram
+options:
+  bundleIdPrefix: com.ofitzharding
+  deploymentTarget:
+    iOS: "17.0"
+targets:
+  Heliogram:
+    type: application
+    platform: iOS
+    sources: [Heliogram]
+    resources: [Heliogram/Resources]
+    settings:
+      base:
+        SWIFT_OBJC_BRIDGING_HEADER: Heliogram/CRS2/crs2.h
+        INFOPLIST_KEY_NSCameraUsageDescription: "Reads the code on the sender's screen."
+        INFOPLIST_KEY_UILaunchScreen_Generation: true
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
+        TARGETED_DEVICE_FAMILY: "1"
+  HeliogramTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources: [HeliogramTests]
+    dependencies: [{ target: Heliogram }]
