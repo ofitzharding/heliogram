@@ -596,14 +596,14 @@ const tCvs = document.createElement("canvas");
 const tCtx = tCvs.getContext("2d", { willReadFrequently: true });
 let trackMiss = 0;
 
-// PROCESSING SPACE. Everything runs at half resolution: the GPU's area
-// filter turns 10 native px/cell into 5 clean, pre-averaged px/cell (the
-// camera model holds ~75% yield there), and every readback, scan, and
-// mapping costs a quarter. That is the difference between decoding 10 of
-// 30 camera frames and all of them. K1 is scale-invariant (r^2/rn^2), so
-// geometry transfers. ?full=1 disables for A/B.
-const SCALE = new URLSearchParams(location.search).get("full") === "1"
-  ? 1 : 0.5;
+// PROCESSING SPACE. Field A/B verdict (2026-08-06): half resolution
+// KILLED it on glass: located 87/763, yield 27% at ~5 scaled px/cell.
+// Matches the film-pipeline finding that the payload starves below ~8
+// real px/cell; the camera model was too kind about pre-filtered
+// downscaling. Full resolution is the default; ?half=1 keeps the
+// experiment reachable.
+const SCALE = new URLSearchParams(location.search).get("half") === "1"
+  ? 0.5 : 1;
 
 function processFrame(){
   const v = $("v");
