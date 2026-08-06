@@ -439,17 +439,18 @@ function detectH(G, w, h){
   const refine = start => {
     if (performance.now() - k1RefineAt < 2000) return start;
     k1RefineAt = performance.now();
-    let best = start, bestN = hardClean(start.sb), bestK = K1;
+    let best = start, bestN = certCount(start.sb, 12), bestK = K1;
     for (const dk of [-0.005, 0.005]){
       const k = +(K1 + dk).toFixed(3);
       const H2 = homography(M.finders, undist(start.q, k));
       if (!H2) continue;
       const sb2 = sampleBits(G, w, h, H2, k);
-      if (hardClean(sb2) > bestN + 1){
+      const n2 = certCount(sb2, 12);
+      if (n2 > bestN + 1){
         const hd2 = headerOf(sb2);
         if (hd2){ best = { H: H2, sb: sb2, rot: start.rot, hd: hd2,
                            q: start.q };
-                  bestN = hardClean(sb2); bestK = k; }
+                  bestN = n2; bestK = k; }
       }
     }
     K1 = bestK;
@@ -544,7 +545,7 @@ const applyH = (H, x, y) => {
 let dec = null;
 function newDecoder(){
   return { decoded: new Map(), pending: [], seen: new Set(),
-           pool: new Map() };
+           pool: new Map(), inferred: new Set() };
 }
 function fountainAdd(idx, block){
   if (dec.seen.has(idx)) return;
@@ -628,25 +629,31 @@ function processFrame(){
     for (let i = 0; i < HC.length; i++){
       hb[i] = sb.bitAt[HC[i]]; hc[i] = sb.confAt[HC[i]];
     }
-    return { sg, data, sb, hd: tryHeader(hb, hc, 10) };
+    return { sg, data, sb, hd: tryHeader(hb, hc, 22) };
   };
-  let H = null, tracked = false, hdKnown;
+  let H = null, tracked = false, hdKnown, stageG = null;
   if (lastH && trackMiss < 8){
     const a = attemptAt(lastH, SG);
     SG = a.sg;
     if (a.hd){ H = lastH; tracked = true; cachedBits = a.sb; hdKnown = a.hd;
                trackMiss = 0; }
     else {
-      // Straddle frame with PROVEN geometry: codewords certify (a
-      // zero-false-accept test) even though the header band is riding the
-      // sender/camera phase seam. The geometry is fine, the frame is
-      // partially a blend; skip it for the cost of a syndrome count
-      // instead of burning 120 ms relearning what is not lost.
-      if (hardClean(a.sb) >= 3){
+      // Headerless frame with PROVEN geometry: payload codewords certify
+      // (zero false accepts) even though the header band is riding the
+      // phase seam or a glare patch. These frames used to be thrown away
+      // and they are MOST of the transfer. With a fresh clock fit, infer
+      // the seq and harvest into quarantine; without one, skip cheap.
+      if (certCount(a.sb, 10) >= 2){
         trackMiss = 0;
-        guide("STRADDLE", "phase seam, riding it out", lastPx);
-        return;
+        stageG = inferSeq(performance.now());
+        if (stageG !== null && (JSMODE ? dynK : M.k)){
+          H = lastH; tracked = true; cachedBits = a.sb; hdKnown = undefined;
+        } else {
+          guide("STRADDLE", "phase seam, riding it out", lastPx);
+          return;
+        }
       }
+      if (!H){
       trackMiss++;
       // Drift vs blur: re-locate the finders locally and refit, but TRUST
       // NOTHING until the header certifies at the refreshed geometry. The
@@ -669,6 +676,7 @@ function processFrame(){
         }
       }
       if (!H){ guide("HOLD", "hold steady", lastPx); return; }
+      }
     }
   }
   if (!H){
@@ -695,7 +703,7 @@ function processFrame(){
                Math.hypot(p2[0]-p0[0], p2[1]-p0[1])) / 2;
   lastPxS = pxS;
   lastPx = pxS / SCALE;              // native cam-px/cell for the operator
-  finishFrame(cachedBits.bitAt, cachedBits.confAt, lastPx, hdKnown);
+  finishFrame(cachedBits.bitAt, cachedBits.confAt, lastPx, hdKnown, stageG);
 }
 
 // Radial term. The homography is fit on four corner pilots, but the phone
@@ -709,22 +717,75 @@ let K1 = 0, k1SweepAt = 0, k1RefineAt = 0, lockMiss = 0;
 const K1LADDER = [0.005, 0.01, 0.015, 0.02, 0.03, 0.045,
                   -0.005, -0.01, -0.02, -0.03];
 
-// Syndrome-clean codeword count: the sharp, cheap judge for geometry
-// candidates (a clean syndrome set is a perfectly sampled codeword).
-function hardClean(sb){
+// Certified-codeword count over a sample of bands: the judge for
+// geometry candidates. NOT syndrome-zero: on real glass at ~10 px/cell
+// almost no codeword is error-free, so a zero-syndrome judge reads 0 on
+// perfectly workable frames (which is why STRADDLE never showed in the
+// field). Hard RS decode + CRC32 is the same zero-false-accept oracle the
+// whole decoder is built on.
+function certCount(sb, nSample){
   const msg = new Uint8Array(255);
-  const synd = new Uint8Array(M.ecc + 1);
   let n = 0;
-  for (let j = 0; j < M.n_sub; j++){
+  const step = Math.max(1, Math.floor(M.n_sub / nSample));
+  for (let j = 0; j < M.n_sub; j += step){
     for (let i = 0; i < 255; i++){
       let v = 0;
       const o = (j*255 + i) * 8;
       for (let b = 0; b < 8; b++) v = (v << 1) | sb.bitAt[PC[o + b]];
       msg[i] = v;
     }
-    if (calcSynd(msg, 255, M.ecc, synd) === 0) n++;
+    const m2 = Uint8Array.from(msg);
+    if (correctMsg(m2, 255, M.ecc, null, 0)){
+      const want = (m2[0] | (m2[1]<<8) | (m2[2]<<16) | (m2[3]<<24)) >>> 0;
+      if (crc32(m2, 4, M.sub) === want) n++;
+    }
   }
   return n;
+}
+
+// ---- seq inference: the dual-seq harvest, browser edition. The header
+// band can die for long stretches (phase seam or glare parked on its
+// rows) while payload bands still certify at 40%+. Those frames used to
+// be discarded; they are most of the transfer. A linear clock fit over
+// recent certified headers predicts seq for headerless frames; harvested
+// blocks are QUARANTINED and only enter the fountain when the next real
+// header validates the fit. Zero false accepts end to end, and finish()
+// still sha256-gates the file.
+let seqAnchors = [];            // [t_ms, seq] from certified headers
+let staged = [];                // {g, blocks: [[j, blk]...]}
+function seqFit(){
+  if (seqAnchors.length < 3) return null;
+  const [t0, s0] = seqAnchors[0];
+  const [tN, sN] = seqAnchors[seqAnchors.length - 1];
+  if (tN - t0 < 900) return null;
+  const b = (sN - s0) / (tN - t0);              // seq per ms
+  if (b <= 0) return null;
+  return { b, tN, sN };
+}
+function inferSeq(now){
+  const f = seqFit();
+  if (!f || now - f.tN > 2500) return null;     // stale fit: refuse
+  const g = f.sN + f.b * (now - f.tN);
+  const r = Math.round(g);
+  return Math.abs(g - r) < 0.22 ? r : null;     // mid-seq confidence only
+}
+function anchorSeq(now, seq){
+  // validate + flush quarantine against this REAL header
+  const f = seqFit();
+  if (f && staged.length){
+    const pred = f.sN + f.b * (now - f.tN);
+    if (Math.abs(pred - seq) < 0.5){
+      for (const s of staged)
+        for (const [j, blk] of s.blocks){
+          const idx = s.g * M.n_sub + j;
+          dec.inferred.add(idx);
+          fountainAdd(idx, blk);
+        }
+    }
+    staged = [];
+  }
+  seqAnchors.push([now, seq]);
+  if (seqAnchors.length > 8) seqAnchors.shift();
 }
 
 function sampleBits(G, w, h, H, k1){
@@ -883,9 +944,9 @@ function threshold(lum){
   return { bitAt, confAt };
 }
 
-function finishFrame(bitAt, confAt, pxPerCell, hdIn){
+function finishFrame(bitAt, confAt, pxPerCell, hdIn, stageG){
   let hd = hdIn;
-  if (hd === undefined){
+  if (hd === undefined && stageG == null){
     const hb = new Uint8Array(HC.length);
     const hcf = new Float32Array(HC.length);
     for (let i = 0; i < HC.length; i++){
@@ -897,13 +958,17 @@ function finishFrame(bitAt, confAt, pxPerCell, hdIn){
   if (hd && JSMODE && hd.k !== dynK){
     dynK = hd.k; dynSize = hd.fileSize; dynCum = robustSoliton(dynK);
   }
-  if (!hd || (!JSMODE && hd.k !== M.k)){
+  const staging = !hd && stageG != null;
+  if (!staging && (!hd || (!JSMODE && hd.k !== M.k))){
     guide("LOCKED, no header",
           pxPerCell < 7 ? "MOVE CLOSER" :
           (pxPerCell > 16 ? "back off a little" :
            "hold still, square to the screen"), pxPerCell);
     return;
   }
+  const seq = staging ? stageG : hd.seq;
+  if (!staging) anchorSeq(performance.now(), hd.seq);
+  const stagedBlocks = [];
   // payload codewords
   const curBlocks = new Map();
   const nb = M.n_sub * 255;
@@ -928,7 +993,7 @@ function finishFrame(bitAt, confAt, pxPerCell, hdIn){
     // Already pooled from an earlier sighting of this seq: at 30 seq/s and
     // ~30 fps capture, repeats are the common case, and re-certifying them
     // was pure heat.
-    if (dec.seen.has(hd.seq * M.n_sub + j)){ have++; continue; }
+    if (dec.seen.has(seq * M.n_sub + j)){ have++; continue; }
     const chunk = pb.subarray(j*255, (j+1)*255);
     const order = performance.now() < ladderBy
       ? () => Array.from({length:255}, (_,i)=>i)
@@ -937,16 +1002,19 @@ function finishFrame(bitAt, confAt, pxPerCell, hdIn){
     const blk = certify(chunk, order, M.ecc, M.sub);
     if (!blk) continue;
     // straddle-ghost: identical content to previous frame's same j
-    if (prevBlocks && hd.seq === prevSeq + 1){
+    if (prevBlocks && seq === prevSeq + 1){
       const pg = prevBlocks.get(j);
       if (pg && eqBytes(pg, blk)) continue;
     }
     curBlocks.set(j, blk);
     stats.certified++;
     if (!stats.firstHit) stats.firstHit = performance.now();
-    fountainAdd(hd.seq * M.n_sub + j, blk);
+    if (staging) stagedBlocks.push([j, blk]);
+    else fountainAdd(seq * M.n_sub + j, blk);
   }
-  prevBlocks = curBlocks; prevSeq = hd.seq;
+  if (staging && stagedBlocks.length && staged.length < 60)
+    staged.push({ g: seq, blocks: stagedBlocks });
+  prevBlocks = curBlocks; prevSeq = seq;
   const yield_ = (curBlocks.size + have) / M.n_sub;
   // STRONG at 60%: instantaneous per-frame yield above 80% is nearly
   // unreachable hand-held at ~10 px/cell, so the green state never showed
@@ -981,6 +1049,22 @@ async function finish(){
   const dig = await crypto.subtle.digest("SHA-256", data);
   const hex = [...new Uint8Array(dig)].map(b=>b.toString(16).padStart(2,"0")).join("");
   const ok = want === null ? null : hex === want;
+  if (ok === false && dec.inferred.size){
+    // The sha gate caught seam poison from inferred-seq symbols. Purge
+    // every inferred symbol, rebuild the fountain from header-anchored
+    // symbols only, and keep receiving. The transfer survives; only the
+    // quarantine's optimism is rolled back.
+    const keep = [];
+    for (const [idx, blk] of dec.pool)
+      if (!dec.inferred.has(idx)) keep.push([idx, blk]);
+    dec = newDecoder();
+    for (const [idx, blk] of keep) fountainAdd(idx, blk);
+    staged = []; seqAnchors = [];
+    $("out").innerHTML =
+      "<p style='color:#f80'>inferred-seq symbols failed the sha gate; " +
+      "purged, still receiving</p>";
+    return;
+  }
   M = Object.assign({}, M, { file_name: name, file_size: data.length });
   const span = (performance.now() - stats.firstHit) / 1000;
   const rate = M.file_size / span / 1024;

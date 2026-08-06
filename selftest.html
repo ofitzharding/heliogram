@@ -93,7 +93,7 @@ function randBytes(n){
     dec = newDecoder(); dynK = 0; dynCum = null; dynSize = 0;
     prevBlocks = null; prevSeq = -10; lastH = null; cachedBits = null;
     K1 = 0; k1SweepAt = 0; k1RefineAt = 0; lockMiss = 0; trackMiss = 0;
-    SG = null;
+    SG = null; seqAnchors = []; staged = [];
     stats = { frames:0, located:0, tracked:0, certified:0,
               t0: performance.now(), firstHit: 0 };
   };
