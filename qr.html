@@ -19,14 +19,17 @@ code{font-size:15px;color:#333;word-break:break-all;text-align:center;
 // never the right thing to encode. Prefer an explicit ?u=, else the tailnet
 // HTTPS origin (iOS requires HTTPS for getUserMedia), else this origin.
 const q = new URLSearchParams(location.search);
-const TAILNET = "https://luka-heasman.tail07a270.ts.net";
+// The public receiver. A localhost origin is never right for the phone, so
+// default to the published page; ?u= overrides (e.g. a tailnet URL when
+// testing unpublished receiver changes).
+const PUBLIC = "https://ofitzharding.github.io/heliogram";
 const base = location.href.replace(/[^/]*$/, "");   // this page's folder
 // Fresh cache-buster on every render: iOS Safari caches rx.html hard, and a
 // stale receiver against a current sender has burned two field sessions.
 const bust = "v" + Date.now().toString(36);
 const URL_ = q.get("u") ||
   (location.hostname === "localhost" || location.hostname === "127.0.0.1"
-    ? TAILNET + `/rx.html?js=1&${bust}`
+    ? PUBLIC + `/rx.html?js=1&${bust}`
     : base.replace(/^http:/, "https:") + `rx.html?js=1&${bust}`);
 document.getElementById("u").textContent = URL_;
 
