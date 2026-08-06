@@ -761,10 +761,21 @@ function finishFrame(bitAt, confAt, pxPerCell, hdIn){
     }
     pb[i] = v8; pconf[i] = cmin;
   }
+  // The erasure ladder is what makes marginal frames pay, but it must not
+  // eat the frame budget: past this deadline codewords get hard RS only,
+  // because processing MORE frames beats squeezing this one.
+  const ladderBy = performance.now() + 14;
+  let have = 0;
   for (let j = 0; j < M.n_sub; j++){
+    // Already pooled from an earlier sighting of this seq: at 30 seq/s and
+    // ~30 fps capture, repeats are the common case, and re-certifying them
+    // was pure heat.
+    if (dec.seen.has(hd.seq * M.n_sub + j)){ have++; continue; }
     const chunk = pb.subarray(j*255, (j+1)*255);
-    const order = Array.from({length:255}, (_,i)=>i)
-      .sort((a,b) => pconf[j*255+a] - pconf[j*255+b]);
+    const order = performance.now() < ladderBy
+      ? Array.from({length:255}, (_,i)=>i)
+          .sort((a,b) => pconf[j*255+a] - pconf[j*255+b])
+      : null;
     const blk = certify(chunk, order, M.ecc, M.sub);
     if (!blk) continue;
     // straddle-ghost: identical content to previous frame's same j
@@ -778,7 +789,7 @@ function finishFrame(bitAt, confAt, pxPerCell, hdIn){
     fountainAdd(hd.seq * M.n_sub + j, blk);
   }
   prevBlocks = curBlocks; prevSeq = hd.seq;
-  const yield_ = curBlocks.size / M.n_sub;
+  const yield_ = (curBlocks.size + have) / M.n_sub;
   guide(yield_ > 0.8 ? "STRONG" : (yield_ > 0.3 ? "DECODING" : "WEAK"),
         yield_ > 0.8 ? "hold exactly there" :
         (pxPerCell < 7 ? "MOVE CLOSER" :
@@ -845,17 +856,30 @@ function guide(state, tip, px, yld){
 }
 
 let running = false;
+let lastPoolT = 0, lastPoolN = 0, poolRate = 0;
 function loop(){
   if (!running) return;
   const t = performance.now();
   processFrame();
   const el = (performance.now() - stats.t0) / 1000;
+  const kk = JSMODE ? (dynK || 0) : M.k;
+  // Progress = POOL FILL, not peeled symbols. LT peeling is back-loaded:
+  // decoded sits near zero until ~k symbols arrive, then cascades. Showing
+  // decoded made a healthy transfer look stuck.
+  const seen = dec.seen.size;
+  if (!lastPoolT){ lastPoolT = t; lastPoolN = seen; }
+  if (t - lastPoolT > 2000){
+    poolRate = (seen - lastPoolN) * 1000 / (t - lastPoolT);
+    lastPoolT = t; lastPoolN = seen;
+  }
   $("fill").style.width =
-    (100 * dec.decoded.size / (JSMODE ? (dynK||1) : M.k)) + "%";
+    (kk ? Math.min(100, 100 * seen / (kk * 1.04)) : 0) + "%";
   $("hud").textContent = CAMDESC + "\n" +
     `frames ${stats.frames}  located ${stats.located} (tracked ${stats.tracked})  ` +
     `certified ${stats.certified}\n` +
-    `fountain ${dec.decoded.size}/${JSMODE ? (dynK || "?") : M.k}  ` +
+    `pool ${seen}/${kk || "?"}  ` +
+    `${(poolRate * M.sub / 1024).toFixed(1)} KB/s in  ` +
+    `decoded ${dec.decoded.size}\n` +
     `${(performance.now()-t).toFixed(0)}ms/frame  ${el.toFixed(1)}s`;
   if ($("v").requestVideoFrameCallback)
     $("v").requestVideoFrameCallback(loop);
@@ -879,6 +903,7 @@ $("go").onclick = async () => {
     console.log("camera capabilities:", JSON.stringify(track.getCapabilities()));
   dec = newDecoder();
   SG = null;
+  lastPoolT = 0; lastPoolN = 0; poolRate = 0;
   stats = { frames:0, located:0, tracked:0, certified:0,
             t0: performance.now(), firstHit: 0 };
   running = true;
